@@ -9,7 +9,7 @@ embedding lookup is implemented for continuous action inputs.
 Input images are expected to be of shape (CH, H, W) and normalized to [0, 1].
 
 
-Action inputs are expected to be normalized to [-1, 1]. Discrete action inputs have not been implemented. Instead, one can set action dim to 1 and set the action bin size to the number of discrete actions. This is equivalent to discrete embedding lookup as actions are converted into onehot vectors anyways.
+Action inputs are expected to be normalized to [-1, 1]. Discrete action inputs have not been implemented. Instead, one can set the action bin size to 2 and set num_actions accordingly. This is equivalent to discrete embedding lookup as actions are converted into onehot vectors anyways.
 
 This will NOT be any more data efficient than other implementations; it just consists of fewer lines of code.
 
