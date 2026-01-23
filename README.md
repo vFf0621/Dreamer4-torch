@@ -40,6 +40,16 @@ Some codes were borrowed from:
     journal={GitHub repository},
     howpublished={\url{https://github.com/nicklashansen/dreamer4}},
 }
+
+@misc{ghugare2023simplifyingmodelbasedrllearning,
+      title={Simplifying Model-based RL: Learning Representations, Latent-space Models, and Policies with One Objective}, 
+      author={Raj Ghugare and Homanga Bharadhwaj and Benjamin Eysenbach and Sergey Levine and Ruslan Salakhutdinov},
+      year={2023},
+      eprint={2209.08466},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2209.08466}, 
+}
 ```
 
 Original Paper:
