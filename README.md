@@ -8,6 +8,7 @@ embedding lookup is implemented for action inputs.
 
 Input images are expected to be of shape (CH, H, W) and normalized in [0, 1].
 
+Discrete action inputs have not been implemented.
 
 Install via 
 ```python
