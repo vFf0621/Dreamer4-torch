@@ -13,6 +13,8 @@ Discrete action inputs have not been implemented.
 
 This will NOT be any more data efficient than other implementations; it just consists of fewer lines of code.
 
+As well, there will be no need of curating a dataset(the dataset is generated through random interactions at first).
+
 Install via 
 ```python
 pip install -r requirements.txt
