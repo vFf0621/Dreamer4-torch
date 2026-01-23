@@ -6,7 +6,7 @@ Please note that Attention Soft Capping is not implemented as no training instab
 Different from previous implementations, this default implementation uses RoPE1D for time attention and learned PE for space attention, as well as the one directional masking for latent tokens in the encoder and decoder. Also, 
 embedding lookup is implemented for continuous action inputs.
 
-Input images are expected to be of shape (CH, H, W) and normalized in [0, 1].
+Input images are expected to be of shape (CH, H, W) and normalized to [0, 1].
 
 
 Action inputs are expected to be in [-1, 1]. Discrete action inputs have not been implemented. Instead, one can set action dim to 1 and set the action bin size to the number of discrete actions. This is equivalent to discrete embedding lookup as actions are converted into onehot vectors anyways.
