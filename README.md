@@ -7,8 +7,12 @@ Install via
 ```python
 pip install -r requirements.txt
 ```
-To Install the MultiCarRacing environment, please see: https://github.com/vFf0621/Dreamer4-compact/tree/main/multi_car_racing
+To Install the MultiCarRacing environment, please see: 
+
+https://github.com/vFf0621/Dreamer4-compact/tree/main/multi_car_racing
+
 Some codes were borrowed from:
+
 ```bibtex
 @inproceedings{hansen2024tdmpc2,
   title={TD-MPC2: Scalable, Robust World Models for Continuous Control}, 
