@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: gym_multi_car_racing
+Version: 1.0.1
+Summary: Gym Multi Car Racing Environment
+Home-page: https://github.com/igilitschenski/multi_car_racing
+License-File: LICENSE
+License-File: LICENSEZone.Identifier
+License-File: AUTHORS
+License-File: AUTHORSZone.Identifier
+Requires-Dist: shapely
+Requires-Dist: Box2D==2.3.10
+Requires-Dist: box2d_py==2.3.5
+Requires-Dist: gymnasium==0.29.1
+Requires-Dist: pygame==2.5.2
+Requires-Dist: pyglet==1.5.0
+Requires-Dist: setuptools==68.2.2
+Dynamic: home-page
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary
