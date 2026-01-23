@@ -1,4 +1,4 @@
-# Dreamer4
+# Minimalistic Dreamer4
 Compact implementation of Dreamer 4
 
 
