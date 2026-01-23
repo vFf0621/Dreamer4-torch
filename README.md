@@ -19,8 +19,9 @@ Some codes were borrowed from:
     howpublished={\url{https://github.com/nicklashansen/dreamer4}},
 }
 
+
 Original Paper:
-```bibtex
+
 @misc{Hafner2025TrainingAgents,
     title={Training Agents Inside of Scalable World Models}, 
     author={Danijar Hafner and Wilson Yan and Timothy Lillicrap},
