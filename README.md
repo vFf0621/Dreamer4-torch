@@ -1,5 +1,7 @@
 # Minimalistic Dreamer4
-Compact implementation of Dreamer 4
+Compact implementation of Dreamer 4, with the help of ChatGPT.
+
+Please note that Attention Soft Capping is not implemented as no training instability is found. Instead, Scaled Product Attention is used.
 
 
 Some codes were borrowed from:
