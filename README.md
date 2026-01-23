@@ -3,7 +3,10 @@ Compact implementation of Dreamer 4, with the help of ChatGPT.
 
 Please note that Attention Soft Capping is not implemented as no training instability is found. Instead, Scaled Product Attention is used.
 
-
+Install via 
+```python
+pip install -r requirements.txt
+```
 Some codes were borrowed from:
 ```bibtex
 @inproceedings{hansen2024tdmpc2,
@@ -20,9 +23,10 @@ Some codes were borrowed from:
     journal={GitHub repository},
     howpublished={\url{https://github.com/nicklashansen/dreamer4}},
 }
-
+```
 
 Original Paper:
+```bibtex
 
 @misc{Hafner2025TrainingAgents,
     title={Training Agents Inside of Scalable World Models}, 
@@ -33,3 +37,4 @@ Original Paper:
     primaryClass={cs.AI},
     url={https://arxiv.org/abs/2509.24527}, 
 }
+```
