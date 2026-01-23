@@ -3,6 +3,12 @@ Compact implementation of Dreamer 4, with the help of ChatGPT.
 
 Please note that Attention Soft Capping is not implemented as no training instability is found. Instead, Scaled Product Attention is used.
 
+Different from previous implementations, this default implementation uses RoPE1D and learned positional PE. Also, 
+embedding lookup is implemented for action inputs.
+
+Input images are expected to be of shape (CH, H, W) and normalized in [0, 1].
+
+
 Install via 
 ```python
 pip install -r requirements.txt
