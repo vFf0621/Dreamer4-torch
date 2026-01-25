@@ -48,8 +48,6 @@ class Policy(nn.Module):
 
         # --- 1. Main Policy Head ---
         logits = self.head(x)
-        with torch.cuda.amp.autocast(enabled=False):
-            logits = logits.float()
         logits = logits.reshape(B, L,self.mtp, self.action_dim, self.num_bins)
 
         probs = F.softmax(logits, dim=-1)
@@ -169,7 +167,6 @@ class CausalSTBlock(nn.Module):
         self,
         x: torch.Tensor,
         token_pad_mask: torch.Tensor | None = None,
-        agent_space="none",
         *,
         agent_idx: int | None = None,   
         mask = None
@@ -199,17 +196,17 @@ class CausalSTBlock(nn.Module):
             if token_pad_mask is not None:
                 time_kpm = token_pad_mask.permute(0, 2, 1).reshape(B * N, T)
             if mask is None:
-                attn_mask = causal_mask(T, device=x.device)  
-            xt_out = self.time_attn(x_time, attn_mask=attn_mask, key_padding_mask=time_kpm)  
+                attn_mask = causal_mask(T, device=x.device) 
+
+                xt_out = self.time_attn(x_time, attn_mask=attn_mask, key_padding_mask=time_kpm)  
+            else:
+                xt_out = self.time_attn(x_time, attn_mask=mask, key_padding_mask=time_kpm)  
+
 
             xt_out = xt_out.reshape(B, N, T, D).permute(0, 2, 1, 3)
 
-            if agent_idx is not None and agent_space in ("skip",):
-                keep = torch.ones((1, 1, N, 1), device=x.device, dtype=xt_out.dtype)
-                keep[:, :, agent_idx, :] = 0
-                x = x + xt_out * keep
-            else:
-                x = x + xt_out
+            
+            x = x + xt_out
 
             x = x + self.mlp(x)
             return x.squeeze(2) if x.shape[2] == 1 else x
@@ -225,52 +222,38 @@ class CausalSTBlock(nn.Module):
                 dim=1,
             ) 
 
-        if agent_space == "skip" and agent_idx is not None:
-            keep_idx = [i for i in range(N) if i != agent_idx]
-            Nk = len(keep_idx)
-            xt_keep = xt[:, keep_idx, :]  
-            xcat = torch.cat([xt_keep, reserved.expand(B * T, R, D)], dim=1)  
-            kpm_keep = None
-            if space_kpm is not None:
-                kpm_keep = torch.cat([space_kpm[:, keep_idx], space_kpm[:, N:]], dim=1)  
-            xs_keep = self.space_attn(xcat, attn_mask=mask, key_padding_mask=kpm_keep)[:, :Nk]  
-            xs = torch.zeros_like(xt)          
-            xs[:, keep_idx, :] = xs_keep
-            x = x + xs.reshape(B, T, N, D)
-            x2 = self.mlp(x)  
-            keep = torch.ones((1, 1, N, 1), device=x.device, dtype=x2.dtype)
-            keep[:, :, agent_idx, :] = 0
-            x = x + x2 * keep
-            return x.squeeze(2) if x.shape[2] == 1 else x
-
         
         xcat = torch.cat([xt, reserved.expand(B * T, R, D)], dim=1)  # [B*T, N+R, D]
 
         # 1) start with caller-provided mask (e.g., modality mask)
+        # --- build final attention mask over xcat = [tokens (N) | reserved (R)] ---
         Ncat = N + R
-
         final_mask = None
+
         if mask is not None:
             if mask.shape[-2:] == (N, N):
                 m = torch.zeros((Ncat, Ncat), dtype=torch.bool, device=x.device)
-                m[:N, :N] = mask  # embed old mask
-                # reserved queries (rows N:) can attend to everything -> block nothing
-                # everyone can attend to reserved keys? depends; allow by default:
-                # m[:N, N:] = False; m[N:, :N] = False; m[N:, N:] = False
+                m[:N, :N] = mask  # embed caller mask on real tokens
+                # by default: allow attention to/from reserved tokens (block False)
                 final_mask = m
             elif mask.shape[-2:] == (Ncat, Ncat):
                 final_mask = mask
             else:
-                raise ValueError(f"mask has shape {mask.shape}, expected ({N},{N}) or ({Ncat},{Ncat})")
+                raise ValueError(
+                    f"mask has shape {mask.shape}, expected ({N},{N}) or ({Ncat},{Ncat})"
+                )
+        else:
+            # no mask from caller: default allow-all (block nothing)
+            final_mask = torch.zeros((Ncat, Ncat), dtype=torch.bool, device=x.device)
 
-        # optionally add oneway agent mask, also Ncat×Ncat
-        if agent_idx is not None and agent_space == "oneway":
-            m1 = torch.zeros((Ncat, Ncat), device=x.device, dtype=torch.bool)
-            m1[:, agent_idx] = True
-            m1[agent_idx, agent_idx] = False
-            final_mask = m1 if final_mask is None else (final_mask | m1)
+        # --- one-way agent rule: agent can't read others; others can read agent ---
+        if agent_idx is not None:
+            # Block all non-agent queries from attending to the agent key.
+            # (agent key is in the first N tokens; reserved keys are N: )
+            final_mask[:N, agent_idx] = True
+            final_mask[agent_idx, agent_idx] = False  # agent can still attend to itself
 
-        xs = self.space_attn(xcat, attn_mask=final_mask, key_padding_mask=space_kpm)[:, :N]    
+        xs = self.space_attn(xcat, attn_mask=final_mask, key_padding_mask=space_kpm)[:, :N]
 
         x = x + xs.reshape(B, T, N, D)
     
@@ -287,7 +270,7 @@ class Encoder(nn.Module):
         d_model: int = 256,
         n_heads: int = 8,
         depth: int = 6,
-        latent_tokens: int = 32,
+        latent_tokens: int = 64,
         time_every: int = 2,
         dropout: float = 0.05,
         out_dim: int = 16,     # Dz
@@ -303,14 +286,13 @@ class Encoder(nn.Module):
         self.latent_tokens = latent_tokens
         self.d_model = d_model
         grid = (h // patch, w//patch)
-        self.num_patches = grid[0] * grid[0]
+        self.num_patches = grid[0] * grid[1]
         N = self.num_patches + latent_tokens
         patch_dim = img_channels * patch * patch
         self.patch_proj = nn.Linear(patch_dim, d_model)
         self.latent_tok = nn.Parameter(torch.randn(1, 1, latent_tokens, d_model) * 0.02)
         self.drop = nn.Dropout(dropout)
         self.pos_emb_lat = nn.Parameter(torch.randn(1, 1, self.latent_tokens + self.num_patches, d_model) * 0.02)
-
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == 0)
@@ -329,7 +311,7 @@ class Encoder(nn.Module):
         patches = F.unfold(x, kernel_size=p, stride=p)                       # (B*T, C*p*p, Np)
         patches = patches.transpose(1, 2).contiguous()                       # (B*T, Np, patch_dim)
         patches = patches.view(B, T, self.num_patches, -1)                   # (B,T,Np,patch_dim)
-        space_mask = encoder_modality_mask(
+        space_mask = modality_mask(
             L=self.latent_tokens,
             modality_sizes=[self.num_patches],
             device=frames.device
@@ -342,13 +324,14 @@ class Encoder(nn.Module):
         x = self.drop(x)
         for blk in self.blocks:
             if blk.time_attn_enabled:
-                x = blk(x, agent_space="none", mask=None)          # no space mask here
+                x = blk(x, mask=None,)          # no space mask here
             else:
-                x = blk(x, agent_space="none", mask=space_mask)    # modality mask only here
+                x = blk(x, mask=space_mask)    # modality mask only here
         x = self.ln_out(x)  
 
         patch_tok = x[:, :,: self.latent_tokens, :]
-        ztok = torch.tanh(self.readout(patch_tok))   # [B,T,Np,Dz]
+        pre = (self.readout(patch_tok))
+        ztok = torch.tanh(pre)   # [B,T,Np,Dz]
         return ztok
 
 
@@ -377,17 +360,16 @@ class TokenDynamics(nn.Module):
         level_dim: int = 16,
 
         step_vocab: int = 128,
-        step_dim: int = 16,
-
+        num_tasks: int = 10,
         d_model: int = 512,
         n_heads: int = 4,
         depth: int = 16,
         time_every: int = 4,
         dropout: float = 0.1,
-
+        
         max_T: int = 255,
         use_agent_token: bool = True,
-        Nz: int = 32,
+        latent_tokens: int = 32,
         device: str = "cuda",
         action_lookup: bool = True,
 
@@ -403,42 +385,35 @@ class TokenDynamics(nn.Module):
         self.action_dim = action_dim
         self.action_bins = action_bins
         self.d_model = d_model
-        self.Nz = Nz
-
+        self.Nz = latent_tokens
+        self.num_task = num_tasks
         self.mask_last_action = mask_last_action
         self.clamp_signal_indices = clamp_signal_indices
-
         # --- Discrete signal embeddings (tau_idx + k_idx) ---
         self.level_vocab = int(level_vocab)
         self.step_vocab = int(step_vocab)
-        self.space_pos_embed = nn.Parameter(0.02 * torch.randn(1, 1, Nz+2, d_model))
+        self.space_pos_embed = nn.Parameter(0.02 * torch.randn(1, 1, latent_tokens+3, d_model))
+        self.z_proj = nn.Sequential(nn.RMSNorm(Dz), nn.Linear(Dz, d_model))
+        self.sig_proj = nn.Sequential(nn.RMSNorm(level_dim), nn.Linear(level_dim, d_model))
 
         self.level_emb = nn.Embedding(self.level_vocab, level_dim)
-        self.step_emb  = nn.Embedding(self.step_vocab, step_dim)
-        self.z_cond_proj = nn.Sequential(
-            nn.RMSNorm(Dz),
-           nn.Linear(Dz, d_model),
-        )
-        self.signal_feat_dim = int(level_dim) + int(step_dim)
+        self.step_emb  = nn.Embedding(self.step_vocab, level_dim)
 
+        self.action_pad = nn.Parameter(0.02 * torch.randn(1, 1, 1, d_model))
         self.action_lookup = action_lookup
 
         # --- Action embedding (true lookup, no one-hot materialization) ---
-        self.action_embs = nn.Linear((action_bins+1)*self.action_dim, self.d_model )
-
-        # --- z + signal -> model dim ---
-        self.z_in = nn.Sequential(
-            nn.RMSNorm(Dz + self.signal_feat_dim),
-            nn.Linear(Dz + self.signal_feat_dim, d_model),
-        )
+        self.action_embs = nn.ModuleList([nn.Embedding(action_bins, self.d_model) for _ in range(self.action_dim)] )
+        self.action_noormalize = nn.RMSNorm(d_model)
+        # --- z + signal -> model dim --
 
         # Agent token (learned)
-        self.agent_token = nn.Parameter(0.02 * torch.randn(1, 1, 1, d_model))
+        self.agent_token = nn.Parameter(0.02 * torch.randn(1, 1, num_tasks, d_model))
 
         # Blocks
         blocks = []
         for i in range(depth):
-            use_time = ((i + 1) % time_every == 0)
+            use_time = ((i+1) % time_every == (0))
             blocks.append(
                 CausalSTBlock(
                     d_model, n_heads,
@@ -462,58 +437,45 @@ class TokenDynamics(nn.Module):
         actions: [B, T, A] in [-1, 1]
         returns: [B, T, A] long in [0, action_bins-1]
         """
-
-        clipped = actions.clamp(-1.0, 1.0)
-        normed = (clipped + 1.0) * 0.5  # [0,1]
-        idx = F.one_hot(
-            (normed * (self.action_bins - 1)).round().long(), num_classes=self.action_bins + 1
-        ).reshape(clipped.shape[0], clipped.shape[1], -1)
-
+        
+        normed = (actions.clamp(-1,1) + 1.0) * 0.5  # [0,1]
+        idx = (normed * (self.action_bins-1)).round().long()
         return idx
 
-    def align_actions(self, actions: torch.Tensor | None, T: int, B: int, dtype, device):
-        """
-        Returns:
-          acts_bt: [B, T, A] (last action padded with zeros if input is T-1)
-          did_pad_last: True if last timestep action is padding
-        """
+    def align_actions(self, actions, T, B, dtype, device):
         if actions is None:
-            acts = torch.zeros((B, T, self.action_dim), device=device, dtype=dtype)
-            return acts, True
+            return torch.zeros((B, T-1, self.action_dim), device=device, dtype=dtype)
 
         if actions.dim() != 3:
-            raise ValueError(f"actions must be [B,Ta,A], got {tuple(actions.shape)}")
-
+            raise ValueError(...)
         Ba, Ta, A = actions.shape
-        if A != self.action_dim:
-            raise ValueError(f"actions last dim must be {self.action_dim}, got {A}")
-        # broadcast batch if needed
-        if Ba == 1 and B > 1:
-            actions = actions.expand(B, -1, -1)
-        elif Ba != B:
-            raise ValueError(f"actions batch {Ba} must match z batch {B} (or be 1)")
+        if Ba != B or A != self.action_dim:
+            raise ValueError(...)
 
+        if Ta == T:
+            return actions[:, :-1] if self.mask_last_action else actions[:, :-1]
         if Ta == T-1:
-            pad = torch.full((B,  1, A), self.action_bins, device=device, dtype=torch.long)
-
-            return torch.cat([pad, actions], dim=1), True
-
-        else:
-            return actions, False
+            return actions
 
     def _validate_or_clamp_index(self, idx: torch.Tensor, vocab: int, name: str) -> torch.Tensor:
         if self.clamp_signal_indices:
             return idx.clamp(0, vocab - 1)
 
         # strict mode: crash early with an informative message
-        if (idx.min() < 0) or (idx.max() >= vocab):
+        if (idx.min() < 0) or (idx.max() >= vocab):            
             raise ValueError(
                 f"{name} out of range: min={int(idx.min())}, max={int(idx.max())}, vocab={int(vocab)}"
             )
         return idx
 
-    # -----------------------------
-    # Forward
+    def agent_mask(self, S: int, agent_idx: int, device=None) -> torch.Tensor:
+        allow = torch.ones((S, S), dtype=torch.bool, device=device)
+        allow[:, agent_idx] = False         # nobody can read agent...
+        allow[agent_idx, :] = True          # ...except agent can read everybody
+        allow[agent_idx, agent_idx] = True
+        return ~allow
+
+            # Forward
     # -----------------------------
     def forward(
         self,
@@ -523,131 +485,116 @@ class TokenDynamics(nn.Module):
         policy_tok_in: torch.Tensor | None = None,  # [1,1,1,D] or [B,1,1,D] or [B,T,1,D]
         detach_agent: bool = False,
         last_z = None,
+        task_id = 0, 
     ):
         device = z_tokens.device
         if z_tokens.dim() != 4:
             raise ValueError(f"z_tokens must be [B,T,Nz,Dz], got {tuple(z_tokens.shape)}")
-
-        B, T, Nz, Dz = z_tokens.shape
-    
         if last_z is not None:
-            T += last_z.size(1)
-            z_tokens = torch.cat([z_tokens, last_z], 1)
-        acts_bt, did_pad_last = self.align_actions(actions, T, B, z_tokens.dtype, device)
-        act_idx = self.discretize_actions_to_indices(acts_bt).float()  # [B,T,A] long
+            z_tokens = torch.cat([z_tokens, last_z], dim=1)
+        B, T, Nz, Dz = z_tokens.shape
 
-        if self.action_lookup:
-            a_sum = self.action_embs(act_idx)
-            a_emb = a_sum[:, :, None, :]  # [B,T,1,D]
-        else:
-            if actions is None:
-                a_emb = torch.zeros((B, T, 1, self.d_model), device=device, dtype=z_tokens.dtype)
-            else:
-                a_emb = self.action_in(acts_bt)[:, :, None, :]  # [B,T,1,D]
+        if signals.size(1) != T:
+            raise ValueError(f"signals has T={signals.size(1)} but z_tokens has T={T}.")
+        acts_bt = self.align_actions(actions, T, B, z_tokens.dtype, device)   # [B, T-1, A]
+        act_idx = self.discretize_actions_to_indices(acts_bt)                   # [B, T-1, A]
 
-        # ---- 2) Signals -> embeddings ----
-        if signals.dtype != torch.long:
-            signals = signals.long()
+        a = 0
+        for i, emb in enumerate(self.action_embs):
+            a = a + emb(act_idx[..., i])                                        # [B, T-1, D]
+        a = self.action_noormalize(a)*200
 
+        a_emb = a[:, :, None, :]                                                # [B, T-1, 1, D]
+        pad = self.action_pad.expand(B, 1, 1, self.d_model)                     # [B, 1, 1, D]
+        a_emb = torch.cat([a_emb, pad], dim=1)                                  # [B, T, 1, D]
+        signals = signals.long()
         if signals.dim() == 4 and signals.size(-1) == 2:
-            level_idx = signals[..., 0]  # [B,T,Nz]
-            step_idx  = signals[..., 1]  # [B,T,Nz]
+            level_idx, step_idx = signals[..., 0], signals[..., 1]
         elif signals.dim() == 3:
-            # legacy: only tau_idx provided
-            level_idx = signals
-            step_idx  = torch.zeros_like(level_idx)
+            level_idx, step_idx = signals, torch.zeros_like(signals)
         else:
-            raise ValueError(f"signals must be [B,T,Nz,2] (or legacy [B,T,Nz]), got {tuple(signals.shape)}")
+            raise ValueError(f"signals must be [B,T,Nz,2] or [B,T,Nz], got {tuple(signals.shape)}")
 
         level_idx = self._validate_or_clamp_index(level_idx, self.level_vocab, "level_idx")
         step_idx  = self._validate_or_clamp_index(step_idx,  self.step_vocab,  "step_idx")
+        level_t = level_idx[:, :, 0]                 # [B,T]
+        step_t  = step_idx[:, :, 0]                  # [B,T]        
+        lev_feat  = self.level_emb(level_t)
+        step_feat = self.step_emb(step_t)
+        z_inp = torch.cat([self.sig_proj(lev_feat + step_feat).unsqueeze(-2), self.z_proj(z_tokens), ], dim=2)
 
-        lev_feat  = self.level_emb(level_idx)  # [B,T,Nz,level_dim]
-        step_feat = self.step_emb(step_idx)    # [B,T,Nz,step_dim]
+        # 2. Stack at dim=3 (immediately after N)
+        # This places z and a side-by-side for every N element.
+        # New Shape: (B, T, N, 2, D)
+        x = torch.cat([a_emb, z_inp,] , dim=2)
 
-        # ---- 3) z + signal -> model tokens ----
-        z_inp = torch.cat([z_tokens, lev_feat, step_feat], dim=-1)  # [B,T,Nz,Dz+signal_dim]
-        z_emb = self.z_in(z_inp)                                    # [B,T,Nz,D]
-
-
-        # concat action token at slot Nz
-        x = torch.cat([z_emb, a_emb], dim=2)                        # [B,T,Nz+1,D]
+        # 3. Flatten the N dimension (dim 2) and the new stack dimension (dim 3)
+        # New Shape: (B, T, N * 2, D)
+        
         Nmain = x.size(2)
-        a_slot = Nz
 
-        # ---- 4) Padding mask ----
-        token_pad_mask = torch.zeros(B, T, Nmain, device=device, dtype=torch.bool)
-
-       #if self.mask_last_action and did_pad_last:
-        #    token_pad_mask[:, T-1, a_slot] = False
-
-        # ---- 5) Run blocks with agent injection (one-way mask) ----
+        token_pad_mask = torch.zeros(B, T, Nmain, device=device, dtype=torch.bool)  # True = PAD
+        token_pad_mask[:, -1, 0] = True
         agent = None
+        x_aug = x
         if policy_tok_in is not None:
             ag = policy_tok_in
-            if ag.dim() != 4 or ag.size(-1) != self.d_model:
-                raise ValueError(f"policy_tok_in must be [*,*,*,D={self.d_model}], got {tuple(ag.shape)}")
-
-            # broadcast to [B,T,1,D]
-            if ag.size(0) == 1 and B > 1:
-                ag = ag.expand(B, -1, -1, -1)
-            if ag.size(1) == 1 and T > 1:
-                ag = ag.expand(B, T, -1, -1)
-            if ag.size(2) != 1:
-                raise ValueError("policy_tok_in must have token dim = 1 at dim=2")
-
+            if ag.size(0) == 1 and B > 1: ag = ag.expand(B, -1, -1, -1)
+            if ag.size(1) == 1 and T > 1: ag = ag.expand(B, T, -1, -1)
+            if ag.size(2) != 1: raise ValueError("policy_tok_in token dim must be 1 at dim=2")
             agent = ag
-            x_aug = torch.cat([x, ag], dim=2)  # [B,T,Nmain+1,D]
-
-        elif self.use_agent_token:
-            agent = self.agent_token.expand(B, T, 1, self.d_model)
             agent_in = agent.detach() if detach_agent else agent
-
-            x_aug = torch.cat([x, agent_in], dim=2)  # [B,T,Nmain+1,D]
-        else:
-            x_aug = torch.cat([x, torch.zeros_like(x[:,:,-1:])], dim=2)
+        elif self.use_agent_token:
+            assert task_id < self.num_task
+            agent = self.agent_token[:, :, task_id].expand(B, T, 1, self.d_model)
+            agent_in = agent.detach() if detach_agent else agent
+        x_aug = torch.cat([x, agent_in], dim=2)
         agent_out_bt = None
+        x_aug = x_aug + self.space_pos_embed.expand(B,1,-1,self.d_model)
         for blk in self.blocks:
-            if agent is None:
-                x = blk(x, token_pad_mask=token_pad_mask)
-                continue
+            S = x_aug.size(2)
+            agent_idx = S - 1
 
-            pad_aug = torch.zeros(B, T, 1, device=device, dtype=torch.bool)
-            token_pad_mask_aug = torch.cat([token_pad_mask, pad_aug], dim=2)
+            tok_mask = self.agent_mask(S, agent_idx, device=device)
 
-            agent_idx = x_aug.size(2) - 1
-            
-            x_aug = blk(
-                x_aug,
-                token_pad_mask=token_pad_mask_aug,
-                agent_idx=agent_idx,
-                agent_space="oneway",
-            )
+            pad_agent = torch.zeros(B, T, 1, dtype=torch.bool, device=device)
+            token_pad_mask_aug = torch.cat([token_pad_mask, pad_agent], dim=2)
 
-            agent = x_aug[:, :, agent_idx:agent_idx + 1, :]  # [B,T,1,D]
-            x = x_aug[:, :, :agent_idx, :]                   # [B,T,Nmain,D]
-            agent_out_bt = agent[:, :, 0, :]                 # [B,T,D]
+            if blk.time_attn_enabled:
+                x_aug = blk(
+                    x_aug,
+                    token_pad_mask=token_pad_mask_aug,
+                    mask=causal_mask(T, self.device),
+                    agent_idx=agent_idx,
+                )
+            else:
+                x_aug = blk(
+                    x_aug,
+                    token_pad_mask=token_pad_mask_aug,
+                    mask=tok_mask,
+                    agent_idx=agent_idx,
+                )
 
-        # ---- 6) Outputs ----
-        h_hist = x[:, :, :Nz, :]           # [B,T,Nz,D]
-        z_pred = self.out(h_hist)          # [B,T,Nz,Dz]
 
-        policy_feat = None
-        if agent_out_bt is not None:
-            policy_feat = agent_out_bt[:, -1, :][:, None, :]  # [B,1,D]
+            agent = x_aug[:, :, agent_idx:agent_idx+1, :]
+            x = x_aug[:, :, :agent_idx, :]
+        agent_out_bt = agent[:, :, 0, :]
 
+        h_hist = x[:, :, 2:Nz+2, :]
+        z_pred = self.out(h_hist)
+
+        policy_feat = agent_out_bt[:, -1:, :] if agent_out_bt is not None else None
         return z_pred, policy_feat
-
 
 class Dreamer4(nn.Module):
     def __init__(self,ch=3, h=96, w=96, patches = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512, 
-                 rep_depth = 8, rep_d_model=256, dyn_d_model=256, model_dim=512, num_heads=8, dropout=0.1, k_max=8, mtp=8, 
+                 rep_depth = 8, rep_d_model=256, dyn_d_model=256, num_heads=8, dropout=0.1, k_max=8, mtp=8, 
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,
-                 dyn_lr=1e-4, dyn_decay=1e-3, ac_lr = 1e-4, ac_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3):
+                 dyn_lr=1e-4, dyn_decay=1e-3, ac_lr = 1e-4, ac_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0):
         super(Dreamer4, self).__init__()
         self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patches, 
-                                n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, 
+                                n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=2,
                                 out_dim=z_dim, dropout=dropout, max_T=max_imag_len)
  
         self.device="cuda" if torch.cuda.is_available() else "cpu"
@@ -663,7 +610,10 @@ class Dreamer4(nn.Module):
             dropout=dropout,
             n_heads=num_heads,
             d_model=dyn_d_model,
-            max_T = max_imag_len
+            max_T = max_imag_len,
+            num_tasks=num_tasks,
+            time_every=4,
+            latent_tokens=latent_tokens
         )
         
         self.decoder = Decoder(img_channels=ch, w = w, h=h, patch=patches, z_dim=z_dim, d_model=rep_d_model, n_heads=num_heads,
@@ -672,11 +622,11 @@ class Dreamer4(nn.Module):
         self.rminv = reward_clamp
         self.rmaxv = -reward_clamp
         self.reward_bins = reward_bins
+        self.task_id = task_id
         self.batch_lengths= batch_lens
         self.horizon_length = max_imag_len
         self.grad_accum = accum       
         self.batch_size = batch_size
-        self.model_dim = model_dim  
         self.action_dim=action_dim
         self.shortcut_kmax = k_max
         self.z_buffer = None
@@ -684,14 +634,14 @@ class Dreamer4(nn.Module):
         self.policy_num_bins = policy_bins
         self.bin_num = reward_bins
         self.steps = 0
-        self.policy = Policy(action_dim=action_dim, latent_dim=latent_dim, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
-        self.t_policy = Policy(action_dim=action_dim, latent_dim=latent_dim, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
-        self.reward = Reward(bin_num=self.bin_num, latent_dim=latent_dim, mtp=self.aux_horizon)
+        self.policy = Policy(action_dim=action_dim, latent_dim=dyn_d_model, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
+        self.t_policy = Policy(action_dim=action_dim, latent_dim=dyn_d_model, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
+        self.reward = Reward(bin_num=self.bin_num, latent_dim=dyn_d_model, mtp=self.aux_horizon)
         self.train_policy = False
-        self.value = Value(bin_num=self.bin_num, latent_dim=latent_dim, hidden_dim=latent_dim*2)
+        self.value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim*2)
 
-        #self.encoder.load_state_dict(torch.load("causal_enc.pt"))
-        #self.decoder.load_state_dict(torch.load("causal_dec.pt"))
+        self.encoder.load_state_dict(torch.load("enc.pt"))
+        self.decoder.load_state_dict(torch.load("dec.pt"))
         
         self.lpips = LPIPSLoss(reduction="none",)
         self.to(self.device)
@@ -765,13 +715,13 @@ class Dreamer4(nn.Module):
 
 
     def evaluate(self, buffer, steps=4): 
-        s, a = buffer.sample_seq( 1, 64)[:2]
+        s, a = buffer.sample_probe( 1, 64)[:2]
         s = torch.from_numpy(s).to(self.device).float()
         a = torch.from_numpy(a).to(self.device).float()
         
         with torch.no_grad():
             z = self.encoder(s)
-            z_eval = self.latent_imagination(z[:,:], a[:,:], ctx_len=a.size(1), eval_=False, forced=True)[0]
+            z_eval = self.latent_imagination(z[:,:], a[:,:], ctx_len=a.size(1), eval_=False,random=False, forced=True)[0]
             decoded = self.decode(z_eval).detach().cpu().numpy()
             for i in range(decoded.shape[1]):
                 cv2.imwrite(f"./eval_imgs/imag_{i}.png", 255 * decoded[0, i].transpose(1, 2, 0)[..., ::-1])
@@ -807,33 +757,6 @@ class Dreamer4(nn.Module):
         sigs[..., 0] = tau_idx_t
         sigs[..., 1] = k_idx_t
         return sigs
-
-    def make_tau_schedule(self, *, k_max: int, schedule: str, d: Optional[float] = None) -> Dict[str, Any]:
-        """
-        Returns a schedule dict:
-        K = number of integration steps (also grid size)
-        e = log2(K)  (step_idx)
-        scale = k_max // K
-        tau_idx[i] = discrete signal index at step i
-        tau[i] = i/K
-        dt = 1/K
-        """
-        if schedule == "finest":
-            K = k_max
-        elif schedule == "shortcut":
-            assert d is not None, "shortcut schedule requires --eval_d"
-            inv = int(round(1.0 / float(d)))
-            assert inv <= k_max, "eval_d must be >= 1/k_max"
-            assert (k_max % inv) == 0, "k_max must be divisible by 1/eval_d"
-            K = inv
-        else:
-            raise ValueError(f"unknown schedule: {schedule}")
-
-        e = int(round(math.log2(K)))
-        scale = k_max // K
-        tau = [i / K for i in range(K)] + [1.0]
-        tau_idx = [i * scale for i in range(K)] + [k_max] # allow final clean index
-        return dict(K=K, e=e, scale=scale, tau=tau, tau_idx=tau_idx, dt=1.0 / K, schedule=schedule, d=1.0 / K)
     @torch.no_grad()
     def shortcut_generate(
         self,
@@ -844,61 +767,89 @@ class Dreamer4(nn.Module):
     ):
         device = z_prev.device
         dtype = z_prev.dtype
+        
+        # --- 1. Input Prep ---
         if z_prev.dim() == 3:
             z_prev = z_prev.unsqueeze(2)
         B, T, Nz, Dz = z_prev.shape
         
-        # 1. HARD FIX: Ensure N matches your training kmax (8)
-        N = getattr(self, "shortcut_kmax", 8) 
-        if N != 8: 
-            print(f"Warning: shortcut_kmax is {N}, forcing 8 for safety")
-            N = 8
-
-        # 2. Calculate Stride & K correctly for Consistency
-        if steps > N: steps = N
+        # --- 2. Configuration & Safeguards ---
+        # Retrieve max K (N) from model config if available, else default to 8
+        N = getattr(self, "shortcut_kmax", 8)
+        
+        # Clamp steps to valid range [1, N]
+        steps = min(max(steps, 1), N)
+        
+        # Calculate Stride (Resolution)
+        # e.g., N=8, steps=4 -> stride=2 (jump 2 levels at a time)
         stride = N // steps
         
-        # 3. Create the Schedule (Linear in time, Discrete in signal)
-        # tau goes from 0.0 -> 1.0
-        tau = torch.linspace(0, 1, steps + 1, device=device)[:-1] # [0, 0.25, 0.5, 0.75]
-        dt = 1.0 / steps
-        
-        # 4. Define the Discrete Signals (The source of the bug)
-        # Training used k_pow (0..log2(N)). We must match that.
-        # Stride 2 => log2(2) = 1. Stride 1 => log2(1) = 0.
-        k_step_idx = int(math.log2(stride)) 
-        
-        # Context is ground truth => treated as "Finest Scale" (Stride 1 => Index 0)
-        
-        # Tau index for context is "Done" (N-1 or N depending on your embedding size)
-        # Assuming you want "Clean":
+        # Calculate k_idx for the model's consistency head
+        # We assume k corresponds to powers of 2 (stride 1->k=0, stride 2->k=1, etc.)
+        # max(0, ...) prevents errors if stride < 1 somehow
+        k_step_idx = int(math.log2(stride)) if stride > 0 else 0
+        device = "cuda"
+        B, T1, Nz, Dz = B, 4, Nz, Dz
 
-        # Initial Noise
+        # We add one extra timestep so a_{T-1} has a place to show up (z_{T}).
+        T2 = T + 1
+
+        z = torch.zeros((B, T1+1, Nz, Dz), device=device)
+
+        # actions length must be T2-1
+        a0 = torch.zeros((B, T1+1, 2), device=device)
+        a1 = torch.randn((B, T1+1, 2), device=device).clamp(-1, 1)
+
+        # signals for T2
+        sigss = self.make_signals_indices(B, T1+1, Nz, tau_idx=N, k_idx=0,)
+
+        z0, _ = self.transformer(z, a0, sigss)
+        z1, _ = self.transformer(z, a1, sigss)
+
+        # Check the LAST predicted step (this is where the last action can influence)
+        d = (z1[:, -1] - z0[:, -1])
+        print("max_abs:", d.abs().max().item())
+        print("abs_mean:", d.abs().mean().item())
+        print("allclose:", torch.allclose(z0[:, -1], z1[:, -1], atol=1e-6, rtol=1e-5))
         z = torch.randn((B, 1, Nz, Dz), device=device, dtype=dtype)
-
+        # --- 4. Generation Loop ---
         for i in range(steps):
-            tau_i = tau[i]
-            # Use the EXACT same integer math as training
-            tau_idx_val = int(round(float(tau_i) * N)) 
+            # Current time index (0 to N-stride)
+            curr_step_idx = i * stride
             
-            # 1. Match the context tau to the training 'N'
-            tau_signals = torch.full((B, T + 1, Nz), N, device=device, dtype=torch.long)
-            tau_signals[:, -1] = tau_idx_val
+            # --- Signal Construction ---
+            # TAU: Context is "Clean" (Index N), Target is current noise level
+            # Check model config: Does embedding have size N+1? If not, use N-1 for context.
+            clean_idx = N  # Assumes embedding size is N+1 (0..N)
             
-            # 2. Match the k_idx (k_step_idx should be 1 for steps=4, N=8)
+            # Create full sequence signals
+            tau_signals = torch.full((B, T + 1, Nz), clean_idx, device=device, dtype=torch.long)
+            tau_signals[:, -1] = curr_step_idx
+            
+            # K (Stride): Context is Finest Scale (0), Target is current stride (k_step_idx)
             k_signals = torch.full((B, T + 1, Nz), 0, device=device, dtype=torch.long)
             k_signals[:, -1] = k_step_idx
 
             sigs = torch.stack([tau_signals, k_signals], dim=-1)
 
+            # --- Forward Pass ---
             packed_seq = torch.cat([z_prev, z], dim=1)
-            # Ensure we are not detaching history if it's supposed to be part of the gradient
-            x1_hat_full = self.transformer(packed_seq, a, sigs, detach_agent=False)[0]
+            
+            # Note: detach_agent=False is likely irrelevant in no_grad, but kept for API consistency
+            x1_hat_full = self.transformer(
+                packed_seq, a, sigs, detach_agent=False, task_id=self.task_id
+            )[0]
+            
+            # We only care about the prediction for the new token
             x1_hat = x1_hat_full[:, -1:]
 
-            # 3. Stability: Optional - reduce first step size if dt=0.25 is too aggressive
-            denom = (1.0 - tau_i).clamp(min=1e-5)
-            z = z + (x1_hat - z) * (dt / denom)
+            # --- Euler Step (Numerically Stable) ---
+            # Formula: z_new = z_old + (x_target - z_old) * (dt / (1 - t))
+            # In integer steps, dt/(1-t) simplifies to 1 / (steps_remaining)
+            steps_remaining = steps - i
+            step_size = 1.0 / steps_remaining
+            
+            z = z + (x1_hat - z) * step_size
 
         return z.clamp(-1, 1) if clamp else z
     def shortcut_forcing(self, z_t, actions, mask: torch.Tensor | None = None):
@@ -970,7 +921,7 @@ class Dreamer4(nn.Module):
          #   signals=self.make_signals_indices(B, T, Nz, tau_idx_sig, k_sig),
           #  detach_agent=False,
         #)[0][:, -T:]
-        x1_hat = self.transformer(z_targ, actions[:,:-1], signals = self.make_signals_indices(B, T, Nz, tau_idx_sig, k_sig), detach_agent=True)[0]
+        x1_hat = self.transformer(z_targ, actions[:,:-1], signals = self.make_signals_indices(B, T, Nz, tau_idx_sig, k_sig), task_id=self.task_id, detach_agent=False)[0]
         # Endpoint mask (tau == 1)
         is_end = (tau_idx == N).float().unsqueeze(-1)          # [B,T,Nz,1]
 
@@ -995,6 +946,7 @@ class Dreamer4(nn.Module):
             z1_prime = self.transformer(
                 z_targ,
                 actions[:,:-1],
+                task_id=self.task_id,
                 signals=self.make_signals_indices(B, T, Nz, tau_idx_sig, k_half),  # k_half still power-index
             )[0][:, -T:]
 
@@ -1010,6 +962,7 @@ class Dreamer4(nn.Module):
             z1_mid = self.transformer(
                 z_mid,
                 actions[:,:-1],
+                task_id=self.task_id,
                 signals=self.make_signals_indices(B, T, Nz, tau_mid_idx_safe, k_half),
             )[0][:, -T:]
 
@@ -1091,22 +1044,29 @@ class Dreamer4(nn.Module):
             device = initial_latent.device
             
             # FIX 1: Do NOT slice [:1]. Keep the full context history provided.
-            z_all = initial_latent.detach()[:,:1]
+            z_all = initial_latent.detach()[:,:]
             # Initialize executed actions. 
             # If actions are provided (Reward training), we use them. 
             # If None (Policy), we start empty.
-            a_exec = actions[:,:0] 
+            a_exec = None
             kl_list, h_list, lp_list, a_list = [], [], [], []
             N = int(getattr(self, "shortcut_kmax", 8)) 
-            z_out = []
+            z_inp=z_all
+            a_exec = actions
+            if not eval_:
+                z_inp = z_all[:,:1]
+                a_exec = None
             for i in range(ctx_len):
                 # Current state input
-                z_inp = z_all
+                
                 B, T_curr, Nz, _ = z_inp.shape
                 
                 # Add noise for robustness
                 noised_z_inp = (0.9 * z_inp + 0.1 * torch.randn_like(z_inp))
-                
+                # --- Dynamics Step (Next State) ---
+                    # Training: Use Ground Truth (Teacher Forcing)
+                    # If initial_latent contains the full sequence, we just advance the window
+
                 # --- Feature Extraction ---
                 if eval_:
                     # Policy Mode: Run transformer on accumulated history
@@ -1115,7 +1075,7 @@ class Dreamer4(nn.Module):
                             noised_z_inp, 
                             a_exec, 
                             signals=self.make_signals_indices(B, T_curr, Nz, N, int(math.log2(N))), 
-                         
+                         task_id=self.task_id,
                             detach_agent=False
                         )
                 elif not eval_ and forced:
@@ -1136,7 +1096,8 @@ class Dreamer4(nn.Module):
                         noised_z_inp, 
                         curr_actions, 
                         signals=self.make_signals_indices(B, T_curr, Nz, N, int(math.log2(N))), 
-                        detach_agent=detach
+                        detach_agent=detach,
+                        task_id=self.task_id
                     )
 
                 # Get the features for the LAST step to feed into Policy/Value heads
@@ -1168,22 +1129,17 @@ class Dreamer4(nn.Module):
                 kl_list.append(kl)
 
                 # Accumulate actions
-                if a_exec.shape[1] == 0: a_exec = a
+                if a_exec is None: a_exec = a
                 else: a_exec = torch.cat([a_exec, a], dim=1)
 
                 h_list.append(h_last)
-
-                # --- Dynamics Step (Next State) ---
                 if eval_ or (not eval_ and forced):
                     # Imagination: Use the model to predict next z
                     with torch.no_grad():
-                        # Note: shortcut_generate needs full history
                         z_next = self.shortcut_generate(noised_z_inp, a_exec, steps=steps)[:, -1:]
-                    z_all = torch.cat([z_all, z_next], dim=1)
-                    z_out.append(z_next)
-                    # Training: Use Ground Truth (Teacher Forcing)
-                    # If initial_latent contains the full sequence, we just advance the window
+                    z_inp = torch.cat([z_inp, z_next], dim=1)
 
+                
             h = torch.cat(h_list, dim=1)
             kl = torch.cat(kl_list, dim=1)
 
@@ -1193,9 +1149,8 @@ class Dreamer4(nn.Module):
             else:
                 lp = torch.zeros_like(kl)
                 imagined_actions = actions # Return GT actions in train mode
-
             # Return relevant slice (exclude initial context from output if desired, or keep all)
-            return torch.cat(z_out, 1), h, lp, kl, imagined_actions
+            return z_inp, h, lp, kl, imagined_actions
     def decode(self, latents):
         return self.decoder(latents)
 
@@ -1278,50 +1233,56 @@ class Dreamer4(nn.Module):
         actor_gn = 0.
         kl = 0.
         self.steps += 1
-        self.rep_optim.zero_grad()
-        self.dyn_optim.zero_grad()
-        if train_reward:
-            self.ac_optim.zero_grad()
-        self.policy_optim.zero_grad()
+        k = buffer.rng.integers(self.batch_lengths[0], self.batch_lengths[1])
+        s = buffer.sample_probe(self.batch_size, k)
+
+        states, actions, reward, termination, = s
+        full_sequence = states[0].transpose(0,2,3,1)
+
+        states = torch.from_numpy(states).to(self.device).float()
+        actions = torch.from_numpy(actions).to(self.device).float()
+        reward = torch.from_numpy(reward).to(self.device).float()
+        termination = torch.from_numpy(termination).to(self.device).float()
 
         for i in tqdm(range(self.grad_accum)):
-            k = buffer.rng.integers(self.batch_lengths[0], self.batch_lengths[1])
-            s = buffer.sample_seq(self.batch_size, k)
-
-            states, actions, reward, termination, = s
-            full_sequence = states[0].transpose(0,2,3,1)
-
-            states = torch.from_numpy(states).to(self.device).float()
-            actions = torch.from_numpy(actions).to(self.device).float()
-            reward = torch.from_numpy(reward).to(self.device).float()
-            termination = torch.from_numpy(termination).to(self.device).float()
             if not model and not policy and not train_reward:
+                self.rep_optim.zero_grad()
+
+                self.dyn_optim = None
+                self.ac_optim = None
+                self.policy_optim = None
+                self.ac_optim=  None
                 self.encoder.train()
                 self.decoder.train()
 
                 z_t   = self.encoder(apply_random_patch_mask(states, max_mask_ratio=0.9)[0])
                 reconst = self.decode(z_t)
                 
-                full_sequence = reconst[0].detach().cpu().numpy().transpose(0,2,3,1)
-                if self.steps % 99==0:
+                full_sequence = reconst[0].clone().detach().cpu().numpy().transpose(0,2,3,1)
+                if self.steps % 100 ==0 and i ==0:
                     for i in range(full_sequence.shape[0]):
                         frame_bgr = full_sequence[i][..., ::-1] *255
                         cv2.imwrite(f"./eval_imgs/reconst_{i}.png", frame_bgr.astype(np.uint8))        
                 reconst = 2 * reconst - 1
-                states = 2 * states - 1
-                mse = ((F.mse_loss(reconst, states, reduction="none").squeeze(-1))).mean()
-                lp  = (self.lpips(reconst, states)).mean()
-                reconst_loss = (mse + 0.2 * lp )
+                targ_state = 2 * states - 1
+                mse = ((F.mse_loss(reconst, targ_state, reduction="none").squeeze(-1))).mean()
+                lp  = (self.lpips(reconst, targ_state))
+                reconst_loss = (mse + 0.2 * lp.mean() )
 
                 
-                (reconst_loss/self.grad_accum).backward()
-                model_gn = adaptive_grad_clip(self, 0.3)
-                if i == self.grad_accum-1:
+                (reconst_loss*10).backward()
 
-                    (self.rep_optim).step()
-                self.train()
+                encoder_gn = adaptive_grad_clip(self.encoder, 0.3)
+                decoder_gn = adaptive_grad_clip(self.decoder, 0.3)
+
+            #if i == self.grad_accum-1:
+
+                (self.rep_optim).step()
             if model:
 
+                self.rep_optim = None
+                self.policy_optim = None
+                self.dyn_optim.zero_grad()
                     # Create the full trajectory first
                     # shape: (Batch, Sequence_Length + 1, ...)
                 full_sequence = states
@@ -1335,20 +1296,17 @@ class Dreamer4(nn.Module):
                 kl_loss, _ = self.shortcut_forcing( z_t, actions)
                 kl = kl_loss.detach().item()
                 dyn_loss = kl_loss
-                self.freeze_agent_token()
                 self.dyn_optim.zero_grad()
                         # Scale the loss before backward
                 (dyn_loss/self.grad_accum).backward()
-                        
-                        # Unscale gradients before clipping (important!)
-                        
-                        
-                        # Now you can clip (gradients are back to normal magnitude)
+                  # [B,T,D]
+                                        # Unscale gradients before clipping (important!)
                 model_gn = adaptive_grad_clip(self, 0.3)
                         
                 if i == self.grad_accum-1:
                     (self.dyn_optim.step())
             if train_reward:
+                self.ac_optim.zero_grad()
                 clean_latents = self.encoder((states))
                 _, h_grad = self.latent_imagination(clean_latents, actions, ctx_len=clean_latents.shape[1], eval_=False, detach=False)[:2]
 
@@ -1370,6 +1328,10 @@ class Dreamer4(nn.Module):
                 (self.ac_optim).step()
                 self.train()
             if policy:
+                self.dyn_optim = None
+                self.ac_optim = None
+                self.ac_optim=  None
+
                 with torch.amp.autocast( "cuda",dtype=torch.float16, enabled=True):
                     initial_latent = self.encoder(states[:, :])
                     H = torch.randint(7, self.horizon_length - 1, size=(1,))[0].item()
@@ -1439,7 +1401,8 @@ class Dreamer4(nn.Module):
             logger["actor_loss"] = actor_loss.detach().item()
         else:
             logger["reconst"] = reconst_loss.detach().item()
-            logger["model_gn"] = model_gn 
+            logger["encoder_gn"] = encoder_gn 
+            logger["decoder_gn"] = decoder_gn 
 
         return logger
 
@@ -1450,18 +1413,18 @@ class Reward(nn.Module):
         self.bin_num = int(bin_num)
         self.latent_dim = int(latent_dim)
 
-        self.network = build_network(latent_dim, 256, 2, "SwiGLU", 512)
+        self.network = build_network(latent_dim, 2*latent_dim, 2, "SwiGLU", latent_dim*2)
 
         self.reward_head = nn.Sequential(
             SwiGLU(),
-            nn.RMSNorm(256),
-            nn.Linear(256, self.mtp * self.bin_num),
+            nn.RMSNorm(latent_dim),
+            nn.Linear(latent_dim, self.mtp * self.bin_num),
         )
 
         self.term_head = nn.Sequential(
             SwiGLU(),
-            nn.RMSNorm(256),
-            nn.Linear(256, 1),
+            nn.RMSNorm(latent_dim),
+            nn.Linear(latent_dim, 1),
         )
 
     def forward(self, x: torch.Tensor):
@@ -1497,9 +1460,9 @@ class Decoder(nn.Module):
         patch: int = 16,
         z_dim: int = 16,
         d_model: int = 256,
-        n_heads: int = 8,
+        n_heads: int = 4,
         depth: int = 8,
-        latent_tokens: int = 32,
+        latent_tokens: int = 64,
         time_every: int = 2,
         dropout: float = 0.05,
         max_T: int = 256,
@@ -1561,16 +1524,16 @@ class Decoder(nn.Module):
         # ---- patch queries ----
         pq = self.patch_queries.expand(B, T, self.num_patches, self.d_model)
         # IMPORTANT: put latents FIRST, then patch queries
-        x = torch.cat([zlat, pq], dim=2) + self.pos_embed_lat  # (B,T,L+Np,D)
+        x = torch.cat([zlat, pq, ], dim=2) + self.pos_embed_lat  # (B,T,L+Np,D)
         x = self.drop(x)
-        space_mask = decoder_modality_mask(L, [self.num_patches], device=x.device)
+        space_mask = modality_mask(L, [self.num_patches], encoder=False, device=x.device)
 
         # ---- transformer ----
         for blk in self.blocks:
             if blk.time_attn_enabled:
-                x = blk(x, agent_space="none", mask=None)          # no space mask here
+                x = blk(x,  mask=None)          # no space mask here
             else:
-                x = blk(x, agent_space="none", mask=space_mask)    # modality mask only here
+                x = blk(x,  mask=space_mask)    # modality mask only here
         x = self.ln_out(x)
 
         # ---- decode ONLY patch tokens ----
