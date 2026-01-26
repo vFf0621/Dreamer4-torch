@@ -584,7 +584,7 @@ class TokenDynamics(nn.Module):
         return z_pred, policy_feat
 
 class Dreamer4(nn.Module):
-    def __init__(self,ch=3, h=96, w=96, patches = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512, 
+    def __init__(self,agent_id, ch=3, h=96, w=96, patches = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512, 
                  rep_depth = 8, rep_d_model=256, dyn_d_model=256, num_heads=8, dropout=0.1, k_max=8, mtp=8, 
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,
@@ -596,7 +596,8 @@ class Dreamer4(nn.Module):
  
         self.device="cuda" if torch.cuda.is_available() else "cpu"
         self.pretrain = False
-        
+        self.agent_id = agent_id
+
         # --- TokenDynamics ---
         # level_vocab, step_vocab match
         self.transformer = TokenDynamics(
@@ -1002,7 +1003,7 @@ class Dreamer4(nn.Module):
         return tau, d
 
     def save_checkpoint(self, name):
-        torch.save(self.state_dict(), "./ckpts/" + name)
+        torch.save(self.state_dict(), f"./ckpts/Agent-{self.agent_id}-Task-{self.task_id}-" + name)
     def save_rep(self, name):
         torch.save(self.encoder.state_dict(), "./ckpts/" + "enc.pt")
         torch.save(self.decoder.state_dict(), "./ckpts/"+"dec.pt")
@@ -1253,9 +1254,9 @@ class Dreamer4(nn.Module):
                 encoder_gn = adaptive_grad_clip(self.encoder, 0.3)
                 decoder_gn = adaptive_grad_clip(self.decoder, 0.3)
 
-            #if i == self.grad_accum-1:
+                if i == self.grad_accum-1:
 
-                (self.rep_optim).step()
+                    (self.rep_optim).step()
             if model:
 
                 self.rep_optim = None
