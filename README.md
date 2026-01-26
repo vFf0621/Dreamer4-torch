@@ -23,7 +23,7 @@ To Install the MultiCarRacing environment, please see:
 
 https://github.com/vFf0621/Dreamer4-compact/tree/main/multi_car_racing
 
-Some codes were borrowed from:
+Some small functions' codes were borrowed from:
 
 ```bibtex
 @inproceedings{hansen2024tdmpc2,
