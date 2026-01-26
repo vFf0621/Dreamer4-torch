@@ -384,7 +384,7 @@ class TokenDynamics(nn.Module):
         self.max_T = max_T
         self.use_agent_token = use_agent_token
         self.device = device
-        self.Sa = 1
+        self.Sa = Sa
         self.action_dim = action_dim
         self.action_bins = action_bins
         self.d_model = d_model
@@ -395,7 +395,7 @@ class TokenDynamics(nn.Module):
         # --- Discrete signal embeddings (tau_idx + k_idx) ---
         self.level_vocab = int(level_vocab)
         self.step_vocab = int(step_vocab)
-        self.space_pos_embed = nn.Parameter(0.02 * torch.randn(1, 1, self.Sa + latent_tokens+2, d_model))
+        self.space_pos_embed = nn.Parameter(0.02 * torch.randn(1, 1, self.Sa + self.Nz+2, d_model))
         self.z_proj = nn.Sequential(nn.RMSNorm(Dz), nn.Linear(Dz, d_model))
         self.sig_proj = nn.Sequential(nn.RMSNorm(level_dim), nn.Linear(level_dim, d_model))
 
@@ -403,12 +403,12 @@ class TokenDynamics(nn.Module):
         self.step_emb  = nn.Embedding(self.step_vocab, level_dim)
         self.action_conditioner = nn.Parameter(0.02 * torch.randn(1, 1, self.Sa, d_model))
 
-        self.action_pad = nn.Parameter(0.02 * torch.randn(1, 1, 1, d_model))
+        self.action_pad = nn.Parameter( torch.zeros(1, 1, 1, d_model))
         self.action_lookup = action_lookup
 
         # --- Action embedding (true lookup, no one-hot materialization) ---
         self.action_embs = nn.ModuleList([nn.Embedding(action_bins, self.d_model) for _ in range(self.action_dim)] )
-        self.action_noormalize = nn.RMSNorm(d_model)
+        self.action_normalize = nn.RMSNorm(d_model)
         # --- z + signal -> model dim --
 
         # Agent token (learned)
@@ -432,7 +432,39 @@ class TokenDynamics(nn.Module):
         self.out = build_network(d_model, 2*d_model, 3, "SwiGLU", Dz)
 
         self.to(device)
+    def interleave_obs_and_actions(self, z_emb, a_emb):
+            """
+            Interleaves the first Sa observation tokens with actions.
+            Appends the remaining N-Sa tokens at the end.
+            """
+            B, T, N, D = z_emb.shape
+            Sa = self.Sa
+            assert self.Sa <= N
 
+            # 1. Ensure action has the 'N' dim
+            if a_emb.dim() == 3:
+                a_emb = a_emb.unsqueeze(2)  # (B, T, 1, D)
+
+            # 2. Split z_emb into "paired" and "unpaired"
+            z_paired = z_emb[:, :, :Sa]      # Shape: (B, T, Sa, D)
+            z_rest   = z_emb[:, :, Sa:]      # Shape: (B, T, N-Sa, D)
+
+            # 3. Expand Actions to match Sa
+            # Note: We expand to 'z_paired', not the full 'z_emb'
+            a_emb = a_emb.expand_as(z_paired) + self.action_conditioner
+
+            # 4. Stack and Flatten the Paired Section
+            # stack -> (B, T, Sa, 2, D)
+            # flatten -> (B, T, 2*Sa, D) -> [z0, a0, z1, a1, ... z_Sa, a_Sa]
+            paired = torch.stack((z_paired, a_emb), dim=3).flatten(2, 3)
+
+            # 5. Concatenate the Rest
+            # Result -> [z0, a0, ... z_Sa, a_Sa, z_Sa+1, z_Sa+2 ...]
+            interleaved = torch.cat([paired, z_rest], dim=2)
+            
+            return interleaved
+
+# Forwar 
     # -----------------------------
     # Discretization helpers
     # -----------------------------
@@ -457,7 +489,7 @@ class TokenDynamics(nn.Module):
             raise ValueError(...)
 
         if Ta == T:
-            return actions[:, :-1] if self.mask_last_action else actions[:, :-1]
+            return actions[:, :-1]
         if Ta == T-1:
             return actions
 
@@ -506,9 +538,9 @@ class TokenDynamics(nn.Module):
         a = 0
         for i, emb in enumerate(self.action_embs):
             a = a + emb(act_idx[..., i])                                        # [B, T-1, D]
-        a = self.action_noormalize(a) 
+        a = self.action_normalize(a) 
         a_emb = a[:, :,None, :]                                          # [B, T-1, 1, D]
-        pad = self.action_pad.expand(B, 1, self.Sa, self.d_model)  +self.action_conditioner                   # [B, 1, 1, D]
+        pad = self.action_pad.expand(B,1,1,-1)         # [B, 1, 1, D]
         a_emb = torch.cat([a_emb, pad], dim=1)                                  # [B, T, 1, D]
         signals = signals.long()
         if signals.dim() == 4 and signals.size(-1) == 2:
@@ -528,7 +560,7 @@ class TokenDynamics(nn.Module):
         # 2. Stack at dim=3 (immediately after N)
         # This places z and a side-by-side for every N element.
         # New Shape: (B, T, N, 2, D)
-        x =torch.cat([z_inp, a_emb], 2)
+        x =self.interleave_obs_and_actions(z_inp, a_emb)
         # 3. Flatten the N dimension (dim 2) and the new stack dimension (dim 3)
         # New Shape: (B, T, N * 2, D)
         x = torch.cat([x, self.sig_proj(lev_feat + step_feat).unsqueeze(-2), ], dim=2)
@@ -536,7 +568,7 @@ class TokenDynamics(nn.Module):
         Nmain = x.size(2)
 
         token_pad_mask = torch.zeros(B, T, Nmain, device=device, dtype=torch.bool)  # True = PAD
-        token_pad_mask[:, -1, Nz:Nz+self.Sa] = True
+        token_pad_mask[:, -1, 1:2*self.Sa:2] = True
         agent = None
         x_aug = x
         if policy_tok_in is not None:
@@ -561,10 +593,7 @@ class TokenDynamics(nn.Module):
             token_pad_mask_aug = torch.cat([token_pad_mask, pad_agent], dim=2)
             
             if blk.time_attn_enabled:
-                x_aug = blk(
-                    x_aug,
-                    agent_idx=agent_idx,
-                )
+                x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, agent_idx=agent_idx)
             else:
                 x_aug = blk(
                     x_aug,
@@ -576,10 +605,9 @@ class TokenDynamics(nn.Module):
             agent = x_aug[:, :, agent_idx:agent_idx+1, :]
             x = x_aug[:, :, :agent_idx, :]
         agent_out_bt = agent[:, :, 0, :]
+        h_hist = torch.cat([x[:, :, 0:2*self.Sa:2, :], x[:,:,2*self.Sa:Nz+self.Sa]], 2)
 
-        h_hist = x[:, :, :Nz, :]
         z_pred = self.out(h_hist)
-
         policy_feat = agent_out_bt[:, -1:, :] if agent_out_bt is not None else None
         return z_pred, policy_feat
 
@@ -691,7 +719,7 @@ class Dreamer4(nn.Module):
 
             # clean level for context
             N = int(getattr(self, "shortcut_kmax", 64))
-            tau_clean_idx = max(0, N - 1)
+            tau_clean_idx = max(0, N)
             sigs = self.make_signals_indices(B, T, Nz, tau_idx=N-1, k_idx=0)
 
             _, h = self.transformer(z, self.action_buffer, signals=sigs)
@@ -799,7 +827,8 @@ class Dreamer4(nn.Module):
             # --- Signal Construction ---
             # TAU: Context is "Clean" (Index N), Target is current noise level
             # Check model config: Does embedding have size N+1? If not, use N-1 for context.
-            clean_idx = N  # Assumes embedding size is N+1 (0..N)
+
+            clean_idx = N # Assumes embedding size is N+1 (0..N)
             
             # Create full sequence signals
             tau_signals = torch.full((B, T + 1, Nz), clean_idx, device=device, dtype=torch.long)
@@ -878,7 +907,7 @@ class Dreamer4(nn.Module):
         j = torch.minimum(j, n_cells)                          # safety
 
         tau_idx = j * s                                        # in {0, s, ..., N}  (endpoint included)
-        tau = (tau_idx.float() / float(N)).unsqueeze(-1).clamp(min=0.1)       # can be exactly 1.0
+        tau = (tau_idx.float() / float(N)).unsqueeze(-1).clamp(min=0.1) # can be exactly 1.0
 
         # Build noisy sample between z0 and clean x1
         z_targ = (1.0 - tau) * z0 + tau * z1_clean
@@ -1035,13 +1064,14 @@ class Dreamer4(nn.Module):
             if not eval_:
                 z_inp = z_all[:,:1]
                 a_exec = None
+            noise = 0.1 * torch.randn(initial_latent.shape[0], ctx_len, *initial_latent.shape[-2:], device=self.device)
             for i in range(ctx_len):
                 # Current state input
                 
                 B, T_curr, Nz, _ = z_inp.shape
                 
                 # Add noise for robustness
-                noised_z_inp = (0.9 * z_inp + 0.1 * torch.randn_like(z_inp))
+                noised_z_inp = (0.9 * z_inp +noise[:,:i+1] )
                 # --- Dynamics Step (Next State) ---
                     # Training: Use Ground Truth (Teacher Forcing)
                     # If initial_latent contains the full sequence, we just advance the window
