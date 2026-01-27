@@ -395,6 +395,7 @@ class TokenDynamics(nn.Module):
         # --- Discrete signal embeddings (tau_idx + k_idx) ---
         self.level_vocab = int(level_vocab)
         self.step_vocab = int(step_vocab)
+        self.space_pos_embed = nn.Parameter(0.02 * torch.randn(1, 1, self.Sa + self.Nz+2, d_model))
         self.z_proj = nn.Sequential(nn.RMSNorm(Dz), nn.Linear(Dz, d_model))
         self.sig_proj = nn.Sequential(nn.RMSNorm(level_dim), nn.Linear(level_dim, d_model))
 
@@ -583,6 +584,7 @@ class TokenDynamics(nn.Module):
             agent_in = agent.detach() if detach_agent else agent
         x_aug = torch.cat([x, agent_in], dim=2)
         agent_out_bt = None
+        x_aug = x_aug + self.space_pos_embed.expand(B,1,-1,self.d_model)
         for blk in self.blocks:
             S = x_aug.size(2)
             agent_idx = S - 1
