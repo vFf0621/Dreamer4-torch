@@ -18,14 +18,14 @@ import os
 os.makedirs("./ckpts", exist_ok=True)
 os.makedirs("./eval_imgs", exist_ok=True)
 
-def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, patches , latent_tokens, z_dim, action_dim, latent_dim, 
+def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, patch , latent_tokens, z_dim, action_dim, latent_dim, 
                  rep_depth , rep_d_model, dyn_d_model, num_heads, dropout, k_max, mtp, task_id,
                  policy_bins , reward_bins , pretrain, reward_clamp,level_vocab , level_embed_dim,mode,num_tasks, Sa,
                  batch_lens, batch_size, accum, max_imag_len, buffer_limit, train, ckpt, rep_lr=1e-4, rep_decay=1e-3,
                  dyn_lr=1e-4, dyn_decay=1e-3, ac_lr = 1e-4, ac_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3 ):
     agents = [Dreamer4(agent_id=i, ch=ch, h=h,
                 w=w, 
-                patches = patches, 
+                patch = patch, 
                 latent_tokens=latent_tokens, 
                 z_dim=z_dim,
                 action_dim=action_dim, 
@@ -76,10 +76,6 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
             train_model =False#(epi > 0) and (epi <= 1200) 
             train_policy = False#(epi > 900)
         elif mode=="dyn":
-            train_reward=False
-            train_model =True#(epi > 0) and (epi <= 1200) 
-            train_policy = False#(epi > 900)
-        elif mode == "finetune_bc":
             train_reward=True
             train_model =True#(epi > 0) and (epi <= 1200) 
             train_policy = False#(epi > 900)
@@ -180,8 +176,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ch", type=int, default=3)
     p.add_argument("--h", type=int, default=96)
     p.add_argument("--w", type=int, default=96)
-    p.add_argument("--patches", type=int, default=16)
-    p.add_argument("--latent_tokens", type=int, default=32)
+    p.add_argument("--patch", type=int, default=8)
+    p.add_argument("--latent_tokens", type=int, default=16)
     p.add_argument("--z_dim", type=int, default=16)
     p.add_argument("--action_dim", type=int, default=2)
 
@@ -190,11 +186,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--pred_dim", type=int, default=512)
     p.add_argument("--rep_depth", type=int, default=6)
-    p.add_argument("--rep_d_model", type=int, default=512)
+    p.add_argument("--rep_d_model", type=int, default=256)
     p.add_argument("--dyn_d_model", type=int, default=512)
-    p.add_argument("--num_heads", type=int, default=8)
-    p.add_argument("--dropout", type=float, default=0.1)
-    p.add_argument("--k_max", type=int, default=8)
+    p.add_argument("--num_heads", type=int, default=4)
+    p.add_argument("--dropout", type=float, default=0.05)
+    p.add_argument("--k_max", type=int, default=32)
     p.add_argument("--mtp", type=int, default=7)
     p.add_argument("--num_tasks", type=int, default=10)
     p.add_argument("--task_id", type=int, default=0)
@@ -203,10 +199,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--policy_bins", type=int, default=100)
     p.add_argument("--reward_bins", type=int, default=100)
     p.add_argument("--reward_clamp_abs", type=float, default=6)
-    p.add_argument("--level_vocab", type=int, default=16)
-    p.add_argument("--level_embed_dim", type=int, default=64)
+    p.add_argument("--level_vocab", type=int, default=129)
+    p.add_argument("--level_embed_dim", type=int, default=256)
     p.add_argument("--ckpt", type=str, default=None)
-    p.add_argument("--dyn_lr", type=float, default=1e-4)
+    p.add_argument("--dyn_lr", type=float, default=1e-5)
     p.add_argument("--dyn_decay", type=float, default=1e-3)
     p.add_argument("--rep_lr", type=float, default=1e-4)
     p.add_argument("--rep_decay", type=float, default=1e-3)
@@ -256,7 +252,7 @@ def main():
         ch=args.ch,
         h=args.h,
         w=args.w,
-        patches=args.patches,
+        patch=args.patch,
         latent_tokens=args.latent_tokens,
         z_dim=args.z_dim,
         action_dim=args.action_dim,
