@@ -130,9 +130,6 @@ class GQA(nn.Module):
             causal = causal[None, None, :, :]  
             attn_mask_ = causal if attn_mask_ is None else (attn_mask_ | causal)
 
-        if key_padding_mask is not None:
-            kpm = key_padding_mask[:, None, None, :]  
-            attn_mask_ = kpm if attn_mask_ is None else (attn_mask_ | kpm)
         if attn_mask is not None:
             out = F.scaled_dot_product_attention(
                 q, k, v,
@@ -407,7 +404,7 @@ class TokenDynamics(nn.Module):
         self.action_conditioner = nn.Parameter(0.02 * torch.randn(1, 1, self.Sa, d_model))
         self.reserved = nn.Parameter(0.02 * torch.randn(1, 1, self.Nr, d_model))
 
-        self.action_pad = ( torch.zeros(1, 1, 1, d_model, device=self.device))
+        self.action_pad = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model))
         self.action_lookup = action_lookup
 
         # --- Action embedding (true lookup, no one-hot materialization) ---
@@ -496,15 +493,24 @@ class TokenDynamics(nn.Module):
             return actions[:, :-1]
         if Ta == T-1:
             return actions
+        else:
+            raise ValueError("Incorrect action shape")
+
 
 
     def agent_mask(self, S: int, agent_idx: int, device=None) -> torch.Tensor:
+    # 1. Initialize: Everyone sees everyone (True = Keep)
         allow = torch.ones((S, S), dtype=torch.bool, device=device)
-        allow[:, agent_idx] = False      # others can't read agent
-        allow[agent_idx, :] = True       # agent can read everyone
-        allow[agent_idx, agent_idx] = True
+        
+        # 2. Block everyone from reading 'agent_idx'
+        allow[:, agent_idx] = False
+        
+        # 3. Allow 'agent_idx' to read everyone (Overwrites self-loop to True)
+        allow[agent_idx, :] = True
+        
+        # For SDPA (True=Keep), return allow directly. DO NOT invert (~).
         return ~allow
-                    # Forwar
+                        # Forwar
     # -----------------------------
     def forward(
         self,
@@ -551,7 +557,7 @@ class TokenDynamics(nn.Module):
         # 2. Stack at dim=3 (immediately after N)
         # This places z and a side-by-side for every N element.
         # New Shape: (B, T, N, 2, D)
-        x, N_inter =self.interleave_obs_and_actions(z_inp, a_emb)
+        x, inter =self.interleave_obs_and_actions(z_inp, a_emb)
         # 3. Flatten the N dimension (dim 2) and the new stack dimension (dim 3)
         # New Shape: (B, T, N * 2, D)
         x = torch.cat([x, self.sig_proj(lev_feat + step_feat).unsqueeze(-2), ], dim=2)
@@ -559,7 +565,7 @@ class TokenDynamics(nn.Module):
         Nmain = x.size(2)
 
         token_pad_mask = torch.zeros(B, T, Nmain, device=device, dtype=torch.bool)  # True = PAD
-        token_pad_mask[:, -1, 1:2*self.Sa:2] = True
+         # token_pad_mask[:, -1, 1:2*self.Sa:2] = True
         agent = None
         x_aug = x
         if policy_tok_in is not None:
@@ -597,7 +603,7 @@ class TokenDynamics(nn.Module):
         agent = x_aug[:, :, agent_idx:agent_idx+1, :]
         x = x_aug[:, :, :agent_idx, :]
         agent_out_bt = agent[:, :, 0, :]
-        x_main = x[:, :, :N_inter, :]
+        x_main = x[:, :, :inter, :]
         z_first = x_main[:, :, :2*self.Sa:2, :]          # Sa tokens: z0..z(Sa-1)
         z_rest  = x_main[:, :, 2*self.Sa:2*self.Sa+(Nz-self.Sa), :] # Nz-Sa tokens: zSa..z(Nz-1)
 
@@ -737,7 +743,7 @@ class Dreamer4(nn.Module):
 
 
     def evaluate(self, buffer, steps=4): 
-        s, a = buffer.sample_probe( 1, 64)[:2]
+        s, a = buffer.sample_seq( 1, 64)[:2]
         s = torch.from_numpy(s).to(self.device).float()
         a = torch.from_numpy(a).to(self.device).float()
         
@@ -1204,7 +1210,7 @@ class Dreamer4(nn.Module):
         kl = 0.
         self.steps += 1
         k = buffer.rng.integers(self.batch_lengths[0], self.batch_lengths[1])
-        s = buffer.sample_probe(self.batch_size, k)
+        s = buffer.sample_seq(self.batch_size, k)
         self.dyn_optim.zero_grad()
 
         states, actions, reward, termination, = s
@@ -1216,6 +1222,7 @@ class Dreamer4(nn.Module):
         termination = torch.from_numpy(termination).to(self.device).float()
         self.rep_optim.zero_grad()
         self.policy_optim.zero_grad(set_to_none=True)
+
         scaler = GradScaler(enabled=True)  # set False to debug in full fp32
         for i in tqdm(range(self.grad_accum)):
             if not model and not policy and not train_reward:
@@ -1260,7 +1267,6 @@ class Dreamer4(nn.Module):
                 kl_loss, _ = self.shortcut_forcing( z_t, actions)
                 kl = kl_loss.detach().item()
                 dyn_loss = kl_loss
-                self.dyn_optim.zero_grad()
                                                 # Scale the loss before backward
                 (dyn_loss/self.grad_accum).backward()
                     # [B,T,D]
@@ -1269,8 +1275,8 @@ class Dreamer4(nn.Module):
                             
                 if i == self.grad_accum-1:
                     (self.dyn_optim).step()
-
-                (self.dyn_optim).zero_grad()
+                    self.dyn_optim.zero_grad()
+            if train_reward:
                 clean_latents = self.encoder((states)).detach()
                 B, T, Nz, _ = clean_latents.shape
 
@@ -1297,6 +1303,8 @@ class Dreamer4(nn.Module):
                 if i == self.grad_accum-1:
 
                     (self.dyn_optim).step()
+                    self.dyn_optim.zero_grad()
+
             if policy:
  
 
@@ -1351,7 +1359,7 @@ class Dreamer4(nn.Module):
         if model:   
             logger["model_gn"] = model_gn 
             logger["shortcut_loss"] = kl
-
+        elif train_reward:
             logger["finetune_bc_loss"] = action_loss.mean().detach().item()
             logger["reward_loss"] = reward_loss.detach().item()
             logger["termination_loss"] = term_loss.detach().item()

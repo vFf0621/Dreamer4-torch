@@ -79,7 +79,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
             train_model =False#(epi > 0) and (epi <= 1200) 
             train_policy = False#(epi > 900)
         elif mode=="dyn":
-            train_reward=True
+            train_reward=False
             train_model =True#(epi > 0) and (epi <= 1200) 
             train_policy = False#(epi > 900)
         elif mode=="policy":
@@ -208,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--level_embed_dim", type=int, default=256)
     p.add_argument("--ckpt", type=str, default=None)
     p.add_argument("--dyn_lr", type=float, default=1e-4)
-    p.add_argument("--dyn_decay", type=float, default=1e-6)
+    p.add_argument("--dyn_decay", type=float, default=1e-4)
     p.add_argument("--rep_lr", type=float, default=1e-4)
     p.add_argument("--rep_decay", type=float, default=1e-3)
     p.add_argument("--policy_lr", type=float, default=1e-4)
