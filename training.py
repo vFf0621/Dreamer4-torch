@@ -18,11 +18,11 @@ import os
 os.makedirs("./ckpts", exist_ok=True)
 os.makedirs("./eval_imgs", exist_ok=True)
 
-def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, patch , latent_tokens, z_dim, action_dim, latent_dim, 
-                 rep_depth , rep_d_model, dyn_d_model, num_heads, dropout, k_max, mtp, task_id,
-                 policy_bins , reward_bins , pretrain, reward_clamp,level_vocab , level_embed_dim,mode,num_tasks, Sa,
+def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, patch , Nr, latent_tokens, z_dim, action_dim, latent_dim, 
+                 rep_depth , rep_d_model, dyn_d_model, num_heads, dropout, k_max, mtp, task_id,  kmax_prob,
+                 policy_bins , reward_bins , pretrain, reward_clamp,level_vocab , level_embed_dim,mode,num_tasks, Sa,finetune_length,
                  batch_lens, batch_size, accum, max_imag_len, buffer_limit, train, ckpt, rep_lr=1e-4, rep_decay=1e-3,
-                 dyn_lr=1e-4, dyn_decay=1e-3, ac_lr = 1e-4, ac_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3 ):
+                 dyn_lr=1e-4, dyn_decay=1e-3, ac_lr = 1e-4, ac_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3 , save_every=500):
     agents = [Dreamer4(agent_id=i, ch=ch, h=h,
                 w=w, 
                 patch = patch, 
@@ -37,7 +37,10 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
                 dropout=dropout, 
                 k_max=k_max, 
                 Sa = Sa, 
+                Nr = Nr, 
+                kmax_prob=kmax_prob,
                 mtp=mtp, 
+                finetune_length=finetune_length,
                 num_tasks=num_tasks,
                 policy_bins = policy_bins, 
                 reward_bins = reward_bins, 
@@ -143,9 +146,9 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
         if train and buffer.full: # Ensure min buffer size
             for a in agents:
                 # Note: buffer is passed directly; train_one_epoch handles sampling internally
-                log_data = a.train_one_epoch(writer, buffer, model=train_model, policy=train_policy, train_reward=train_reward)
+                log_data = a.train_step(writer, buffer, model=train_model, policy=train_policy, train_reward=train_reward)
                 wandb.log(data=log_data)
-        if epi%1000==0:
+        if epi%save_every==0:
         # --- Checkpointing ---
             print(">>> Saving Parameters <<<")
             for i in range(len(agents)):
@@ -173,24 +176,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--buffer_limit", type=int, default=12000)
 
     # Observation / encoding
-    p.add_argument("--ch", type=int, default=3)
-    p.add_argument("--h", type=int, default=96)
-    p.add_argument("--w", type=int, default=96)
-    p.add_argument("--patch", type=int, default=8)
-    p.add_argument("--latent_tokens", type=int, default=16)
-    p.add_argument("--z_dim", type=int, default=16)
+    p.add_argument("--ch", type=int, default=3, help="Image Channels")
+    p.add_argument("--h", type=int, default=96, help="Image Height")
+    p.add_argument("--w", type=int, default=96, help="Image Width")
+    p.add_argument("--patch", type=int, default=8, help="Patch Size")
+    p.add_argument("--latent_tokens", type=int, default=64, help="Nz")
+    p.add_argument("--reserved_tokens", type=int, default=4, help="Nr")
+
+    p.add_argument("--z_dim", type=int, default=16, help="Bottleneck")
     p.add_argument("--action_dim", type=int, default=2)
-
+    p.add_argument("--kmax_base_prob", type=int, default=0.75)
     # Model sizes
-    p.add_argument("--Sa", type=int, default=8)
+    p.add_argument("--Sa", type=int, default=64)
 
-    p.add_argument("--pred_dim", type=int, default=512)
-    p.add_argument("--rep_depth", type=int, default=6)
+    p.add_argument("--pred_dim", type=int, default=256)
+    p.add_argument("--rep_depth", type=int, default=4, help="Has to be a multiple of 2")
     p.add_argument("--rep_d_model", type=int, default=256)
-    p.add_argument("--dyn_d_model", type=int, default=512)
-    p.add_argument("--num_heads", type=int, default=4)
+    p.add_argument("--dyn_d_model", type=int, default=256)
+    p.add_argument("--num_heads", type=int, default=8)
     p.add_argument("--dropout", type=float, default=0.05)
-    p.add_argument("--k_max", type=int, default=32)
+    p.add_argument("--k_max", type=int, default=8, help="Has to be a power of 2")
     p.add_argument("--mtp", type=int, default=7)
     p.add_argument("--num_tasks", type=int, default=10)
     p.add_argument("--task_id", type=int, default=0)
@@ -202,8 +207,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--level_vocab", type=int, default=129)
     p.add_argument("--level_embed_dim", type=int, default=256)
     p.add_argument("--ckpt", type=str, default=None)
-    p.add_argument("--dyn_lr", type=float, default=1e-5)
-    p.add_argument("--dyn_decay", type=float, default=1e-3)
+    p.add_argument("--dyn_lr", type=float, default=1e-4)
+    p.add_argument("--dyn_decay", type=float, default=1e-6)
     p.add_argument("--rep_lr", type=float, default=1e-4)
     p.add_argument("--rep_decay", type=float, default=1e-3)
     p.add_argument("--policy_lr", type=float, default=1e-4)
@@ -221,15 +226,18 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("MIN_LEN", "MAX_LEN"),
         help="Batch length range, e.g. --batch_lens 45 65",
     )
-    p.add_argument("--batch_size", type=int, default=3)
-    p.add_argument("--accum", type=int, default=1)
+    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--accum", type=int, default=5)
     p.add_argument("--max_imag_len", type=int, default=128)
+    # For memory considerations
+    p.add_argument("--ac_finetune_length", type=int, default=32)
 
     # Flags (default True -> allow toggling off with --no-*)
     p.add_argument("--train", dest="train", action="store_true", default=True)
     p.add_argument("--no-train", dest="train", action="store_false", help="Disable training mode.")
     p.add_argument("--pretrain", dest="pretrain", action="store_true", default=True)
     p.add_argument("--no-pretrain", dest="pretrain", action="store_false", help="Disable pretraining mode.")
+    p.add_argument("--save_every", type=int, default=500)
 
     return p
 
@@ -253,6 +261,7 @@ def main():
         h=args.h,
         w=args.w,
         patch=args.patch,
+        kmax_prob = args.kmax_base_prob,
         latent_tokens=args.latent_tokens,
         z_dim=args.z_dim,
         action_dim=args.action_dim,
@@ -273,6 +282,9 @@ def main():
         batch_lens=tuple(args.batch_lens),
         batch_size=args.batch_size,
         Sa=args.Sa,
+        Nr=args.reserved_tokens,    
+        save_every=args.save_every,
+        finetune_length=args.ac_finetune_length,
 
         accum=args.accum,
         max_imag_len=args.max_imag_len,

@@ -4,7 +4,7 @@ class ReplayBuffer:
     """
     Same interface and base outputs as your buffer.
     sample_seq() does NOT ignore short episodes. """
-    def __init__(self, buffer_limit=150000, obs_size=(3, 96, 96), action_size=2,
+    def __init__(self, buffer_limit=36000, obs_size=(3, 96, 96), action_size=2,
                  obs_dtype=np.float32, seed=None):
         print("buffer limit is = ", buffer_limit)
 
@@ -26,7 +26,7 @@ class ReplayBuffer:
 
         # Protect against stale pointers under ring overwrites
         self.write_id = np.zeros((self.buffer_limit,), dtype=np.int64)
-        self.next_write_id = np.zeros((self.buffer_limit,), dtype=np.int64)
+        self.next_write_id = np.zeros((self.buffer_limit, ), dtype=np.int64)
         self._global_write_counter = np.int64(1)
 
         # For single-stream collection: link previous transition to current if not terminal
@@ -39,7 +39,8 @@ class ReplayBuffer:
         return self.size()
 
     def add(self, state, action, reward, next_state, done):
-
+        if self.full:
+            return
         i = self.idx
 
         # Overwrite-safe reset of outgoing pointer from this slot
@@ -66,8 +67,8 @@ class ReplayBuffer:
         self._prev = -1 if bool(done) else i
 
         # Advance cursor
-        self.idx = (i + 1) % self.buffer_limit
-        self.full = self.full or (self.idx == 0)
+        self.idx = (i + 1)
+        self.full = (self.idx == self.buffer_limit)
 
     def sample(self, n):
         max_idx = self.size()
@@ -91,18 +92,58 @@ class ReplayBuffer:
         return self._probe_cache
 
     def sample_seq(self, batch_size, chunk_size):
+        N = int(self.buffer_limit)
+        B = int(batch_size)
+        L = int(chunk_size)
 
-        last_filled_index = self.idx - chunk_size + 1
-        assert self.full or (last_filled_index > batch_size), "too short dataset or too long chunk_size"
+        assert L >= 1
+        assert self.full or (self.idx >= L), "too short dataset or too long chunk_size"
 
-        high = self.buffer_limit if self.full else last_filled_index
-        sample_index = self.rng.integers(0, high, size=int(batch_size), endpoint=False).reshape(-1, 1)
+        done = self.terminal[:N].astype(bool)
 
-        chunk_length = np.arange(chunk_size).reshape(1, -1)
-        sample_index = (sample_index + chunk_length) % self.buffer_limit
+        valid = np.ones(N, dtype=bool)
+
+        if not self.full:
+            last_start = self.idx - L
+            valid[:] = False
+            if last_start >= 0:
+                valid[: last_start + 1] = True
+
+            if L > 1 and last_start >= 0:
+                # terminals in [s, s+L-2] must be 0
+                window = L - 1
+                # prefix sum over the *filled* region only
+                d = done[: self.idx].astype(np.int32)
+                cs = np.concatenate(([0], np.cumsum(d)))  # length idx+1
+
+                s = np.arange(last_start + 1)             # 0..last_start
+                terminals_in_prefix = cs[s + window] - cs[s]  # length last_start+1
+                valid[: last_start + 1] &= (terminals_in_prefix == 0)
+
+        else:
+            if L > 1:
+                # avoid ring discontinuity at idx-1 -> idx
+                bad = (self.idx - np.arange(1, L)) % N
+                valid[bad] = False
+
+                # forbid episode crossing: no done in first L-1 steps (circular)
+                window = L - 1
+                d2 = np.concatenate([done, done[:window]]).astype(np.int32)  # length N+window
+                cs = np.concatenate(([0], np.cumsum(d2)))                   # length N+window+1
+
+                s = np.arange(N)  # 0..N-1
+                terminals_in_prefix = cs[s + window] - cs[s]  # length N (FIX)
+                valid &= (terminals_in_prefix == 0)
+
+        candidates = np.flatnonzero(valid)
+        assert candidates.size >= B, f"Not enough valid sequences: need {B}, have {candidates.size}"
+
+        starts = self.rng.choice(candidates, size=B, replace=False)
+        offsets = np.arange(L, dtype=np.int64)[None, :]
+        sample_index = (starts[:, None] + offsets) % N
 
         observation = self.observation[sample_index]
-        action = self.action[sample_index]
-        reward = self.reward[sample_index]
-        done = self.terminal[sample_index]
-        return observation, action, reward, done
+        action      = self.action[sample_index]
+        reward      = self.reward[sample_index]
+        done_seq    = self.terminal[sample_index]
+        return observation, action, reward, done_seq

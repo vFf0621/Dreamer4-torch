@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as td
 from torch.distributions.transforms import TanhTransform
-import math
 from collections.abc import Iterable
 
 def soft_ce(pred, target, bins, minv, maxv):
@@ -53,6 +52,15 @@ def two_hot_inv(x, bin_num, minv, maxv):
     x = F.softmax(x, dim=-1)
     x = torch.sum(x * dreg_bins, dim=-1, keepdim=True)
     return symexp(x)
+
+def concat_mtp(x, mtp):
+    if len(x.shape) < 3:
+        x = x[None]
+    last= x[:,-mtp]
+    prev = x[:,:-mtp, 0]   
+    seq = torch.cat([prev, last], 1)   
+    return seq
+
 
 def build_network(input_size, hidden_size, num_layers, activation, output_size, rms=True):
 
@@ -327,31 +335,10 @@ class RoPE1D(nn.Module):
         cos = self.cos_cached[..., :T, :].to(dtype=x.dtype)
         sin = self.sin_cached[..., :T, :].to(dtype=x.dtype)
         return cos, sin
-def decoder_modality_mask(L: int, modality_sizes: list[int], device=None) -> torch.Tensor:
-    """
-    Layout: [z | m1 | m2 | ...]
-    Decoder rule:
-      - z queries attend only to z keys
-      - modality_i queries attend to z keys + modality_i keys
-    Returns boolean mask [S,S] where True blocks attention.
-    """
-    S = L + sum(modality_sizes)
-    allow = torch.zeros((S, S), dtype=torch.bool, device=device)
 
-    # z attends only to z
-    allow[:L, :L] = True
-
-    # each modality attends to (z + itself)
-    start = L
-    for n in modality_sizes:
-        allow[start:start+n, :L] = True               # to z
-        allow[start:start+n, start:start+n] = True    # within itself
-        start += n
-
-    return ~allow
 
 def causal_mask(T: int, device=None) -> torch.Tensor:
-    return torch.triu(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1)
+    return ~torch.triu(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1)
 
 class ActionBinning:
     def __init__(self, bins=50, low=-1.0, high=1.0, device="cuda"):
@@ -391,31 +378,63 @@ class ActionBinning:
         dist = td.OneHotCategorical(logits=logits)
         sample_one_hot = dist.sample() 
         return (sample_one_hot * self.centers).sum(dim=-1)
-    
-def encoder_modality_mask(
-    L: int,                   # number of latent (z) tokens
-    modality_sizes: list[int], # [n1, n2, ...]
-    device=None
+def modality_mask(
+    L: int,                   
+    modality_sizes: list[int], 
+    device=None,
+    encoder=True  # <--- You must pass False for the Decoder!
 ) -> torch.Tensor:
-    """
-    Returns a boolean mask [S, S] where True = BLOCK attention, False = ALLOW.
-    Layout: [z | m1 | m2 | ...]
-    Encoder rule:
-      - z queries attend to all keys
-      - modality queries attend only within same modality
-    """
-    S = L + sum(modality_sizes)
+    
+    Np = sum(modality_sizes)
+    S  = L + Np
     allow = torch.zeros((S, S), dtype=torch.bool, device=device)
+    
+    if not encoder:
+        # --- ENCODER LOGIC ---
+        # 1. Latents read from everything (to encode)
+        allow[:L, :] = True 
+        
+        # 2. Patches read from Patches (spatial context)
+        #    BUT Patches DO NOT read from Latents (prevent leakage)
+        allow[L:, L:] = True
 
-    # z attends to everything
-    allow[:L, :] = True
+    else:
+        # --- DECODER LOGIC ---
+        # 1. Latents read ONLY from Latents (keep source pure)
+        allow[:L, :L] = True
+        
+        # 2. Patches read from Patches (to form image) 
+        #    AND Patches read from Latents (CRITICAL: this is the gradient path)
+        allow[L:, :] = True  # <--- This fixes the zero grad
 
-    # each modality attends only to itself
-    start = L
-    for n in modality_sizes:
-        allow[start:start+n, start:start+n] = True
-        start += n
-
-    # Convert allow->mask-out
-    attn_mask = ~allow  # True means "block"
-    return attn_mask
+    return ~allow
+import seaborn as sns
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.pyplot as plt
+def save_attention_mask(mask, filename, title="Attention Mask"):
+    """
+    Saves a 2D attention mask as an image file.
+    
+    Args:
+        mask (Tensor): 2D Tensor of shape (H, W)
+        filename (str): Path to save (e.g., 'plots/mask_epoch_1.png')
+    """
+    # 1. Prepare Data: Detach, move to CPU, convert to numpy
+    if isinstance(mask, torch.Tensor):
+        mask = mask.detach().cpu().numpy()
+        
+    # 2. Create Figure
+    plt.figure(figsize=(8, 8))
+    plt.imshow(mask, cmap='viridis', interpolation='nearest')
+    
+    # 3. Styling
+    plt.colorbar(label='Weight')
+    plt.title(title)
+    plt.xlabel("Key")
+    plt.ylabel("Query")
+    
+    # 4. Save and Close (Crucial for memory management in loops)
+    # bbox_inches='tight' prevents labels from being cut off
+    plt.savefig(filename, bbox_inches='tight', dpi=150)
+    plt.close()
