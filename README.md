@@ -28,6 +28,10 @@ Below are the training artifacts:
 
 <img width="2528" height="1328" alt="W B Chart 1_29_2026, 2_38_32 PM" src="https://github.com/user-attachments/assets/a39382a6-44b9-44cf-bf16-82580ecf19e1" />
 
+And the reconstructed sequence:
+
+![animation](https://github.com/user-attachments/assets/58b96292-2dd8-400f-b737-4e584e16c627)
+
 
 Install via 
 ```python
