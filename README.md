@@ -30,7 +30,7 @@ Below are the training artifacts:
 
 And the reconstructed sequence:
 
-![animation](https://github.com/user-attachments/assets/58b96292-2dd8-400f-b737-4e584e16c627)
+![output](https://github.com/user-attachments/assets/bf886ed2-76cb-436f-b59e-ef61e5fcbdbe)
 
 
 Install via 
