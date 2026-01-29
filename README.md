@@ -13,6 +13,8 @@ Action inputs are expected to be normalized to [-1, 1]. Discrete action inputs h
 
 This will NOT be any more data efficient than other implementations; it just consists of fewer lines of code.
 
+Action embeddings are interleaved with the latent, not added.
+
 As well, there will be no need of curating a dataset(the dataset is generated through random interactions at first).
 
 Install via 
