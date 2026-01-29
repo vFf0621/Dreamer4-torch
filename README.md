@@ -34,14 +34,6 @@ Some small functions' codes were borrowed from:
   booktitle={International Conference on Learning Representations (ICLR)},
   year={2024}
 }
-@misc{Hansen2026Dreamer4PyTorch,
-    title={Dreamer 4 in PyTorch},
-    author={Nicklas Hansen},
-    year={2026},
-    publisher={GitHub},
-    journal={GitHub repository},
-    howpublished={\url{https://github.com/nicklashansen/dreamer4}},
-}
 
 @misc{ghugare2023simplifyingmodelbasedrllearning,
       title={Simplifying Model-based RL: Learning Representations, Latent-space Models, and Policies with One Objective}, 
