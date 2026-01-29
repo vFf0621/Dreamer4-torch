@@ -24,10 +24,10 @@ Below are the training artifacts:
 
 <img width="2528" height="1328" alt="W B Chart 1_29_2026, 2_38_21 PM" src="https://github.com/user-attachments/assets/dc894084-0112-4b96-85a1-f797532b97bf" />
 
-<img width="2528" height="1328" alt="W B Chart 1_29_2026, 2_38_27 PM" src="https://github.com/user-attachments/assets/b6de4922-9ccc-46f8-ab54-3d7fe
+<img width="2528" height="1328" alt="W B Chart 1_29_2026, 2_38_27 PM" src="https://github.com/user-attachments/assets/b6de4922-9ccc-46f8-ab54-3d7fe0aa54c9" />
 
 <img width="2528" height="1328" alt="W B Chart 1_29_2026, 2_38_32 PM" src="https://github.com/user-attachments/assets/a39382a6-44b9-44cf-bf16-82580ecf19e1" />
-0aa54c9" />
+
 
 Install via 
 ```python
