@@ -72,7 +72,7 @@ class Policy(nn.Module):
 
 # ---- Highway-gated residual wrapper ---
 class GQA(nn.Module):
-    def __init__(self, embed_dim=16, num_heads=8, num_kv_heads=4, dropout=0.1, causal=False):
+    def __init__(self, embed_dim=16, num_heads=8, num_kv_heads=4, dropout=0.1, causal=False,device="cuda"):
         super().__init__()
         assert embed_dim % num_heads == 0
         assert num_heads % num_kv_heads == 0
@@ -91,7 +91,7 @@ class GQA(nn.Module):
         self.norm = nn.RMSNorm(embed_dim)
         self.q_norm = nn.RMSNorm(self.head_dim)
         self.k_norm = nn.RMSNorm(self.head_dim)
-
+        self.device=device
         if causal:
             self.rope = RoPE1D(self.head_dim)
         self.dropout = dropout
@@ -102,13 +102,13 @@ class GQA(nn.Module):
         xk_in = x_k if x_k is not None else xq
         Tk = xk_in.shape[1]
 
-        q = self.q_proj(xq)    
-        k = self.k_proj(xk_in) 
-        v = self.v_proj(xk_in) 
+        q = self.q_proj(xq)
+        k = self.k_proj(xk_in)
+        v = self.v_proj(xk_in)
 
-        q = q.view(B, Tq, self.num_heads, self.head_dim).transpose(1, 2)      
-        k = k.view(B, Tk, self.num_kv_heads, self.head_dim).transpose(1, 2)   
-        v = v.view(B, Tk, self.num_kv_heads, self.head_dim).transpose(1, 2)   
+        q = q.view(B, Tq, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, Tk, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, Tk, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         if self.causal:
             cos, sin = self.rope(q, seq_len=Tq)
@@ -117,34 +117,62 @@ class GQA(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        attn_mask_ = None
-        if attn_mask is not None:
-            attn_mask_ = attn_mask
-            if attn_mask_.dim() == 2:
-                attn_mask_ = attn_mask_[None, None, :, :]   
-            elif attn_mask_.dim() == 3:
-                attn_mask_ = attn_mask_[:, None, :, :]      
+        # =====================================================
+        # BUILD FINAL ATTENTION MASK (SDPA bool mask)
+        # =====================================================
 
+        # ---- key padding mask (block padded keys) ----
+        final_bias = None  # additive float bias
+
+        # ---- user-provided attn_mask ----
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                # bool allow mask (True=allow) -> additive bias
+                bias = torch.zeros_like(attn_mask, dtype=q.dtype, device=q.device)
+                bias.masked_fill_(~attn_mask, float("-inf"))
+            else:
+                # already additive bias (0 / -inf)
+                bias = attn_mask.to(device=q.device, dtype=q.dtype)
+
+            # normalize shape to be broadcastable
+            if bias.dim() == 2:
+                bias = bias[None, None, :, :]       # [1,1,Tq,Tk]
+            elif bias.dim() == 3:
+                bias = bias[:, None, :, :]          # [B,1,Tq,Tk]
+
+            final_bias = bias
+
+        # ---- key padding mask (block padded KEYS) ----
+        if key_padding_mask is not None:
+            # key_padding_mask: [B, Tk], True = PAD
+            if key_padding_mask.dim() != 2 or key_padding_mask.shape != (B, Tk):
+                raise ValueError(f"key_padding_mask must be [B,Tk]=[{B},{Tk}], got {tuple(key_padding_mask.shape)}")
+
+            kpm_bias = torch.zeros((B, 1, 1, Tk), dtype=q.dtype, device=q.device)
+            kpm_bias.masked_fill_(key_padding_mask[:, None, None, :], float("-inf"))
+
+            final_bias = kpm_bias if final_bias is None else (final_bias + kpm_bias)
+
+        # ---- causal mask (ONLY if time attention) ----
         if self.causal:
-            causal = torch.ones((Tq, Tk), dtype=torch.bool, device=q.device).triu(1)  
-            causal = causal[None, None, :, :]  
-            attn_mask_ = causal if attn_mask_ is None else (attn_mask_ | causal)
+            # block attending to future keys: j > i
+            causal_bool = torch.ones((Tq, Tk), dtype=torch.bool, device=q.device).tril(diagonal=0)
+            causal_bias = torch.zeros((Tq, Tk), dtype=q.dtype, device=q.device)
+            causal_bias.masked_fill_(~causal_bool, float("-inf"))
+            causal_bias = causal_bias[None, None, :, :]  # [1,1,Tq,Tk]
 
-        if attn_mask is not None:
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask_,
-                dropout_p=self.dropout,
-                is_causal=False,
-                enable_gqa=True,
-            )
-        else:
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=self.dropout,
-                is_causal=self.causal,
-                enable_gqa=True,
-            )
+            final_bias = causal_bias if final_bias is None else (final_bias + causal_bias)
+
+        # =====================================================
+        # SDPA
+        # =====================================================
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=final_bias,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,   # IMPORTANT: we already applied causal bias
+            enable_gqa=True,
+        )
 
         out = out.transpose(1, 2).contiguous().view(B, Tq, D)
         return self.out_proj(out)
@@ -158,9 +186,9 @@ class CausalSTBlock(nn.Module):
         self.ln_space = nn.RMSNorm(d_model)
 
         if not self.time_attn_enabled:
-            self.space_attn = GQA(d_model, n_heads, n_heads // 2, dropout, )
+            self.space_attn = GQA(d_model, n_heads, n_heads // 2, dropout, device=device)
         else:
-            self.time_attn = GQA(d_model, n_heads, n_heads // 2, dropout, causal=True)
+            self.time_attn = GQA(d_model, n_heads, n_heads // 2, dropout, causal=True, device=device)
 
         self.num_reserved = num_reserved
         self.ln_time = nn.RMSNorm(d_model)
@@ -170,98 +198,96 @@ class CausalSTBlock(nn.Module):
         self.to(self.device)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        token_pad_mask: torch.Tensor | None = None,
-        *,
-        agent_idx: int | None = None,   
-        mask = None
-    ) -> torch.Tensor:
+            self,
+            x: torch.Tensor,
+            token_pad_mask: torch.Tensor | None = None,   # [B,T,N] True = PAD
+            *,
+            agent_idx: int | None = None,
+            mask=None,                                    # either None, or [N,N] or [N+R, N+R] additive float (-inf)
+            ) -> torch.Tensor:
         if x.dim() == 3:
             x = x.unsqueeze(2)  # [B,T,1,D]
 
         reserved = self.reserved_tokens
         B, T, N, D = x.shape
         R = reserved.shape[1]
+        Ncat = N + R
 
+        # ---- normalize token_pad_mask to [B,T,N] ----
         if token_pad_mask is not None:
             assert token_pad_mask.shape[:2] == (B, T), (token_pad_mask.shape, (B, T))
             if token_pad_mask.size(2) >= N:
                 token_pad_mask = token_pad_mask[:, :, :N]
             else:
-                pad = torch.zeros(B, T, N - token_pad_mask.size(2), dtype=torch.bool, device=x.device)
+                pad = torch.zeros(B, T, N - token_pad_mask.size(2),
+                                dtype=torch.bool, device=x.device)
                 token_pad_mask = torch.cat([token_pad_mask.to(x.device), pad], dim=2)
 
         if agent_idx is not None and not (0 <= agent_idx < N):
             raise ValueError(f"agent_idx={agent_idx} out of range for N={N}")
 
+        # =========================
+        # TIME ATTENTION
+        # =========================
         if self.time_attn_enabled:
             x_time = self.ln_time(x).permute(0, 2, 1, 3).reshape(B * N, T, D)
 
             time_kpm = None
             if token_pad_mask is not None:
+                # token_pad_mask: [B,T,N] -> [B,N,T] -> [B*N, T]
                 time_kpm = token_pad_mask.permute(0, 2, 1).reshape(B * N, T)
-            if mask is None:
-        
 
-                xt_out = self.time_attn(x_time, attn_mask=None, key_padding_mask=time_kpm)  
-            else:
-                xt_out = self.time_attn(x_time, attn_mask=mask, key_padding_mask=time_kpm)  
-
+            # Prefer is_causal=True inside your GQA/attn module if possible; otherwise pass a causal float mask.
+            xt_out = self.time_attn(
+                x_time,
+                attn_mask=None,              # or causal_mask(T) if your impl needs it
+                key_padding_mask=time_kpm,
+            )
 
             xt_out = xt_out.reshape(B, N, T, D).permute(0, 2, 1, 3)
-
-            
             x = x + xt_out
-
             x = x + self.mlp(x)
             return x.squeeze(2) if x.shape[2] == 1 else x
 
+        # =========================
+        # SPACE ATTENTION
+        # =========================
         x_space = self.ln_space(x)
-        xt = x_space.reshape(B * T, N, D)  
+        xt = x_space.reshape(B * T, N, D)  # [B*T, N, D]
+        xcat = torch.cat([xt, reserved.expand(B * T, R, D)], dim=1)  # [B*T, N+R, D]
 
+        # ---- build key_padding_mask for space attn: [B*T, N+R] ----
         space_kpm = None
         if token_pad_mask is not None:
-            space_kpm = token_pad_mask.reshape(B * T, N)  
+            space_kpm = token_pad_mask.reshape(B * T, N)  # [B*T, N]
+            # reserved tokens are never PAD
             space_kpm = torch.cat(
                 [space_kpm, torch.zeros(B * T, R, dtype=torch.bool, device=x.device)],
                 dim=1,
-            ) 
+            )  # [B*T, N+R]
 
-        
-        xcat = torch.cat([xt, reserved.expand(B * T, R, D)], dim=1)  # [B*T, N+R, D]
-
-        # 1) start with caller-provided mask (e.g., modality mask)
-        # --- build final attention mask over xcat = [tokens (N) | reserved (R)] ---
-        Ncat = N + R
+        # ---- build final additive attn mask over [N+R, N+R] ----
         final_mask = None
-
         if mask is not None:
             if mask.shape[-2:] == (N, N):
-                m = torch.zeros((Ncat, Ncat), dtype=torch.bool, device=x.device)
-                m[:N, :N] = mask  # embed caller mask on real tokens
-                # by default: allow attention to/from reserved tokens (block False)
+                # embed into top-left; allow everything involving reserved by default
+                m = torch.zeros((Ncat, Ncat), dtype=torch.float, device=x.device)
+                m[:N, :N] = mask
                 final_mask = m
             elif mask.shape[-2:] == (Ncat, Ncat):
                 final_mask = mask
             else:
-                raise ValueError(
-                    f"mask has shape {mask.shape}, expected ({N},{N}) or ({Ncat},{Ncat})"
-                )
-        else:
-            # no mask from caller: default allow-all (block nothing)
-            final_mask = torch.zeros((Ncat, Ncat), dtype=torch.bool, device=x.device)
+                raise ValueError(f"mask has shape {mask.shape}, expected ({N},{N}) or ({Ncat},{Ncat})")
 
-        # --- one-way agent rule: agent can't read others; others can read agent ---
-        #
-      #  save_attention_mask(final_mask, "attn_mask.png")
-        xs = self.space_attn(xcat, attn_mask=final_mask, key_padding_mask=space_kpm)[:, :N]
+        xs = self.space_attn(
+            xcat,
+            attn_mask=final_mask,          # additive float mask (0 / -inf)
+            key_padding_mask=space_kpm,    # True = PAD keys
+        )[:, :N]  # drop reserved outputs
 
         x = x + xs.reshape(B, T, N, D)
-    
         x = x + self.mlp(x)
         return x.squeeze(2) if x.shape[2] == 1 else x
-
 class Encoder(nn.Module):
     def __init__(
         self,
@@ -404,7 +430,7 @@ class TokenDynamics(nn.Module):
         self.action_conditioner = nn.Parameter(0.02 * torch.randn(1, 1, self.Sa, d_model))
         self.reserved = nn.Parameter(0.02 * torch.randn(1, 1, self.Nr, d_model))
 
-        self.action_pad = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model))
+        self.action_pad = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
         self.action_lookup = action_lookup
 
         # --- Action embedding (true lookup, no one-hot materialization) ---
@@ -425,6 +451,7 @@ class TokenDynamics(nn.Module):
                     dropout=dropout,
                     time_attn=use_time,
                     device=device,
+                    num_reserved=0,
                 )
             )
         self.blocks = nn.ModuleList(blocks)
@@ -433,38 +460,57 @@ class TokenDynamics(nn.Module):
         self.out = build_network(d_model, 2*d_model, 3, "SwiGLU", Dz)
 
         self.to(device)
-    def interleave_obs_and_actions(self, z_emb, a_emb):
-            """
-            Interleaves the first Sa observation tokens with actions.
-            Appends the remaining N-Sa tokens at the end.
-            """
-            B, T, N, D = z_emb.shape
-            Sa = self.Sa
-            assert self.Sa <= N
+    def recover_z(self, out: torch.Tensor):
+        """
+        out: [B,T,Nz+Sa,D] created by interleave_gb_1a
+        returns:
+        a_rec: [B,T,Sa,D]
+        b_rec: [B,T,Nz,D]
+        """
+        Sa = self.Sa
+        B, T, L, D = out.shape
+        assert L % Sa == 0, "Token length must be divisible by Sa"
+        block = L // Sa                 # block = g+1
+        g = block - 1
+        assert g >= 1
 
-            # 1. Ensure action has the 'N' dim
-            if a_emb.dim() == 3:
-                a_emb = a_emb.unsqueeze(2)  # (B, T, 1, D)
+        blocks = out.reshape(B, T, Sa, g+1, D)   # [B,T,Sa,g+1,D]
+        z_rec = blocks[:, :, :, :g, :].reshape(B, T, Sa*g, D)  # [B,T,Nz,D]
+       # a_rec = blocks[:, :, :,  g, :]                          # [B,T,Sa,D]
+        return z_rec
+    
+    def interleave_z_a(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        """
+        1 action token per (Nz/Sa) latent tokens
+        z: [B,T,Nz,D]
+        a: [B,T,Sa,D]
+        returns: [B,T,Nz+Sa,D]
+        """
+        B, T, Nz, D = z.shape
+        assert a.shape[0] == B and a.shape[1] == T and a.shape[3] == D
 
-            # 2. Split z_emb into "paired" and "unpaired"
-            z_paired = z_emb[:, :, :Sa]      # Shape: (B, T, Sa, D)
-            z_rest   = z_emb[:, :, Sa:]      # Shape: (B, T, N-Sa, D)
+        Sa = a.shape[2]
+        assert Nz % Sa == 0, f"Nz={Nz} must be divisible by Sa={Sa}"
+        g = Nz // Sa
 
-            # 3. Expand Actions to match Sa
-            # Note: We expand to 'z_paired', not the full 'z_emb'
-            a_emb = a_emb.expand_as(z_paired) + self.action_conditioner
+        z_grp = z.reshape(B, T, Sa, g, D)     # [B,T,Sa,g,D]
+        a_grp = a.unsqueeze(3)               # [B,T,Sa,1,D]
 
-            # 4. Stack and Flatten the Paired Section
-            # stack -> (B, T, Sa, 2, D)
-            # flatten -> (B, T, 2*Sa, D) -> [z0, a0, z1, a1, ... z_Sa, a_Sa]
-            paired = torch.stack((z_paired, a_emb), dim=3).flatten(2, 3)
-
-            # 5. Concatenate the Rest
-            # Result -> [z0, a0, ... z_Sa, a_Sa, z_Sa+1, z_Sa+2 ...]
-            interleaved = torch.cat([paired, z_rest], dim=2)
-            
-            return interleaved, interleaved.size(2)
-
+        out = torch.cat([z_grp, a_grp], dim=3)  # [B,T,Sa,g+1,D]
+        return out.reshape(B, T, Nz + Sa, D)
+    def make_kpm_for_actions(self, B, T, S, Nz, *, pad_action_t: int | None, device):
+        """
+        key_padding_mask: [B, T, S] with True = PAD (blocked as key).
+        pad_action_t:
+        - None  : no padded action timestep
+        - 0     : you PREPEND pad (a_{-1} unknown) -> t=0 action slots are padded
+        - T-1   : you APPEND pad (a_{T-1} unknown) -> last timestep action slots are padded
+        """
+        kpm = torch.zeros((B, T, S), dtype=torch.bool, device=device)
+        if pad_action_t is not None:
+            kpm[:, pad_action_t, Nz] = True
+        return kpm
+  
 # Forwar 
     # -----------------------------
     # Discretization helpers
@@ -498,20 +544,38 @@ class TokenDynamics(nn.Module):
 
 
 
-    def agent_mask(self, S: int, agent_idx: int, device=None) -> torch.Tensor:
-    # 1. Initialize: Everyone sees everyone (True = Keep)
+    def agent_mask(self, S: int, agent_idx: int, device=None, Nr: int = 0, *, dtype=torch.float32):
+        if not (0 <= agent_idx < S):
+            raise ValueError(f"agent_idx={agent_idx} out of range for S={S}")
+        if Nr < 0 or Nr > S:
+            raise ValueError(f"Nr={Nr} must satisfy 0 <= Nr <= S={S}")
+
         allow = torch.ones((S, S), dtype=torch.bool, device=device)
-        
-        # 2. Block everyone from reading 'agent_idx'
+
+        # Agent rule: others cannot read agent; agent reads everyone
         allow[:, agent_idx] = False
-        
-        # 3. Allow 'agent_idx' to read everyone (Overwrites self-loop to True)
         allow[agent_idx, :] = True
-        
-        # For SDPA (True=Keep), return allow directly. DO NOT invert (~).
-        return ~allow
-                        # Forwar
+        allow[agent_idx, agent_idx] = True
+
+        # Reserved rule: reserved can read everyone EXCEPT agent
+        if Nr > 0:
+            rs = S - Nr  # start index of reserved tokens
+            allow[rs:, agent_idx] = False  # reserved queries can't read agent
+            allow[rs:, rs:] = True         # reserved can read themselves
+
+        # Convert allow-mask -> additive bias (0 keep, -inf block)
+        attn_bias = torch.zeros((S, S), dtype=dtype, device=device)
+        attn_bias.masked_fill_(~allow, float("-inf"))
+
+        # Optional sanity checks (safe ones)
+        assert attn_bias.shape == (S, S)
+        assert torch.isfinite(attn_bias[allow]).all()
+
+        return attn_bias
+
+                                # Forwar
     # -----------------------------
+# -----------------------------
     def forward(
         self,
         z_tokens: torch.Tensor,                 # [B, T, Nz, Dz]
@@ -519,28 +583,33 @@ class TokenDynamics(nn.Module):
         signals: torch.Tensor,                  # [B, T, Nz, 2] (level_idx, step_idx)
         policy_tok_in: torch.Tensor | None = None,  # [1,1,1,D] or [B,1,1,D] or [B,T,1,D]
         detach_agent: bool = False,
-        last_z = None,
-        task_id = 0, 
+        last_z=None,
+        task_id=0,
     ):
+        assert (actions.size(1) == z_tokens.size(1) - 1) or ( actions.size(1) == z_tokens.size(1) )
         device = z_tokens.device
         if z_tokens.dim() != 4:
             raise ValueError(f"z_tokens must be [B,T,Nz,Dz], got {tuple(z_tokens.shape)}")
         if last_z is not None:
             z_tokens = torch.cat([z_tokens, last_z], dim=1)
-        B, T, Nz, Dz = z_tokens.shape
+
+        B, T, Nz_in, Dz = z_tokens.shape
 
         if signals.size(1) != T:
             raise ValueError(f"signals has T={signals.size(1)} but z_tokens has T={T}.")
-        acts_bt = self.align_actions(actions, T, B, z_tokens.dtype, device)   # [B, T-1, A]
-        act_idx = self.discretize_actions_to_indices(acts_bt)                   # [B, T-1, A]
+
+        acts_bt = self.align_actions(actions, T, B, z_tokens.dtype, device)          # [B, T-1, A]
+        act_idx = self.discretize_actions_to_indices(acts_bt)                        # [B, T-1, A]
 
         a = 0
         for i, emb in enumerate(self.action_embs):
-            a = a + emb(act_idx[..., i])                                        # [B, T-1, D]
-        a = self.action_normalize(a) 
-        a_emb = a[:, :,None, :]                                          # [B, T-1, 1, D]
-        pad = self.action_pad.expand(B,1,1,-1)         # [B, 1, 1, D]
-        a_emb = torch.cat([a_emb, pad], dim=1)                                  # [B, T, 1, D]
+            a = a + emb(act_idx[..., i])                                             # [B, T-1, D]
+        a = self.action_normalize(a)
+
+        a_emb = a[:, :, None, :]                                                     # [B, T-1, 1, D]
+        pad = self.action_pad.expand(B, 1, 1, -1)                                     # [B, 1, 1, D]
+        a_emb = torch.cat([a_emb, pad], dim=1)                                        # [B, T, 1, D]
+        a_tokens = a_emb.expand(-1, -1, self.Sa, -1) + self.action_conditioner  # [B,T,Sa,D]
         signals = signals.long()
         if signals.dim() == 4 and signals.size(-1) == 2:
             level_idx, step_idx = signals[..., 0], signals[..., 1]
@@ -549,85 +618,80 @@ class TokenDynamics(nn.Module):
         else:
             raise ValueError(f"signals must be [B,T,Nz,2] or [B,T,Nz], got {tuple(signals.shape)}")
 
-        level_t = level_idx[:, :, 0]                 # [B,T]
-        step_t  = step_idx[:, :, 0]                  # [B,T]        
+        level_t = level_idx[:, :, 0]                                                 # [B,T]
+        step_t  = step_idx[:, :, 0]                                                  # [B,T]
         lev_feat  = self.level_emb(level_t)
         step_feat = self.step_emb(step_t)
+
         z_inp = self.z_proj(z_tokens)
-        # 2. Stack at dim=3 (immediately after N)
-        # This places z and a side-by-side for every N element.
-        # New Shape: (B, T, N, 2, D)
-        x, inter =self.interleave_obs_and_actions(z_inp, a_emb)
-        # 3. Flatten the N dimension (dim 2) and the new stack dimension (dim 3)
-        # New Shape: (B, T, N * 2, D)
-        x = torch.cat([x, self.sig_proj(lev_feat + step_feat).unsqueeze(-2), ], dim=2)
 
+        # Interleave z + a, then append signal token
+        x = self.interleave_z_a(z_inp, a_tokens )                 # x: [B,T,?,D]
         Nmain = x.size(2)
-
-        token_pad_mask = torch.zeros(B, T, Nmain, device=device, dtype=torch.bool)  # True = PAD
-         # token_pad_mask[:, -1, 1:2*self.Sa:2] = True
+        x = torch.cat([x, self.sig_proj(lev_feat + step_feat).unsqueeze(-2)], dim=2)
+        token_pad_mask = self.make_kpm_for_actions(B, T, S=x.size(2), Nz=Nz_in, pad_action_t=T-1, device=device)
+        pad_extra = torch.zeros(B, T, 1 + self.Nr, dtype=torch.bool, device=device)
+        token_pad_mask_aug = torch.cat([token_pad_mask, pad_extra], dim=2)  # [B,T,Nmain+1+Nr]
         agent = None
-        x_aug = x
         if policy_tok_in is not None:
             ag = policy_tok_in
             if ag.size(0) == 1 and B > 1: ag = ag.expand(B, -1, -1, -1)
             if ag.size(1) == 1 and T > 1: ag = ag.expand(B, T, -1, -1)
-            if ag.size(2) != 1: raise ValueError("policy_tok_in token dim must be 1 at dim=2")
+            if ag.size(2) != 1:
+                raise ValueError("policy_tok_in token dim must be 1 at dim=2")
             agent = ag
             agent_in = agent.detach() if detach_agent else agent
         elif self.use_agent_token:
             assert task_id < self.num_task
             agent = self.agent_token[:, :, task_id].expand(B, T, 1, self.d_model)
             agent_in = agent.detach() if detach_agent else agent
+
         agent_idx = x.size(2)
-        reserved = self.reserved.expand(B, T, self.Nr, -1)
+        reserved  = self.reserved.expand(B, T, self.Nr, -1)
+
         x_aug = torch.cat([x, agent_in, reserved], dim=2)
-        agent_out_bt = None
-        x_aug = x_aug + self.space_pos_embed.expand(B,1,-1,self.d_model)
+        x_aug = x_aug + self.space_pos_embed.expand(B, 1, -1, self.d_model)
+
         for blk in self.blocks:
             S = x_aug.size(2)
-            tok_mask = self.agent_mask(S, agent_idx, device=device)
-            pad_agent = torch.zeros(B, T, 1 + self.Nr, dtype=torch.bool, device=device)
-            token_pad_mask_aug = torch.cat([token_pad_mask, pad_agent], dim=2)
-            
+            tok_mask = self.agent_mask(S, agent_idx, device=device, Nr=self.Nr)  # keep agent mask
+
             if blk.time_attn_enabled:
                 x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, agent_idx=None)
             else:
-                x_aug = blk(
-                    x_aug,
-                    token_pad_mask=token_pad_mask_aug,
-                    mask=tok_mask,
-                    agent_idx=agent_idx,
-                )
+                x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, mask=tok_mask, agent_idx=agent_idx)
 
         agent = x_aug[:, :, agent_idx:agent_idx+1, :]
-        x = x_aug[:, :, :agent_idx, :]
+        x     = x_aug[:, :, :agent_idx, :]
         agent_out_bt = agent[:, :, 0, :]
-        x_main = x[:, :, :inter, :]
-        z_first = x_main[:, :, :2*self.Sa:2, :]          # Sa tokens: z0..z(Sa-1)
-        z_rest  = x_main[:, :, 2*self.Sa:2*self.Sa+(Nz-self.Sa), :] # Nz-Sa tokens: zSa..z(Nz-1)
 
-        h_hist = torch.cat([z_first, z_rest], dim=2) # [B,T,Nz,D]
-        z_pred = self.out(h_hist)
-        policy_feat = agent_out_bt[:, :, :] if agent_out_bt is not None else None
-        return (z_pred), policy_feat
+
+        hist = self.recover_z(x[:,:,:Nmain])     
+
+        hist = hist.reshape(B, T*Nz_in, self.d_model)     # [B,T*Nz,D]
+        z = self.out(hist)                              # [B,T*Nz,Dz]
+        z_pred = z.view(B, T, Nz_in, Dz)            # [B,T,Nz,Dz]                        # [B,T,Nz,D]
+
+        policy_feat = agent_out_bt if agent_out_bt is not None else None
+        return z_pred, policy_feat
+
 
 class Dreamer4(nn.Module):
     def __init__(self,agent_id, ch=3, h=96, w=96, patch = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512, 
                  rep_depth = 8, rep_d_model=256, dyn_d_model=256, num_heads=8, dropout=0.1, k_max=8, mtp=8, 
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
-                 batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,
+                 batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, ac_lr = 1e-4, ac_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,
-                 finetune_length=32, kmax_prob=0.1):
+                kmax_prob=0.1):
         super(Dreamer4, self).__init__()
-        self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patch, 
+        self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patch, d_model=rep_d_model,
                                 n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=2,
                                 out_dim=z_dim, dropout=dropout, max_T=max_imag_len)
  
         self.device="cuda" if torch.cuda.is_available() else "cpu"
         self.pretrain = False
         self.agent_id = agent_id
-
+        self.eval_ctx = eval_context_len
         # --- TokenDynamics --      -
         # level_vocab, step_vocab match
         self.transformer = TokenDynamics(
@@ -651,7 +715,6 @@ class Dreamer4(nn.Module):
         self.imagination_steps = max_imag_len - 1
         self.rminv = -reward_clamp
         self.rmaxv = reward_clamp
-        self.finetune_length=  finetune_length
         self.reward_bins = reward_bins
         self.task_id = task_id
         self.batch_lengths= batch_lens
@@ -721,7 +784,7 @@ class Dreamer4(nn.Module):
 
             # clean level for context
             N = int(getattr(self, "shortcut_kmax", 64))
-            sigs = self.make_signals_indices(B, T, Nz, tau_idx=N, k_idx=0)
+            sigs = self.make_signals_indices(B, T, Nz, tau_idx=N - 1, k_idx=0)
 
             _, h = self.transformer(z, self.action_buffer, signals=sigs)
 
@@ -733,7 +796,7 @@ class Dreamer4(nn.Module):
                 self.action_buffer = torch.cat([self.action_buffer, a], dim=1)
 
             # keep a rolling window
-            W = 15
+            W = self.eval_ctx
             if self.state_buffer.size(1) > W:
                 self.state_buffer = self.state_buffer[:, -W:]
                 if self.action_buffer is not None:
@@ -753,6 +816,11 @@ class Dreamer4(nn.Module):
             decoded = self.decode(z_eval).detach().cpu().numpy()
             for i in range(decoded.shape[1]):
                 cv2.imwrite(f"./eval_imgs/imag_{i}.png", 255 * decoded[0, i].transpose(1, 2, 0)[..., ::-1])
+            z_eval = self.latent_imagination(z[:,:], None, ctx_len=a.size(1), eval_=False,random=True, forced=False)[0]
+            decoded = self.decode(z_eval).detach().cpu().numpy()
+            for i in range(decoded.shape[1]):
+                cv2.imwrite(f"./eval_imgs/random_{i}.png", 255 * decoded[0, i].transpose(1, 2, 0)[..., ::-1])
+
         return
     def make_signals_indices(self, B, T, Nz, tau_idx=0, k_idx=0):
         """
@@ -804,14 +872,13 @@ class Dreamer4(nn.Module):
         # ============================
         # τ LOOKUP TABLE (same as training)
         # ============================
-        noise_min = 0.0
+        noise_min = 0.1
         tau_max = 1.0 - noise_min
 
         tau_lut = torch.arange(N + 1, device=device, dtype=torch.float32) / float(N)
         tau_lut[-1] = tau_max
-
         # context is "cleanest" (tau_idx=N)
-        tau_ctx = torch.full((B, T, Nz), N, device=device, dtype=torch.long)
+        tau_ctx = torch.full((B, T, 1), N - 1, device=device, dtype=torch.long)
         k_ctx = torch.zeros_like(tau_ctx)
 
         z = torch.randn((B, 1, Nz, Dz), device=device, dtype=dtype)
@@ -826,10 +893,10 @@ class Dreamer4(nn.Module):
             d_tau = tau_nextf - tau
 
             tau_sig = torch.cat(
-                [tau_ctx, torch.full((B, 1, Nz), tau_i, device=device, dtype=torch.long)], dim=1
+                [tau_ctx, torch.full((B, 1, 1), tau_i, device=device, dtype=torch.long)], dim=1
             )
             k_sig = torch.cat(
-                [k_ctx, torch.full((B, 1, Nz), k_pow, device=device, dtype=torch.long)], dim=1
+                [k_ctx, torch.full((B, 1, 1), k_pow, device=device, dtype=torch.long)], dim=1
             )
             sigs = torch.stack([tau_sig, k_sig], dim=-1)
 
@@ -841,13 +908,10 @@ class Dreamer4(nn.Module):
 
             v = (x1_hat - z) / max(1e-5, 1.0 - tau)
             z = z + v * d_tau
-
         return z.clamp(-1, 1) if clamp else z
 
     def shortcut_forcing(self, z_t, actions, mask: torch.Tensor | None = None):
-        import math
-        import torch
-        import torch.nn.functional as F
+
 
         device = z_t.device
         seq_mask = mask
@@ -862,7 +926,7 @@ class Dreamer4(nn.Module):
         N = int(self.shortcut_kmax)
         assert N > 1 and (N & (N - 1)) == 0
         max_pow = int(math.log2(N))
-
+        assert (z_t.size(1) == actions.size(1) -1 ) or (z_t.size(1) == actions.size(1))
         # ============================
         # τ LOOKUP TABLE (min noise 0.1)
         # ============================
@@ -875,29 +939,30 @@ class Dreamer4(nn.Module):
         # ============================
         # sample k
         # ============================
-        k_pow = torch.randint(1, max_pow + 1, (B, T, Nz), device=device)
-        base = torch.rand(B, T, Nz, device=device) <= self.kmax_prob
+        k_pow = torch.randint(1, max_pow + 1, (B, T, 1), device=device)
+        base = torch.rand(B, T, 1, device=device) <= self.kmax_prob
         k_pow[base] = 0
 
         s = (1 << k_pow)
-        is_base = (k_pow == 0)
-
         k_half = (k_pow - 1).clamp(min=0)
         s_half = (1 << k_half)
 
-        # ============================
-        # sample tau_idx
-        # ============================
-        u = torch.rand(B, T, Nz, device=device)
+        u = torch.rand(B, T, 1, device=device)
         tau_idx_base = torch.floor(u * (N + 1)).long().clamp(0, N)
 
         max_tau_idx = (N - 1) - s_half
         max_j = torch.div(max_tau_idx, s, rounding_mode="floor").clamp(min=0)
-        u2 = torch.rand(B, T, Nz, device=device)
+        u2 = torch.rand(B, T, 1, device=device)
         tau_idx_nb = (torch.floor(u2 * (max_j + 1).float()).long()) * s
+        tau_idx = torch.where(base, tau_idx_base, tau_idx_nb)
 
-        tau_idx = torch.where(is_base, tau_idx_base, tau_idx_nb)
+        is_base = ((k_pow == 0) | (tau_idx == N - 1))
 
+
+        # ============================
+        # sample tau_idx
+        # ============================
+    
         assert (tau_idx >= 0).all()
         assert (tau_idx[is_base] <= N).all()
         assert (tau_idx[~is_base] <= N - 1).all()
@@ -912,12 +977,12 @@ class Dreamer4(nn.Module):
         # ============================
         # student prediction
         # ============================
-        x1_hat = self.transformer(
+        x1_hat = self.latent_imagination(
             z_targ,
-            actions[:, :-1],
-            signals=self.make_signals_indices(B, T, Nz, tau_idx, k_pow),
-            task_id=self.task_id,
-            detach_agent=True,
+            actions[:, :],
+            eval_=False,
+            signals=self.make_signals_indices(B, T, 1, tau_idx, k_pow),
+            get_feat=True,
         )[0]
 
         is_base_f = is_base.unsqueeze(-1).float()
@@ -932,11 +997,11 @@ class Dreamer4(nn.Module):
             tau_mid_idx = torch.where(is_base, torch.zeros_like(tau_idx), tau_idx + s_half)
             tau_mid = tau_lut[tau_mid_idx].to(z_t.dtype).unsqueeze(-1)
 
-            z1_prime = self.transformer(
+            z1_prime = self.latent_imagination(
                 z_targ,
-                actions[:, :-1],
-                signals=self.make_signals_indices(B, T, Nz, tau_idx, k_half),
-                task_id=self.task_id,
+                actions[:, :],
+                signals=self.make_signals_indices(B, T, 1, tau_idx, k_half),
+                get_feat=True
             )[0][:, :]
 
             v1 = (z1_prime - z_targ) / (1.0 - tau).clamp(min=1e-5)
@@ -944,11 +1009,11 @@ class Dreamer4(nn.Module):
 
             z_mid = z_targ + v1 * d_half
 
-            z1_mid = self.transformer(
+            z1_mid = self.latent_imagination(
                 z_mid,
-                actions[:, :-1],
-                signals=self.make_signals_indices(B, T, Nz, tau_mid_idx, k_half),
-                task_id=self.task_id,
+                actions[:, :],
+                signals=self.make_signals_indices(B, T, 1, tau_mid_idx, k_half),
+                get_feat=True,
             )[0][:, :]
 
             v2 = (z1_mid - z_mid) / (1.0 - tau_mid).clamp(min=1e-5)
@@ -966,16 +1031,10 @@ class Dreamer4(nn.Module):
         loss_boot = loss_boot * valid_mid
 
         loss = is_base_f * loss_base + (1.0 - is_base_f) * loss_boot
-        loss = loss.mean(dim=-1)
 
-        w_tau = (0.9 * tau.squeeze(-1) + 0.1)
+        w_tau = (0.9 * tau + 0.1)
 
-        if seq_mask is None:
-            m = torch.ones_like(w_tau)
-        else:
-            m = seq_mask.float()
-
-        loss = (loss * w_tau * m).sum() / (w_tau * m).sum().clamp_min(1e-8)
+        loss = (loss * w_tau ).mean()
 
         return loss, {
             "tau_mean": tau.mean().item(),
@@ -994,9 +1053,9 @@ class Dreamer4(nn.Module):
             self,
             initial_latent,
             actions,
-            ctx_len,
+            ctx_len = None,
             eval_=True,
-            mtp=False,
+            signals=None,
             detach=False,
             random=False,
             steps=4,
@@ -1004,7 +1063,8 @@ class Dreamer4(nn.Module):
             forced=False,
         ):
             device = initial_latent.device
-            
+            if not ctx_len:
+                ctx_len = initial_latent.size(1)
             # FIX 1: Do NOT slice [:1]. Keep the full context history provided.
             z_all = initial_latent.detach()[:,:]
             # Initialize executed actions. 
@@ -1012,6 +1072,7 @@ class Dreamer4(nn.Module):
             # If None (Policy), we start empty.
             a_exec = None
             kl_list, h_list, lp_list, a_list = [], [], [], []
+            z_list =[]
             N = int(getattr(self, "shortcut_kmax", 8)) 
             z_inp=z_all
 
@@ -1031,30 +1092,30 @@ class Dreamer4(nn.Module):
 
                 # --- Feature Extraction ---
                 if get_feat:
-                    policy_feat = self.transformer(
+                    z_feat, policy_feat = self.transformer(
                             initial_latent[:,:i+1].detach(), 
                             actions[:,:i], 
-                            signals=self.make_signals_indices(B, T_curr, Nz, N, 0), 
+                            signals=signals[:,:i+1], 
                             task_id=self.task_id,
                             detach_agent=False
-                        )[1][:,-1:]
-                    
-                    h_list.append(policy_feat)
+                        )
+                    z_list.append(z_feat[:,-1:])
+                    h_list.append(policy_feat[:,-1:])
                     if i == ctx_len - 1:
-                        return torch.cat(h_list, 1)
+                        return torch.cat(z_list,1), torch.cat(h_list, 1)
                     else:
                         continue
-                elif eval_:
+                elif eval_ and not random:
                     # Policy Mode: Run transformer on accumulated history
                     with torch.no_grad():
                         _, policy_feat = self.transformer(
                             z_inp, 
                             a_exec, 
-                            signals=self.make_signals_indices(B, T_curr, Nz, N, 0), 
+                            signals=self.make_signals_indices(B, T_curr, Nz, N - 1, 0), 
                          task_id=self.task_id,
                             detach_agent=False
                         )
-                elif not eval_ and forced:
+                elif random or (not eval_ and forced):
 
                     policy_feat = torch.zeros(B,1,self.transformer.d_model,device=self.device)
                 else:
@@ -1071,7 +1132,7 @@ class Dreamer4(nn.Module):
                     _, policy_feat = self.transformer(
                         z_inp, 
                         curr_actions, 
-                        signals=self.make_signals_indices(B, T_curr, Nz, N, 0), 
+                        signals=self.make_signals_indices(B, T_curr, Nz, N - 1, 0), 
                         detach_agent=detach,
                         task_id=self.task_id
                     )
@@ -1080,7 +1141,7 @@ class Dreamer4(nn.Module):
                 h_last = policy_feat[:, -1:, :]
 
                 # --- Action Selection ---
-                if not eval_:
+                if not eval_ and not random:
                     # Teacher Forcing / BC: Use the ground truth action provided
                     a = actions[:, i:i+1]
                     log_p = torch.zeros((a.size(0), 1, 1), device=device)
@@ -1109,11 +1170,11 @@ class Dreamer4(nn.Module):
                 else: a_exec = torch.cat([a_exec, a], dim=1)
 
                 h_list.append(h_last)
-                if eval_ or (not eval_ and forced):
+    
                     # Imagination: Use the model to predict next z
-                    with torch.no_grad():
-                        z_next = self.shortcut_generate(z_inp, a_exec, steps=steps)[:, -1:]
-                    z_inp = torch.cat([z_inp, z_next], dim=1)
+                with torch.no_grad():
+                    z_next = self.shortcut_generate(z_inp, a_exec, steps=steps)[:, -1:]
+                z_inp = torch.cat([z_inp, z_next], dim=1)
 
                 
             h = torch.cat(h_list, dim=1)
@@ -1186,11 +1247,6 @@ class Dreamer4(nn.Module):
     
         self.transformer.agent_token.requires_grad_(True)
 
-    def freeze_agent_token(self):
-        for p in self.transformer.parameters():
-            p.requires_grad_(True)
-        self.transformer.agent_token.requires_grad_(False)
-
     def update_ema(self):
         with torch.no_grad():
             for ema_param, param in zip(self.t_policy.parameters(), self.policy.parameters()):
@@ -1223,7 +1279,6 @@ class Dreamer4(nn.Module):
         self.rep_optim.zero_grad()
         self.policy_optim.zero_grad(set_to_none=True)
 
-        scaler = GradScaler(enabled=True)  # set False to debug in full fp32
         for i in tqdm(range(self.grad_accum)):
             if not model and not policy and not train_reward:
                 self.encoder.train()
@@ -1233,7 +1288,7 @@ class Dreamer4(nn.Module):
                 reconst = self.decode(z_t)
                 
                 full_sequence = reconst[0].clone().detach().cpu().numpy().transpose(0,2,3,1)
-                if self.steps % 100 ==0 and i ==0:
+                if self.steps ==0 and i ==0:
                     for i in range(full_sequence.shape[0]):
                         frame_bgr = full_sequence[i][..., ::-1] *255
                         cv2.imwrite(f"./eval_imgs/reconst_{i}.png", frame_bgr.astype(np.uint8))        
@@ -1243,15 +1298,15 @@ class Dreamer4(nn.Module):
                 lp  = (self.lpips(reconst, targ_state))
                 reconst_loss = (mse + 0.2 * lp.mean() )
 
-                
-                scaler.scale(reconst_loss*10).backward()
+                (reconst_loss*10).backward()
 
                 encoder_gn = adaptive_grad_clip(self.encoder, 0.3)
                 decoder_gn = adaptive_grad_clip(self.decoder, 0.3)
 
                 if i == self.grad_accum-1:
 
-                    scaler.step(self.rep_optim)
+                    (self.rep_optim).step()
+                    self.rep_optim.zero_grad()
             if model:
                     
                     # Create the full trajectory first
@@ -1263,7 +1318,7 @@ class Dreamer4(nn.Module):
                         # This ensures s_{t+1} has the same embedding whether it's looked at as "current" or "next"
                 z_t = self.encoder(full_sequence).detach()
                         # Split into current and next steps
-                self.freeze_agent_token()
+               # self.freeze_agent_token()
                 kl_loss, _ = self.shortcut_forcing( z_t, actions)
                 kl = kl_loss.detach().item()
                 dyn_loss = kl_loss
@@ -1273,37 +1328,40 @@ class Dreamer4(nn.Module):
                                             # Unscale gradients before clipping (important!)
                 model_gn = adaptive_grad_clip(self, 0.3)
                             
-                if i == self.grad_accum-1:
+                if i == self.grad_accum-1 and not train_reward:
                     (self.dyn_optim).step()
-                    self.dyn_optim.zero_grad()
+                    #self.dyn_optim.zero_grad()
             if train_reward:
                 clean_latents = self.encoder((states)).detach()
                 B, T, Nz, _ = clean_latents.shape
 
                 noised = clean_latents * 0.9 + torch.randn_like(clean_latents)*0.1
                 N = self.shortcut_kmax
-                h_with_grad = self.latent_imagination(noised, actions[:,:-1], get_feat=True, ctx_len=self.finetune_length)
+                h_with_grad = self.latent_imagination(noised, actions[:,:-1], get_feat=True, 
+                                                      signals=self.make_signals_indices(B, T, Nz, N, 0)
+                                                      , ctx_len=noised.size(1))[1]
 
                 action_loss, reward_loss, _ = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:])
                                             
                 term_target = termination[:, :].float()
-                if term_target.dim()==3: term_target = term_target[:,:self.finetune_length].squeeze(-1)
+                if term_target.dim()==3: term_target = term_target[:,:].squeeze(-1)
                 rew_pred = self.reward(h_with_grad[:,:])
                 term_logits = concat_mtp(rew_pred[-1].logits, self.aux_horizon)
 
                 pos_w = torch.tensor(15.0, device=term_logits.device)
                 term_loss = F.binary_cross_entropy_with_logits(
-                                    term_logits[:,:], term_target[:,:self.finetune_length],
+                                    term_logits[:,:], term_target[:,:],
                                     pos_weight=pos_w
                                 ) 
                 ac_loss =  action_loss+reward_loss+term_loss
-                self.unfreeze_agent_token()
-                (ac_loss.mean()/self.grad_accum).backward()
-                reward_policy_model_gn = adaptive_grad_clip(self, 0.3)
-                if i == self.grad_accum-1:
+                with FreezeParameters([self.transformer]):
+                    self.unfreeze_agent_token()
+                    (ac_loss.mean()/self.grad_accum).backward()
+                    reward_policy_model_gn = adaptive_grad_clip(self, 0.3)
+                    if i == self.grad_accum-1:
 
-                    (self.dyn_optim).step()
-                    self.dyn_optim.zero_grad()
+                        (self.dyn_optim).step()
+                        self.dyn_optim.zero_grad()
 
             if policy:
  
@@ -1359,7 +1417,6 @@ class Dreamer4(nn.Module):
         if model:   
             logger["model_gn"] = model_gn 
             logger["shortcut_loss"] = kl
-        elif train_reward:
             logger["finetune_bc_loss"] = action_loss.mean().detach().item()
             logger["reward_loss"] = reward_loss.detach().item()
             logger["termination_loss"] = term_loss.detach().item()

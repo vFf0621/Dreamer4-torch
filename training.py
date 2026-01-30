@@ -12,7 +12,9 @@ import argparse
 
 # --- Setup ---
 wandb.init(project="Dreamer4", entity="fguan", name="test")
-
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_math_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
 # Training parameters
 import os
 os.makedirs("./ckpts", exist_ok=True)
@@ -20,8 +22,8 @@ os.makedirs("./eval_imgs", exist_ok=True)
 
 def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, patch , Nr, latent_tokens, z_dim, action_dim, latent_dim, 
                  rep_depth , rep_d_model, dyn_d_model, num_heads, dropout, k_max, mtp, task_id,  kmax_prob,
-                 policy_bins , reward_bins , pretrain, reward_clamp,level_vocab , level_embed_dim,mode,num_tasks, Sa,finetune_length,
-                 batch_lens, batch_size, accum, max_imag_len, buffer_limit, train, ckpt, rep_lr=1e-4, rep_decay=1e-3,
+                 policy_bins , reward_bins , pretrain, reward_clamp,level_vocab , level_embed_dim,mode,num_tasks, Sa,
+                 batch_lens, batch_size, accum, max_imag_len, buffer_limit, train, ckpt, rep_lr=1e-4, rep_decay=1e-3,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, ac_lr = 1e-4, ac_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3 , save_every=500):
     agents = [Dreamer4(agent_id=i, ch=ch, h=h,
                 w=w, 
@@ -39,8 +41,8 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
                 Sa = Sa, 
                 Nr = Nr, 
                 kmax_prob=kmax_prob,
+                eval_context_len=eval_context_len,
                 mtp=mtp, 
-                finetune_length=finetune_length,
                 num_tasks=num_tasks,
                 policy_bins = policy_bins, 
                 reward_bins = reward_bins, 
@@ -79,9 +81,10 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
             train_model =False#(epi > 0) and (epi <= 1200) 
             train_policy = False#(epi > 900)
         elif mode=="dyn":
-            train_reward=False
+            train_reward=True
             train_model =True#(epi > 0) and (epi <= 1200) 
             train_policy = False#(epi > 900)
+  
         elif mode=="policy":
             train_reward=False
             train_model =False#(epi > 0) and (epi <= 1200) 
@@ -185,20 +188,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--z_dim", type=int, default=16, help="Bottleneck")
     p.add_argument("--action_dim", type=int, default=2)
-    p.add_argument("--kmax_base_prob", type=int, default=0.75)
+    p.add_argument("--kmax_base_prob", type=int, default=0.5)
     # Model sizes
-    p.add_argument("--Sa", type=int, default=64)
+    p.add_argument("--Sa", type=int, default=4)
 
     p.add_argument("--pred_dim", type=int, default=256)
     p.add_argument("--rep_depth", type=int, default=4, help="Has to be a multiple of 2")
     p.add_argument("--rep_d_model", type=int, default=256)
     p.add_argument("--dyn_d_model", type=int, default=256)
     p.add_argument("--num_heads", type=int, default=8)
-    p.add_argument("--dropout", type=float, default=0.05)
-    p.add_argument("--k_max", type=int, default=8, help="Has to be a power of 2")
+    p.add_argument("--dropout", type=float, default=0.01)
+    p.add_argument("--k_max", type=int, default=32, help="Has to be a power of 2")
     p.add_argument("--mtp", type=int, default=7)
     p.add_argument("--num_tasks", type=int, default=10)
     p.add_argument("--task_id", type=int, default=0)
+    p.add_argument("--eval_context_len", type=int, default=15)
 
     # Discretization / vocab
     p.add_argument("--policy_bins", type=int, default=100)
@@ -228,16 +232,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--accum", type=int, default=5)
-    p.add_argument("--max_imag_len", type=int, default=128)
+    p.add_argument("--max_imag_len", type=int, default=12008)
     # For memory considerations
-    p.add_argument("--ac_finetune_length", type=int, default=32)
 
     # Flags (default True -> allow toggling off with --no-*)
     p.add_argument("--train", dest="train", action="store_true", default=True)
     p.add_argument("--no-train", dest="train", action="store_false", help="Disable training mode.")
     p.add_argument("--pretrain", dest="pretrain", action="store_true", default=True)
     p.add_argument("--no-pretrain", dest="pretrain", action="store_false", help="Disable pretraining mode.")
-    p.add_argument("--save_every", type=int, default=500)
+    p.add_argument("--save_every", type=int, default=1000)
 
     return p
 
@@ -264,6 +267,7 @@ def main():
         kmax_prob = args.kmax_base_prob,
         latent_tokens=args.latent_tokens,
         z_dim=args.z_dim,
+        eval_context_len = args.eval_context_len,
         action_dim=args.action_dim,
         latent_dim=args.pred_dim,
         rep_depth=args.rep_depth,
@@ -284,7 +288,6 @@ def main():
         Sa=args.Sa,
         Nr=args.reserved_tokens,    
         save_every=args.save_every,
-        finetune_length=args.ac_finetune_length,
 
         accum=args.accum,
         max_imag_len=args.max_imag_len,
