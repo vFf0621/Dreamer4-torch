@@ -273,6 +273,7 @@ class CausalSTBlock(nn.Module):
                 # embed into top-left; allow everything involving reserved by default
                 m = torch.zeros((Ncat, Ncat), dtype=torch.float, device=x.device)
                 m[:N, :N] = mask
+                m[N:, :N] = float("-inf")
                 final_mask = m
             elif mask.shape[-2:] == (Ncat, Ncat):
                 final_mask = mask
@@ -734,9 +735,9 @@ class Dreamer4(nn.Module):
         self.train_policy = False
         self.value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim*2, r_max=reward_clamp)
         self.kmax_prob = kmax_prob
-        self.encoder.load_state_dict(torch.load("enc.pt"))
+       # self.encoder.load_state_dict(torch.load("enc.pt"))
        
-        self.decoder.load_state_dict(torch.load("dec.pt"))
+        # self.decoder.load_state_dict(torch.load("dec.pt"))
         
         self.lpips = LPIPSLoss(reduction="none",)
         self.to(self.device)
@@ -1288,7 +1289,7 @@ class Dreamer4(nn.Module):
                 reconst = self.decode(z_t)
                 
                 full_sequence = reconst[0].clone().detach().cpu().numpy().transpose(0,2,3,1)
-                if self.steps ==0 and i ==0:
+                if self.step%100 ==0 and i ==0:
                     for i in range(full_sequence.shape[0]):
                         frame_bgr = full_sequence[i][..., ::-1] *255
                         cv2.imwrite(f"./eval_imgs/reconst_{i}.png", frame_bgr.astype(np.uint8))        
