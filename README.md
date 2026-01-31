@@ -21,12 +21,11 @@ Training time for MAE is found to be very fast (41 minutes for the 96 x 96 car r
 
 Below are the training artifacts:
 
+<img width="400" height="400" alt="W B Chart 1_30_2026, 11_34_36 PM" src="https://github.com/user-attachments/assets/3d20bd7a-8496-4b55-b4d0-41fa962ca05b" />
 
-<img width="500" height="250" alt="W B Chart 1_29_2026, 2_38_21 PM" src="https://github.com/user-attachments/assets/dc894084-0112-4b96-85a1-f797532b97bf" />
+<img width="400" height="400" alt="W B Chart 1_30_2026, 11_34_54 PM" src="https://github.com/user-attachments/assets/fd60f127-e38f-406d-b431-6d392f15ce45" />
 
-<img width="500" height="250" alt="W B Chart 1_29_2026, 2_38_27 PM" src="https://github.com/user-attachments/assets/b6de4922-9ccc-46f8-ab54-3d7fe0aa54c9" />
-
-<img width="500" height="250" alt="W B Chart 1_29_2026, 2_38_32 PM" src="https://github.com/user-attachments/assets/a39382a6-44b9-44cf-bf16-82580ecf19e1" />
+<img width="400" height="400" alt="W B Chart 1_30_2026, 11_34_36 PM" src="https://github.com/user-attachments/assets/09fa0999-6248-4df6-a88b-db70ab560015" />
 
 And the reconstructed sequence:
 
