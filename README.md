@@ -20,12 +20,12 @@ As well, there will be no need of curating a dataset(the dataset is generated th
 Training time for MAE is found to be very fast (41 minutes for the 96 x 96 car racing game on a RTX PRO 6000 GPU).
 
 Below are the training artifacts:
+<img width="1328" height="1328" alt="W B Chart 1_30_2026, 11_35_06 PM" src="https://github.com/user-attachments/assets/350b72ad-b8ef-434a-9d9e-8c31e07f7f7d" />
 
 <img width="400" height="400" alt="W B Chart 1_30_2026, 11_34_36 PM" src="https://github.com/user-attachments/assets/3d20bd7a-8496-4b55-b4d0-41fa962ca05b" />
 
 <img width="400" height="400" alt="W B Chart 1_30_2026, 11_34_54 PM" src="https://github.com/user-attachments/assets/fd60f127-e38f-406d-b431-6d392f15ce45" />
 
-<img width="400" height="400" alt="W B Chart 1_30_2026, 11_34_36 PM" src="https://github.com/user-attachments/assets/09fa0999-6248-4df6-a88b-db70ab560015" />
 
 And the reconstructed sequence:
 
