@@ -11,7 +11,6 @@ import os
 import argparse
 
 # --- Setup ---
-wandb.init(project="Dreamer4", entity="fguan", name="test")
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_math_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
@@ -25,6 +24,8 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
                  policy_bins , reward_bins , pretrain, reward_clamp,level_vocab , level_embed_dim,mode,num_tasks, Sa,
                  batch_lens, batch_size, accum, max_imag_len, buffer_limit, train, ckpt, rep_lr=1e-4, rep_decay=1e-3,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, ac_lr = 1e-4, ac_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3 , save_every=500):
+    wandb.init(project="Dreamer4", entity="fguan", name=mode)
+
     agents = [Dreamer4(agent_id=i, ch=ch, h=h,
                 w=w, 
                 patch = patch, 
@@ -193,7 +194,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--Sa", type=int, default=4)
 
     p.add_argument("--pred_dim", type=int, default=256)
-    p.add_argument("--rep_depth", type=int, default=4, help="Has to be a multiple of 2")
+    p.add_argument("--rep_depth", type=int, default=6, help="Has to be a multiple of 2")
     p.add_argument("--rep_d_model", type=int, default=256)
     p.add_argument("--dyn_d_model", type=int, default=256)
     p.add_argument("--num_heads", type=int, default=8)

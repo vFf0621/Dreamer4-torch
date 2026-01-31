@@ -72,20 +72,20 @@ class Policy(nn.Module):
 
 # ---- Highway-gated residual wrapper ---
 class GQA(nn.Module):
-    def __init__(self, embed_dim=16, num_heads=8, num_kv_heads=4, dropout=0.1, causal=False,device="cuda"):
+    def __init__(self, embed_dim=16, num_heads=8, dropout=0.1, causal=False,device="cuda"):
         super().__init__()
         assert embed_dim % num_heads == 0
         assert num_heads % num_kv_heads == 0
 
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
+        self.num_kv_heads = num_heads//2
         self.head_dim = embed_dim // num_heads
         self.causal = causal
 
         self.q_proj = nn.Linear(embed_dim, num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(embed_dim, num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(embed_dim, num_kv_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(embed_dim, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(embed_dim, self.num_kv_heads * self.head_dim, bias=False)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
 
         self.norm = nn.RMSNorm(embed_dim)
@@ -179,7 +179,7 @@ class GQA(nn.Module):
 
 
 class CausalSTBlock(nn.Module):
-    def __init__(self, d_model, n_heads, dropout=0.1, num_reserved=2, time_attn=True, cap_value=50,  device="cuda"):
+    def __init__(self, d_model, n_heads, dropout=0.1, time_attn=True, cap_value=50,  device="cuda"):
         super().__init__()
         self.time_attn_enabled = time_attn
         self.d_model = d_model
@@ -190,9 +190,7 @@ class CausalSTBlock(nn.Module):
         else:
             self.time_attn = GQA(d_model, n_heads, n_heads // 2, dropout, causal=True, device=device)
 
-        self.num_reserved = num_reserved
         self.ln_time = nn.RMSNorm(d_model)
-        self.reserved_tokens = nn.Parameter(torch.zeros(1, num_reserved, int(d_model)))
         self.mlp = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
         self.device = device
         self.to(self.device)
@@ -208,10 +206,8 @@ class CausalSTBlock(nn.Module):
         if x.dim() == 3:
             x = x.unsqueeze(2)  # [B,T,1,D]
 
-        reserved = self.reserved_tokens
         B, T, N, D = x.shape
-        R = reserved.shape[1]
-        Ncat = N + R
+        Ncat = N
 
         # ---- normalize token_pad_mask to [B,T,N] ----
         if token_pad_mask is not None:
@@ -253,35 +249,41 @@ class CausalSTBlock(nn.Module):
         # SPACE ATTENTION
         # =========================
         x_space = self.ln_space(x)
-        xt = x_space.reshape(B * T, N, D)  # [B*T, N, D]
-        xcat = torch.cat([xt, reserved.expand(B * T, R, D)], dim=1)  # [B*T, N+R, D]
+        x_space = x_space.reshape(B * T, N, D)  # [B*T, N, D]
 
         # ---- build key_padding_mask for space attn: [B*T, N+R] ----
         space_kpm = None
         if token_pad_mask is not None:
             space_kpm = token_pad_mask.reshape(B * T, N)  # [B*T, N]
             # reserved tokens are never PAD
-            space_kpm = torch.cat(
-                [space_kpm, torch.zeros(B * T, R, dtype=torch.bool, device=x.device)],
-                dim=1,
-            )  # [B*T, N+R]
+          
 
         # ---- build final additive attn mask over [N+R, N+R] ----
         final_mask = None
         if mask is not None:
             if mask.shape[-2:] == (N, N):
-                # embed into top-left; allow everything involving reserved by default
-                m = torch.zeros((Ncat, Ncat), dtype=torch.float, device=x.device)
+                # Expand (N,N) -> (Ncat,Ncat) with "reserved are keys-only":
+                # - Everyone may attend to reserved keys (cols N:)
+                # - Reserved queries (rows N:) may NOT attend to non-reserved keys (:N)
+                # - Optionally: reserved queries only attend to themselves (recommended)
+
+               
+                    # additive mask: 0 = keep, -inf = block
+                m = torch.zeros((Ncat, Ncat), dtype=mask.dtype, device=x.device)
+
+                    # normal->normal from provided mask (should contain 0/-inf or similar)
                 m[:N, :N] = mask
-                m[N:, :N] = float("-inf")
+
+                 
                 final_mask = m
+
             elif mask.shape[-2:] == (Ncat, Ncat):
                 final_mask = mask
             else:
                 raise ValueError(f"mask has shape {mask.shape}, expected ({N},{N}) or ({Ncat},{Ncat})")
-
+           
         xs = self.space_attn(
-            xcat,
+            x_space,
             attn_mask=final_mask,          # additive float mask (0 / -inf)
             key_padding_mask=space_kpm,    # True = PAD keys
         )[:, :N]  # drop reserved outputs
@@ -304,6 +306,7 @@ class Encoder(nn.Module):
         dropout: float = 0.05,
         out_dim: int = 16,     # Dz
         max_T: int = 256,
+        num_reserved = 4,
         pool: str = "first",      # "mean" or "first"
     ):
         super().__init__()
@@ -321,7 +324,9 @@ class Encoder(nn.Module):
         self.patch_proj = nn.Sequential(nn.RMSNorm(patch_dim), nn.Linear(patch_dim, d_model))
         self.latent_tok = nn.Parameter(torch.randn(1, 1, latent_tokens, d_model) * 0.02)
         self.drop = nn.Dropout(dropout)
-        self.pos_emb_lat = nn.Parameter(torch.randn(1, 1, self.latent_tokens + self.num_patches, d_model) * 0.02)
+        self.pos_emb_lat = nn.Parameter(torch.randn(1, 1, self.latent_tokens + self.num_patches+num_reserved, d_model) * 0.02)
+        self.reserved = nn.Parameter(torch.randn(1, 1, num_reserved, d_model) * 0.02)
+        self.num_reserved=num_reserved
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == 0)
@@ -342,13 +347,13 @@ class Encoder(nn.Module):
         patches = patches.view(B, T, self.num_patches, -1)                   # (B,T,Np,patch_dim)
         space_mask = modality_mask(
             L=self.latent_tokens,
-            modality_sizes=[self.num_patches],
+            modality_sizes=[self.num_patches, self.num_reserved],
             device=frames.device
         ) 
         
         proj = self.patch_proj(patches)                             # (B,T,Np,D)
         lat = self.latent_tok.view(1, 1, self.latent_tokens, self.d_model).expand(B, T, -1, -1) 
-        x = torch.cat([lat, proj], dim=2) +self.pos_emb_lat                             # (B,T,S,D) with S=L+Np      
+        x = torch.cat([lat, proj, self.reserved.expand(B,T,-1,self.d_model)], dim=2) +self.pos_emb_lat                             # (B,T,S,D) with S=L+Np      
 
         x = self.drop(x)
         for blk in self.blocks:
@@ -356,10 +361,9 @@ class Encoder(nn.Module):
                 x = blk(x, mask=None,)          # no space mask here
             else:
                 x = blk(x, mask=space_mask)    # modality mask only here
-        x = self.ln_out(x)  
+        x = self.ln_out(x[:,:,:self.latent_tokens])  
 
-        patch_tok = x[:, :,: self.latent_tokens, :]
-        pre = (self.readout(patch_tok))
+        pre = (self.readout(x))
         ztok = torch.tanh(pre)   # [B,T,Np,Dz]
         return ztok
 
@@ -452,7 +456,6 @@ class TokenDynamics(nn.Module):
                     dropout=dropout,
                     time_attn=use_time,
                     device=device,
-                    num_reserved=0,
                 )
             )
         self.blocks = nn.ModuleList(blocks)
@@ -687,7 +690,7 @@ class Dreamer4(nn.Module):
         super(Dreamer4, self).__init__()
         self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patch, d_model=rep_d_model,
                                 n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=2,
-                                out_dim=z_dim, dropout=dropout, max_T=max_imag_len)
+                                out_dim=z_dim, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
  
         self.device="cuda" if torch.cuda.is_available() else "cpu"
         self.pretrain = False
@@ -712,7 +715,7 @@ class Dreamer4(nn.Module):
         )
         
         self.decoder = Decoder(img_channels=ch, w = w, h=h, patch=patch, z_dim=z_dim, d_model=rep_d_model, n_heads=num_heads,
-                               depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len)
+                               depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
         self.imagination_steps = max_imag_len - 1
         self.rminv = -reward_clamp
         self.rmaxv = reward_clamp
@@ -1289,7 +1292,7 @@ class Dreamer4(nn.Module):
                 reconst = self.decode(z_t)
                 
                 full_sequence = reconst[0].clone().detach().cpu().numpy().transpose(0,2,3,1)
-                if self.step%100 ==0 and i ==0:
+                if self.steps %100 ==0 and i ==0:
                     for i in range(full_sequence.shape[0]):
                         frame_bgr = full_sequence[i][..., ::-1] *255
                         cv2.imwrite(f"./eval_imgs/reconst_{i}.png", frame_bgr.astype(np.uint8))        
@@ -1299,7 +1302,7 @@ class Dreamer4(nn.Module):
                 lp  = (self.lpips(reconst, targ_state))
                 reconst_loss = (mse + 0.2 * lp.mean() )
 
-                (reconst_loss*10).backward()
+                (reconst_loss).backward()
 
                 encoder_gn = adaptive_grad_clip(self.encoder, 0.3)
                 decoder_gn = adaptive_grad_clip(self.decoder, 0.3)
@@ -1505,6 +1508,7 @@ class Decoder(nn.Module):
         dropout: float = 0.05,
         max_T: int = 256,
         output_range: str = "0_1",
+        num_reserved = 4,
     ):
         super().__init__()
         assert (h % patch == 0) and (w % patch == 0)
@@ -1521,6 +1525,8 @@ class Decoder(nn.Module):
         g2 = h // patch
         self.grid = (g1, g2)
         self.num_patches = g1 * g2
+        self.reserved = nn.Parameter(torch.randn(1, 1, num_reserved, d_model) * 0.02)
+        self.num_reserved=num_reserved
 
         self.patch_queries = nn.Parameter(torch.randn(1, 1, self.num_patches, d_model) * 0.02)
 
@@ -1532,7 +1538,7 @@ class Decoder(nn.Module):
             use_time = ((i+1) % time_every == 0)
             blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time))
         self.blocks = nn.ModuleList(blocks)
-        self.pos_embed_lat = nn.Parameter(torch.randn(1, 1, self.latent_tokens+self.num_patches, d_model) * 0.02)
+        self.pos_embed_lat = nn.Parameter(torch.randn(1, 1, self.latent_tokens+self.num_patches+num_reserved, d_model) * 0.02)
         self.ln_out = nn.RMSNorm(d_model)
         self.to_patch = nn.Linear(d_model, img_channels * patch * patch)
 
@@ -1562,9 +1568,9 @@ class Decoder(nn.Module):
         # ---- patch queries ----
         pq = self.patch_queries.expand(B, T, self.num_patches, self.d_model)
         # IMPORTANT: put latents FIRST, then patch queries
-        x = torch.cat([zlat, pq, ], dim=2) + self.pos_embed_lat  # (B,T,L+Np,D)
+        x = torch.cat([zlat, pq, self.reserved.expand(B, T, -1, self.d_model)], dim=2) + self.pos_embed_lat  # (B,T,L+Np,D)
         x = self.drop(x)
-        space_mask = modality_mask(L, [self.num_patches], encoder=False, device=x.device)
+        space_mask = modality_mask(L, [self.num_patches, self.num_reserved], encoder=False, device=x.device)
 
         # ---- transformer ----
         for blk in self.blocks:
@@ -1575,7 +1581,7 @@ class Decoder(nn.Module):
         x = self.ln_out(x)
 
         # ---- decode ONLY patch tokens ----
-        patch_tok = x[:, :, L:, :]           # (B,T,Np,D)
+        patch_tok = x[:, :, L:-self.num_reserved, :]           # (B,T,Np,D)
         # sanity check
         assert patch_tok.shape[2] == self.num_patches, (patch_tok.shape, self.num_patches)
 
