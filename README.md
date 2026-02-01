@@ -42,7 +42,6 @@ For the dynamics:
 Imagined Trajectory:
 
 ![output](https://github.com/user-attachments/assets/6a40ab76-da89-4b11-8bf3-fc5d403da0ce)
-
 &nbsp;&nbsp;&nbsp;&nbsp;
 ![output](https://github.com/user-attachments/assets/d970e24b-1621-47ac-9ccf-7eb572c4203c)
 &nbsp;&nbsp;&nbsp;&nbsp;
