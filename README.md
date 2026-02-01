@@ -43,6 +43,9 @@ Imagined Trajectory:
 
 ![output](https://github.com/user-attachments/assets/6a40ab76-da89-4b11-8bf3-fc5d403da0ce)
 
+Memory Consumption:
+<img width="873" height="30" alt="image" src="https://github.com/user-attachments/assets/cbe37613-a936-4322-9f02-8c64b526d9f6" />
+
 
 Install via 
 ```python
