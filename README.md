@@ -39,6 +39,9 @@ For the dynamics:
 
 <img width="300" height="300" alt="W B Chart 2_1_2026, 10_31_28 AM" src="https://github.com/user-attachments/assets/c9a35ad2-d289-4317-b210-1898bef29282" />
 
+Imagined Trajectory:
+
+![output](https://github.com/user-attachments/assets/1d8f53d9-3b8e-40c7-83ec-7519cf4f8c93)
 
 Install via 
 ```python
