@@ -15,7 +15,7 @@ This will NOT be any more data efficient than other implementations; it just con
 
 Action embeddings are interleaved with the latent, not added, as in previous implementations.
 
-As well, there will be no need of curating a dataset(the dataset is generated through random interactions at first).
+As well, there might be no need of curating a dataset if your environment is dense, like the car racing game(the dataset is generated through random interactions at first).
 
 Training time for MAE is found to be rather fast (176 minutes for the 96 x 96 car racing game on a RTX PRO 6000 GPU).
 
