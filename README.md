@@ -33,6 +33,13 @@ And the reconstructed sequence:
 
 ![animation](https://github.com/user-attachments/assets/da93ffd6-1cfd-47c2-b455-19af9ccf7fb8)
 
+For the dynamics:
+
+<img width="300" height="300" alt="W B Chart 2_1_2026, 10_31_16 AM" src="https://github.com/user-attachments/assets/e350a4fe-c6d9-4a93-b995-57768b06b527" />
+
+<img width="300" height="300" alt="W B Chart 2_1_2026, 10_31_28 AM" src="https://github.com/user-attachments/assets/c9a35ad2-d289-4317-b210-1898bef29282" />
+
+
 Install via 
 ```python
 pip install -r requirements.txt
