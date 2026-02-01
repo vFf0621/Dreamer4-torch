@@ -22,11 +22,11 @@ Training time for MAE is found to be rather fast (176 minutes for the 96 x 96 ca
 Below are the training artifacts:
 
 
-<img width="300" height="300" alt="W B Chart 1_30_2026, 11_35_06 PM" src="https://github.com/user-attachments/assets/350b72ad-b8ef-434a-9d9e-8c31e07f7f7d" />
+<img width="200" height="200" alt="W B Chart 1_30_2026, 11_35_06 PM" src="https://github.com/user-attachments/assets/350b72ad-b8ef-434a-9d9e-8c31e07f7f7d" />
 
-<img width="300" height="300" alt="W B Chart 1_30_2026, 11_34_36 PM" src="https://github.com/user-attachments/assets/3d20bd7a-8496-4b55-b4d0-41fa962ca05b" />
+<img width="200" height="200" alt="W B Chart 1_30_2026, 11_34_36 PM" src="https://github.com/user-attachments/assets/3d20bd7a-8496-4b55-b4d0-41fa962ca05b" />
 
-<img width="300" height="300" alt="W B Chart 1_30_2026, 11_34_54 PM" src="https://github.com/user-attachments/assets/fd60f127-e38f-406d-b431-6d392f15ce45" />
+<img width="200" height="200" alt="W B Chart 1_30_2026, 11_34_54 PM" src="https://github.com/user-attachments/assets/fd60f127-e38f-406d-b431-6d392f15ce45" />
 
 
 And the reconstructed sequence:
@@ -35,9 +35,9 @@ And the reconstructed sequence:
 
 For the dynamics:
 
-<img width="300" height="300" alt="W B Chart 2_1_2026, 10_31_16 AM" src="https://github.com/user-attachments/assets/e350a4fe-c6d9-4a93-b995-57768b06b527" />
+<img width="200" height="200" alt="W B Chart 2_1_2026, 10_31_16 AM" src="https://github.com/user-attachments/assets/e350a4fe-c6d9-4a93-b995-57768b06b527" />
 
-<img width="300" height="300" alt="W B Chart 2_1_2026, 10_31_28 AM" src="https://github.com/user-attachments/assets/c9a35ad2-d289-4317-b210-1898bef29282" />
+<img width="200" height="200" alt="W B Chart 2_1_2026, 10_31_28 AM" src="https://github.com/user-attachments/assets/c9a35ad2-d289-4317-b210-1898bef29282" />
 
 Imagined Trajectory:
 
