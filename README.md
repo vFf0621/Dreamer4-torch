@@ -41,7 +41,8 @@ For the dynamics:
 
 Imagined Trajectory:
 
-![output](https://github.com/user-attachments/assets/1d8f53d9-3b8e-40c7-83ec-7519cf4f8c93)
+![output](https://github.com/user-attachments/assets/6a40ab76-da89-4b11-8bf3-fc5d403da0ce)
+
 
 Install via 
 ```python
