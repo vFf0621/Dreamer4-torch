@@ -42,8 +42,12 @@ For the dynamics:
 Imagined Trajectory:
 
 ![output](https://github.com/user-attachments/assets/6a40ab76-da89-4b11-8bf3-fc5d403da0ce)
+
+&nbsp;&nbsp;&nbsp;&nbsp;
 ![output](https://github.com/user-attachments/assets/d970e24b-1621-47ac-9ccf-7eb572c4203c)
+&nbsp;&nbsp;&nbsp;&nbsp;
 ![output](https://github.com/user-attachments/assets/e5eb5310-d6f0-4f26-a51d-90cd73764c66)
+&nbsp;&nbsp;&nbsp;&nbsp;
 ![output](https://github.com/user-attachments/assets/438a4e8e-88da-4061-bfa6-1c816d7e7d86)
 
 Memory Consumption:
