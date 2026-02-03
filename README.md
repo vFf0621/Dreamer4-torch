@@ -49,7 +49,8 @@ Imagined Trajectory:
 &nbsp;&nbsp;&nbsp;&nbsp;
 ![output](https://github.com/user-attachments/assets/438a4e8e-88da-4061-bfa6-1c816d7e7d86)
 &nbsp;&nbsp;&nbsp;&nbsp;
-![output](https://github.com/user-attachments/assets/c5bc42af-557f-49d2-96b2-9696ebd2e76d)
+![output](https://github.com/user-attachments/assets/61dd875d-55b2-4536-a905-b3f149b1da08)
+
 
 
 
