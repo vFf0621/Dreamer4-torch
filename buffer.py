@@ -91,59 +91,86 @@ class ReplayBuffer:
             )
         return self._probe_cache
 
-    def sample_seq(self, batch_size, chunk_size):
-        N = int(self.buffer_limit)
+    def sample_seq(self, batch_size, chunk_size, min_len=10, return_len=False):
+        """
+        No cross-episode chunks, no padding.
+        Enforces that every sampled start has avail_len >= min_len (default 10).
+        Returns sequences of length L_eff >= min_len.
+        """
+        N = int(self.size())
         B = int(batch_size)
         L = int(chunk_size)
+        min_len = int(min_len)
 
-        assert L >= 1
-        assert self.full or (self.idx >= L), "too short dataset or too long chunk_size"
+        if N == 0:
+            raise ValueError("Buffer is empty.")
+        if L < 1:
+            raise ValueError("chunk_size must be >= 1")
+        if min_len < 1:
+            raise ValueError("min_len must be >= 1")
+        if L < min_len:
+            raise ValueError(f"chunk_size ({L}) must be >= min_len ({min_len})")
 
-        done = self.terminal[:N].astype(bool)
+        def avail_len(start, Lmax):
+            cur = int(start)
+            wid_cur = int(self.write_id[cur])
+            length = 1
+            if bool(self.terminal[cur]) or Lmax == 1:
+                return 1
 
-        valid = np.ones(N, dtype=bool)
+            for _ in range(1, Lmax):
+                if bool(self.terminal[cur]):  # episode ends at cur
+                    break
+                nxt = int(self.next_idx[cur])
+                if nxt < 0:
+                    break
+                # overwrite-safe link check
+                if int(self.next_write_id[cur]) != int(self.write_id[nxt]):
+                    break
+                # strict contiguity for single-stream buffer
+                if int(self.write_id[nxt]) != wid_cur + 1:
+                    break
+                cur = nxt
+                wid_cur = int(self.write_id[cur])
+                length += 1
 
-        if not self.full:
-            last_start = self.idx - L
-            valid[:] = False
-            if last_start >= 0:
-                valid[: last_start + 1] = True
+            return length
 
-            if L > 1 and last_start >= 0:
-                # terminals in [s, s+L-2] must be 0
-                window = L - 1
-                # prefix sum over the *filled* region only
-                d = done[: self.idx].astype(np.int32)
-                cs = np.concatenate(([0], np.cumsum(d)))  # length idx+1
+        # --- Build candidate starts that can provide >= min_len steps ---
+        # (Uses Lmax=min_len so this filter is cheap-ish.)
+        all_starts = np.arange(N, dtype=np.int64)
+        ok_mask = np.fromiter((avail_len(s, min_len) >= min_len for s in all_starts),
+                            dtype=np.bool_, count=N)
+        candidates = all_starts[ok_mask]
 
-                s = np.arange(last_start + 1)             # 0..last_start
-                terminals_in_prefix = cs[s + window] - cs[s]  # length last_start+1
-                valid[: last_start + 1] &= (terminals_in_prefix == 0)
+        if candidates.size < B:
+            raise ValueError(
+                f"Not enough starts with avail_len >= {min_len}: need {B}, have {candidates.size}."
+            )
 
-        else:
-            if L > 1:
-                # avoid ring discontinuity at idx-1 -> idx
-                bad = (self.idx - np.arange(1, L)) % N
-                valid[bad] = False
+        starts = self.rng.choice(candidates, size=B, replace=(candidates.size < B))
 
-                # forbid episode crossing: no done in first L-1 steps (circular)
-                window = L - 1
-                d2 = np.concatenate([done, done[:window]]).astype(np.int32)  # length N+window
-                cs = np.concatenate(([0], np.cumsum(d2)))                   # length N+window+1
+        # Now compute the effective length for this batch, capped by chunk_size.
+        avails = np.array([avail_len(s, L) for s in starts], dtype=np.int64)
+        L_eff = int(avails.min())
+        if L_eff < min_len:
+            # Should not happen because candidates ensured min_len, but keep as safety.
+            raise RuntimeError(f"L_eff {L_eff} < min_len {min_len}. Bug in avail_len/candidates filter.")
 
-                s = np.arange(N)  # 0..N-1
-                terminals_in_prefix = cs[s + window] - cs[s]  # length N (FIX)
-                valid &= (terminals_in_prefix == 0)
+        # Gather indices by following next pointers for exactly L_eff steps
+        idxs = np.empty((B, L_eff), dtype=np.int64)
+        for i, s in enumerate(starts):
+            cur = int(s)
+            idxs[i, 0] = cur
+            for t in range(1, L_eff):
+                cur = int(self.next_idx[cur])
+                idxs[i, t] = cur
 
-        candidates = np.flatnonzero(valid)
-        assert candidates.size >= B, f"Not enough valid sequences: need {B}, have {candidates.size}"
+        observation = self.observation[idxs]
+        action      = self.action[idxs]
+        reward      = self.reward[idxs]
+        done_seq    = self.terminal[idxs]
 
-        starts = self.rng.choice(candidates, size=B, replace=False)
-        offsets = np.arange(L, dtype=np.int64)[None, :]
-        sample_index = (starts[:, None] + offsets) % N
-
-        observation = self.observation[sample_index]
-        action      = self.action[sample_index]
-        reward      = self.reward[sample_index]
-        done_seq    = self.terminal[sample_index]
+        if return_len:
+            return observation, action, reward, done_seq, L_eff
         return observation, action, reward, done_seq
