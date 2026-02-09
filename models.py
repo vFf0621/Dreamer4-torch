@@ -60,9 +60,7 @@ class Policy(nn.Module):
         # For training stability, we often use expectation or straight-through sampling
         dist_act = td.Categorical(probs=prob[:,:,0])
         idx = dist_act.sample()
-
-        action = two_hot_inv(prob, self.num_bins, -0.7, 0.7)[:,:,0].squeeze(-1)
-
+        action = ((idx / self.num_bins) * 2 - 1).clamp(-1, 1)
         log_prob = dist_act.log_prob(idx).sum(dim=-1, keepdim=True) # Sum over action dims
         
         return action, log_prob, dist, dist_act, idx
@@ -512,6 +510,7 @@ class TokenDynamics(nn.Module):
         
         normed = (actions.clamp(-1,1) + 1.0) * 0.5  # [0,1]
         idx = (normed * (self.action_bins-1)).round().long()
+        idx = torch.clamp(idx, 0, self.action_bins - 1)
         return idx
 
     def align_actions(self, actions, T, B):
@@ -1185,7 +1184,7 @@ class Dreamer4(nn.Module):
                         _, log_q, _, base_q, _ = self.t_policy(h_last)
                     kl_step = td.kl_divergence(base_p, base_q)
                     if kl_step.dim() >= 2:
-                        kl_step = kl_step.sum(-1, keepdim=True)
+                        kl_step = kl_step.mean(-1, keepdim=True)
                     kl = kl_step
 
                 kl_list.append(kl)
@@ -1387,16 +1386,17 @@ class Dreamer4(nn.Module):
         kl = 0.
         self.steps += 1
         k = buffer.rng.integers(self.batch_lengths[0], self.batch_lengths[1])
-        s = buffer.sample_seq(self.batch_size, k)
-        self.dyn_optim.zero_grad()
+        if not policy:
+            s = buffer.sample_seq(self.batch_size, k)
+            self.dyn_optim.zero_grad()
 
-        states, actions, reward, termination, = s
-        full_sequence = states[0].transpose(0,2,3,1)
+            states, actions, reward, termination, = s
+            full_sequence = states[0].transpose(0,2,3,1)
 
-        states = torch.from_numpy(states).to(self.device).float()
-        actions = torch.from_numpy(actions).to(self.device).float()
-        reward = torch.from_numpy(reward).to(self.device).float()
-        termination = torch.from_numpy(termination).to(self.device).float()
+            states = torch.from_numpy(states).to(self.device).float()
+            actions = torch.from_numpy(actions).to(self.device).float()
+            reward = torch.from_numpy(reward).to(self.device).float()
+            termination = torch.from_numpy(termination).to(self.device).float()
         self.rep_optim.zero_grad()
         self.policy_optim.zero_grad(set_to_none=True)
         for i in tqdm(range(self.grad_accum)):
@@ -1488,8 +1488,9 @@ class Dreamer4(nn.Module):
                     self.dyn_optim.zero_grad()
 
             if policy:
- 
-
+                states, actions = buffer.sample(self.batch_size)[:2]
+                states = torch.from_numpy(states).to(self.device).float()
+                actions = torch.from_numpy(actions).to(self.device).float()
                 with FreezeParameters([
                                             self.encoder,
                                             self.transformer,
@@ -1503,7 +1504,7 @@ class Dreamer4(nn.Module):
                     z_0 = initial_latent[:,:1].detach()
                     
                     imag_z, h_t, lp, kl_prior, imagined_actions = self.latent_imagination(
-                                z_0, actions[:, :], offset=self.eval_ctx, num_iter=H) 
+                                z_0, actions[:, :], offset=1, num_iter=H) 
                     self.decode_and_save(imag_z, "imagined") 
                     r_full, _, _, termination = self.reward(h_t[:, :])
                     r_seq = concat_mtp(r_full[:,:-1],self.aux_horizon)  
@@ -1528,8 +1529,7 @@ class Dreamer4(nn.Module):
                     neg =  ((adv<0) * lp_t).sum()/ base[adv < 0].sum().clamp(min=1)
 
                     actor_loss = 0.5*(pos + neg).mean()+ 3e-1*(kl_prior.mean())
-
-                 
+ 
                     ((actor_loss + value_loss)/self.grad_accum).backward()
                     actor_gn =adaptive_grad_clip(self, 0.3)
                     if i==self.grad_accum - 1:

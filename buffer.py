@@ -76,10 +76,10 @@ class ReplayBuffer:
             raise ValueError("Buffer is empty.")
         idxes = self.rng.integers(0, max_idx, size=int(n), endpoint=False)
         return (
-            self.observation[idxes],
-            self.action[idxes],
-            self.reward[idxes],
-            self.terminal[idxes].astype(np.float32),
+            self.observation[idxes, None],
+            self.action[idxes, None],
+            self.reward[idxes, None],
+            self.terminal[idxes, None].astype(np.float32),
         )
     def sample_probe(self, batch_size, chunk_size):
         if getattr(self, "_probe_cache", None) is None:

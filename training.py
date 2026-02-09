@@ -106,7 +106,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
                 act = [None for i in range(len(agents))] # Single agent
                 for i in range(len(agents)):
                 # Warmup: Random Action
-                    if not train_policy and epi < num_warmups:
+                    if not train_policy or not buffer.full:
                         act[i] = env.action_space.sample()
                     # Training: Model Action
                     else:
@@ -114,6 +114,8 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
                         # Assuming single agent, extracting index 0
                         state_tensor = torch.from_numpy(observation[0]).to(agents[0].device)
                         act[i] = agents[i].action_step(state_tensor)
+                        env.render() 
+
                     # Step Environment
                 # gym_multi_car_racing usually returns dicts or tuples depending on version
                 # ensuring compatibility with your previous unpacking
@@ -128,7 +130,6 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
                 observation = next_observation
             
             # Rendering (optional, can slow down training)
-             #   env.render() 
         # --- Storage Phase ---
         if train and len(episode_obs) > 0:
             # Convert lists to numpy arrays for the buffer
@@ -147,7 +148,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
         writer["episodic_return_0"] = score
         
         # Train on the buffer
-        if train and (buffer.full or mode=="policy"): # Ensure min buffer size
+        if train and (buffer.full): # Ensure min buffer size
             for a in agents:
                 # Note: buffer is passed directly; train_one_epoch handles sampling internally
                 log_data = a.train_step(writer, buffer, model=train_model, policy=train_policy, train_reward=train_reward)
@@ -257,7 +258,7 @@ def main():
     env = gym.make("MultiCarRacing-v1", num_agents=args.num_agents, render_mode=args.render_mode) 
     simulate(
         env,
-        1000000 if args.train_mode not in {"inference", "policy"}  else 1,
+        1000000,
         args.steps,  # your empty dict argument stays as-is
         num_agents=args.num_agents,
         buffer_limit=args.buffer_limit,
