@@ -1,4 +1,4 @@
-# Memory efficient Dreamer4
+# Unofficial Dreamer4
 Compact implementation of Dreamer 4.
 
 Please note that Attention Soft Capping is not implemented as no training instability is found. Instead, Scaled Dot-Product Attention is used.
