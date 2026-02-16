@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.distributions as td
 from torch.distributions.transforms import TanhTransform
 from collections.abc import Iterable
-
+import torch.nn.init as init
 def soft_ce(pred, target, bins, minv, maxv):
     """Computes the cross entropy loss between predictions and soft targets."""
     pred = F.log_softmax(pred, dim=-1)
@@ -48,7 +48,7 @@ def two_hot(x, minv, maxv, bins):
 
 def two_hot_inv(x, bin_num, minv, maxv):
     """Converts a batch of soft two-hot encoded vectors to scalars."""
-    dreg_bins = torch.linspace(-minv, maxv, bin_num, device=x.device, dtype=x.dtype)
+    dreg_bins = torch.linspace(minv, maxv, bin_num, device=x.device, dtype=x.dtype)
     x = F.softmax(x, dim=-1)
     x = torch.sum(x * dreg_bins, dim=-1, keepdim=True)
     return symexp(x)
@@ -61,7 +61,14 @@ def concat_mtp(x, mtp):
     seq = torch.cat([prev, last], 1)   
     return seq
 
-
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        # Apply Xavier Uniform to Linear Layers
+        init.orthogonal_(m.weight)
+        if m.bias is not None:
+            init.zeros_(m.bias)
+            
+            
 def build_network(input_size, hidden_size, num_layers, activation, output_size, rms=True):
 
     layers = []
@@ -79,7 +86,14 @@ def build_network(input_size, hidden_size, num_layers, activation, output_size, 
     # output projection
     layers.append(nn.Linear(hidden_size, output_size))
     return nn.Sequential(*layers)
-
+def int_to_one_hot(x, num_classes):
+	"""
+	Converts an integer tensor to a one-hot tensor.
+	Supports batched inputs.
+	"""
+	one_hot = torch.zeros(*x.shape, num_classes, device=x.device)
+	one_hot.scatter_(-1, x.unsqueeze(-1), 1)
+	return one_hot
 def apply_random_patch_mask(
     images: torch.Tensor,
     patch_size: int = 16,
@@ -186,7 +200,37 @@ class LPIPSLoss(nn.Module):
         if self.reduction == "sum":
             return d.sum()
         return d.mean()
+def mask_after_done(inp, contprob, thresh=0.5):
+    """
+    inp:   [B, T] or [B, T, 1]
+    contprob: [B, T] or [B, T, 1]   (continuation probability in [0,1])
 
+    Masks reward so that once contprob < thresh occurs,
+    reward at that timestep and all future timesteps become 0.
+    """
+    inp = inp.squeeze(-1)
+    contprob = contprob.squeeze(-1)
+
+    B, T = inp.shape
+
+    # done mask: True where episode is considered ended
+    done = contprob  >= thresh   # [B, T]
+
+    # cumulative "has ended already" mask
+    ended = torch.cumsum(done.int(), dim=1) > 0   # [B, T], True after first done
+    ended = torch.cat([torch.zeros_like(ended[:,:1]), ended], 1)[:,:-1]
+
+    # mask rewards
+    out = inp.masked_fill(ended, 0.0)
+
+    return out
+
+
+def kl_div(p, q):
+    logprob = nn.functional.log_softmax(p, -1)
+    logother = nn.functional.log_softmax(q, -1)
+    prob = torch.softmax(p, -1)
+    return (prob * (logprob - logother)).sum(-1)
 def adaptive_grad_clip(model, clip=0.01, eps=1e-3):
     total_grad_norm = 0.0
 
@@ -207,29 +251,23 @@ def adaptive_grad_clip(model, clip=0.01, eps=1e-3):
 
     return total_grad_norm ** 0.5
 
-def check_shape(t):
-    if len(t.shape) == 3:
-        t = t.squeeze(-1)
-    return t
-def lambda_returns(reward, cont, value, lambda_=0.95, discount=0.997):
-    reward = check_shape(reward).squeeze(-1)   # [B,T]
-    cont   = check_shape(cont).squeeze(-1)     # [B,T]
-    value  = check_shape(value).squeeze(-1)    # [B,T+1]
-
+def lambda_returns(reward, contprob, boot,lambda_=0.95, discount=0.997):
+    # reward, contprob, value: [B,T] (or [B,T,1] -> squeeze)
+    reward   = reward.squeeze(-1)
+    contprob = contprob.squeeze(-1)      # continuation probability in [0,1]
+    boot    = boot.squeeze(-1)
     B, T = reward.shape
-    assert value.shape[1] == T + 1, (reward.shape, value.shape)
 
-    returns = torch.zeros(B, T, device=reward.device, dtype=reward.dtype)
-    next_ret = value[:, -1]  # bootstrap V_{T}
-
-    for t in reversed(range(T)):
-        disc = discount * cont[:, t]
-        next_val = value[:, t + 1]
-        target = reward[:, t] + disc * ((1 - lambda_) * next_val + lambda_ * next_ret)
-        returns[:, t] = target
-        next_ret = target
-
-    return returns
+    # Effective discount per step: gamma_t = discount * contprob_t
+    
+    # Shift value to get V_{t+1}. For last step, bootstrap with V_{T-1} (or provide an explicit boot value)
+    rets = [boot[:, -1]]
+    live = (contprob[:, 1:] > 0.5).float() * discount
+    cont = lambda_
+    interm = reward[:, 1:] + (1 - cont) * live * boot[:, 1:]
+    for t in reversed(range(live.shape[1])):
+        rets.append(interm[:, t] + live[:, t] * cont * rets[-1])
+    return torch.stack(list(reversed(rets))[:-1], 1)
 def get_parameters(modules: Iterable[nn.Module]):
     model_parameters = []
     for module in modules:
@@ -340,44 +378,55 @@ class RoPE1D(nn.Module):
 def causal_mask(T: int, device=None) -> torch.Tensor:
     return ~torch.triu(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1)
 
-class ActionBinning:
-    def __init__(self, bins=50, low=-1.0, high=1.0, device="cuda"):
-        self.bins = bins
-        self.low = low
-        self.high = high
-        self.bin_step = (high - low) / (bins - 1)
-        self.centers = torch.linspace(low, high, bins, device=device)
+def unimix_probs(probs, eps=0.01, dim=-1):
+    # probs: [..., num_bins]
+    num_bins = probs.size(dim)
+    uniform = torch.full_like(probs, 1.0 / num_bins)
+    return (1.0 - eps) * probs + eps * uniform
+def gumbel_softmax(
+    prob: torch.Tensor,
+    tau: float = 1.0,
+    hard: bool = False,
+    dim: int = -1,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    """
+    Gumbel-Softmax sampling from probabilities.
 
-    def to_logits(self, actions):
-        x = actions.clamp(self.low, self.high)
-        pos = (x - self.low) / self.bin_step
-        
-        floor_idx = pos.floor().long().clamp(0, self.bins - 1)
-        ceil_idx = (floor_idx + 1).clamp(0, self.bins - 1)
-        
-        ceil_weight = pos - floor_idx.float()
-        floor_weight = 1.0 - ceil_weight
-        
-        shape = actions.shape
-        target = torch.zeros(*shape, self.bins, device=actions.device)
-        
-        target.scatter_(-1, floor_idx.unsqueeze(-1), floor_weight.unsqueeze(-1))
-        target.scatter_(-1, ceil_idx.unsqueeze(-1), ceil_weight.unsqueeze(-1))
-        
-        return target
+    Args:
+      prob: [..., num_bins] (Probabilities, must sum to 1)
+      tau: temperature (lower -> more one-hot, higher -> uniform)
+      hard: if True, returns one-hot but allows gradient flow (straight-through)
+      dim: bins dimension
+      eps: numerical stability
 
-    def from_logits(self, logits, deterministic=False):
-        probs = F.softmax(logits, dim=-1)
-        if deterministic:
-            indices = torch.argmax(probs, dim=-1)
-            return self.centers[indices]
-        else:
-            return (probs * self.centers).sum(dim=-1)
-            
-    def sample(self, logits):
-        dist = td.OneHotCategorical(logits=logits)
-        sample_one_hot = dist.sample() 
-        return (sample_one_hot * self.centers).sum(dim=-1)
+    Returns:
+      y: same shape as prob
+    """
+    # 1. Convert Probabilities to Logits
+    #    We clamp to avoid log(0) = -inf
+    logits = torch.log(prob.clamp_min(eps))
+
+    # 2. Sample Gumbel Noise
+    u = torch.rand_like(logits)
+    g = -torch.log(-torch.log(u.clamp_min(eps)).clamp_min(eps))
+
+    # 3. Softmax with Temperature
+    #    (log(p) + g) / tau
+    y = F.softmax((logits + g) / tau, dim=dim)
+
+    if not hard:
+        return y
+
+    # 4. Straight-through: Hard One-Hot forward, Soft backward
+    #    index of max value
+    index = y.argmax(dim, keepdim=True)
+    
+    #    create hard one-hot tensor
+    y_hard = torch.zeros_like(logits, memory_format=torch.legacy_contiguous_format).scatter_(dim, index, 1.0)
+    
+    #    detach hard so gradients flow through 'y' (the soft version)
+    return y_hard - y.detach() + y
 def modality_mask(
     L: int,                   
     modality_sizes: list[int], 

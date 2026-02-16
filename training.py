@@ -18,9 +18,37 @@ torch.backends.cuda.enable_mem_efficient_sdp(True)
 import os
 os.makedirs("./ckpts", exist_ok=True)
 os.makedirs("./eval_imgs", exist_ok=True)
+def load_replay(path="buffer.npz", seed=None):
+    data = np.load(path, allow_pickle=True)
 
+    buf = ReplayBuffer(
+        buffer_limit=int(data["buffer_limit"]),
+        obs_size=tuple(data["obs_size"].tolist()),
+        action_size=int(data["action_size"]),
+        seed=seed,  # will be overridden if rng_state is present
+    )
+
+    buf.observation[:] = data["observation"]
+    buf.action[:]      = data["action"]
+    buf.reward[:]      = data["reward"]
+    buf.terminal[:]    = data["terminal"]
+
+    buf.idx   = int(data["idx"])
+    buf.full  = bool(data["full"])
+
+    buf.next_idx[:]      = data["next_idx"]
+    buf.write_id[:]      = data["write_id"]
+    buf.next_write_id[:] = data["next_write_id"]
+    buf._global_write_counter = np.int64(data["global_write_counter"])
+    buf._prev = int(data["prev"])
+
+    if "rng_state" in data:
+        buf.rng = np.random.default_rng()
+        buf.rng.bit_generator.state = data["rng_state"].item()
+
+    return buf
 def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, patch , Nr, latent_tokens, z_dim, action_dim, latent_dim, 
-                 rep_depth , rep_d_model, dyn_d_model, num_heads, dropout, k_max, mtp, task_id,  kmax_prob, lambda_,
+                 rep_depth , rep_d_model, dyn_d_model, num_heads, dropout, k_max, mtp, task_id,  kmax_prob, lambda_, buffer,
                  policy_bins , reward_bins , pretrain, reward_clamp,level_vocab , level_embed_dim,mode,num_tasks, Sa,
                  batch_lens, batch_size, accum, max_imag_len, buffer_limit, train, ckpt, rep_lr=1e-4, rep_decay=1e-3,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3 , save_every=500):
@@ -66,7 +94,10 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
                 policy_lr=policy_lr, 
                 policy_decay=policy_decay) for i in range(num_agents)]
     # 1. Initialize Buffer OUTSIDE the loop so data persists
-    buffer = ReplayBuffer(buffer_limit=buffer_limit, obs_size=(ch, h,w), action_size=action_dim )
+    if buffer:
+        buffer = load_replay(buffer)
+    else:
+        buffer = ReplayBuffer(buffer_limit=buffer_limit, obs_size=(ch, h,w), action_size=action_dim )
     total_steps = 0
     writer = {}
     for epi in range(num_warmups + num_interaction_episodes):
@@ -106,7 +137,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
                 act = [None for i in range(len(agents))] # Single agent
                 for i in range(len(agents)):
                 # Warmup: Random Action
-                    if not train_policy or not buffer.full:
+                    if not train_policy:
                         act[i] = env.action_space.sample()
                     # Training: Model Action
                     else:
@@ -148,7 +179,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
         writer["episodic_return_0"] = score
         
         # Train on the buffer
-        if train and (buffer.full): # Ensure min buffer size
+        if train and (buffer.full or mode=="policy"): # Ensure min buffer size
             for a in agents:
                 # Note: buffer is passed directly; train_one_epoch handles sampling internally
                 log_data = a.train_step(writer, buffer, model=train_model, policy=train_policy, train_reward=train_reward)
@@ -201,10 +232,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_heads", type=int, default=8)
     p.add_argument("--dropout", type=float, default=0.01)
     p.add_argument("--k_max", type=int, default=128, help="Has to be a power of 2")
-    p.add_argument("--mtp", type=int, default=7)
+    p.add_argument("--mtp", type=int, default=8)
     p.add_argument("--num_tasks", type=int, default=10)
     p.add_argument("--task_id", type=int, default=0)
     p.add_argument("--eval_context_len", type=int, default=12)
+    p.add_argument("--buffer", type=str, default="")
 
     # Discretization / vocab
     p.add_argument("--policy_bins", type=int, default=101)
@@ -219,7 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lambda_", type=float, default=0.95)
 
     p.add_argument("--rep_decay", type=float, default=1e-3)
-    p.add_argument("--policy_lr", type=float, default=1e-5)
+    p.add_argument("--policy_lr", type=float, default=7e-4)
     p.add_argument("--policy_decay", type=float, default=1e-4)
     p.add_argument("--render_mode", type=str, default="rgb_array")
     p.add_argument("--train_mode", type=str, default="pretrain")
@@ -266,6 +298,7 @@ def main():
         h=args.h,
         w=args.w,
         patch=args.patch,
+        buffer=args.buffer,
         kmax_prob = args.kmax_base_prob,
         latent_tokens=args.latent_tokens,
         z_dim=args.z_dim,
