@@ -1,9 +1,9 @@
 # Unofficial Dreamer4
 Compact implementation of Dreamer 4.
 
-Please note that Attention Soft Capping is not implemented as no training instability is found. Instead, Scaled Dot-Product Attention is used.
+Please note that Attention Soft Capping is not implemented as no training instability is found. Instead, Scaled Dot-Product Attention is used
 
-Different from previous implementations, this default implementation uses RoPE1D(as stated in the paper) for time attention and learned PE for space attention, as well as the one directional masking for latent tokens in the encoder and decoder. Also, 
+This default implementation uses RoPE1D(as stated in the paper) for time attention and learned PE for space attention, as well as the one directional masking for latent tokens in the encoder and decoder. Also, 
 embedding lookup is implemented for continuous action inputs.
 
 Input images are expected to be of shape (CH, H, W) and normalized to [0, 1].
