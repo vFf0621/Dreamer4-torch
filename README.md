@@ -48,11 +48,11 @@ Imagined Trajectory:
 ![output](https://github.com/user-attachments/assets/61dd875d-55b2-4536-a905-b3f149b1da08)
 
 For Finetuning:
+<img width="985" height="608" alt="Screenshot from 2026-02-17 17-15-00" src="https://github.com/user-attachments/assets/03ea90a7-7d42-4b6a-b7e0-bd7fa6bdf46d" />
 
-<img width="969" height="1137" alt="Screenshot from 2026-02-17 17-20-51" src="https://github.com/user-attachments/assets/37e42260-438d-423b-bf56-6a85e8eccb9b" />
 
 For RL: 
-<img width="985" height="608" alt="Screenshot from 2026-02-17 17-15-00" src="https://github.com/user-attachments/assets/03ea90a7-7d42-4b6a-b7e0-bd7fa6bdf46d" />
+<img width="969" height="1137" alt="Screenshot from 2026-02-17 17-20-51" src="https://github.com/user-attachments/assets/37e42260-438d-423b-bf56-6a85e8eccb9b" />
 
 
 Memory Consumption:
