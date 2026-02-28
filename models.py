@@ -68,7 +68,6 @@ class Policy(nn.Module):
         action = action.squeeze(-1)
         return action, logp, dist, dist_act, idx
 
-# ---- Highway-gated residual wrapper ---
 class GQA(nn.Module):
     def __init__(self, embed_dim=16, num_heads=8, dropout=0.1, causal=False,device="cuda"):
         super().__init__()
@@ -89,8 +88,7 @@ class GQA(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim)
         self.k_norm = nn.RMSNorm(self.head_dim)
         self.device=device
-        if causal:
-            self.rope = RoPE1D(self.head_dim)
+        self.rope = RoPE1D(self.head_dim)
         self.dropout = dropout
 
     def forward(self, x, x_k=None, attn_mask=None, key_padding_mask=None):
@@ -107,9 +105,8 @@ class GQA(nn.Module):
         k = k.view(B, Tk, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, Tk, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        if self.causal:
-            cos, sin = self.rope(q, seq_len=Tq)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        cos, sin = self.rope(q, seq_len=Tq)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -321,7 +318,6 @@ class Encoder(nn.Module):
         self.patch_proj = nn.Sequential(nn.RMSNorm(patch_dim), nn.Linear(patch_dim, d_model))
         self.latent_tok = nn.Parameter(torch.randn(1, 1, latent_tokens, d_model) * 0.02)
         self.drop = nn.Dropout(dropout)
-        self.pos_emb_lat = nn.Parameter(torch.randn(1, 1, self.latent_tokens + self.num_patches+num_reserved, d_model) * 0.02)
         self.reserved = nn.Parameter(torch.randn(1, 1, num_reserved, d_model) * 0.02)
         self.num_reserved=num_reserved
         blocks = []
@@ -350,7 +346,7 @@ class Encoder(nn.Module):
         
         proj = self.patch_proj(patches)                             # (B,T,Np,D)
         lat = self.latent_tok.view(1, 1, self.latent_tokens, self.d_model).expand(B, T, -1, -1) 
-        x = torch.cat([lat, proj, self.reserved.expand(B,T,-1,self.d_model)], dim=2) +self.pos_emb_lat                             # (B,T,S,D) with S=L+Np      
+        x = torch.cat([lat, proj, self.reserved.expand(B,T,-1,self.d_model)], dim=2)                     # (B,T,S,D) with S=L+Np      
 
         x = self.drop(x)
         for blk in self.blocks:
@@ -423,7 +419,6 @@ class TokenDynamics(nn.Module):
         # --- Discrete signal embeddings (tau_idx + k_idx) ---
         self.level_vocab = int(level_vocab)
         self.step_vocab = int(step_vocab)
-        self.space_pos_embed = nn.Parameter(0.02 * torch.randn(1, 1, self.Sa + self.Nz+2 + Nr, d_model))
         self.z_proj = nn.Sequential(nn.RMSNorm(Dz), nn.Linear(Dz, d_model))
         self.sig_proj = nn.Sequential(nn.RMSNorm(level_dim), nn.Linear(level_dim, d_model))
 
@@ -652,7 +647,6 @@ class TokenDynamics(nn.Module):
         reserved  = self.reserved.expand(B, T, self.Nr, -1)
 
         x_aug = torch.cat([x, agent_in, reserved], dim=2)
-        x_aug = x_aug + self.space_pos_embed.expand(B, 1, -1, self.d_model)
 
         for blk in self.blocks:
             S = x_aug.size(2)
@@ -738,9 +732,9 @@ class Dreamer4(nn.Module):
         self.kmax_prob = kmax_prob
         self.t_value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp)
         self.disc = 0.997
-        self.encoder.load_state_dict(torch.load("enc.pt"))
+      #  self.encoder.load_state_dict(torch.load("enc.pt"))
        
-        self.decoder.load_state_dict(torch.load("dec.pt"))
+  #      self.decoder.load_state_dict(torch.load("dec.pt"))
         self.tau_ctx = 0.1
         self.lpips = LPIPSLoss(reduction="none",)
         self.rep_optim = torch.optim.AdamW(
@@ -1688,7 +1682,6 @@ class Decoder(nn.Module):
             use_time = ((i+1) % time_every == 0)
             blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time))
         self.blocks = nn.ModuleList(blocks)
-        self.pos_embed_lat = nn.Parameter(torch.randn(1, 1, self.latent_tokens+self.num_patches+num_reserved, d_model) * 0.02)
         self.ln_out = nn.RMSNorm(d_model)
         self.to_patch = nn.Linear(d_model, img_channels * patch * patch)
 
@@ -1718,7 +1711,7 @@ class Decoder(nn.Module):
         # ---- patch queries ----
         pq = self.patch_queries.expand(B, T, self.num_patches, self.d_model)
         # IMPORTANT: put latents FIRST, then patch queries
-        x = torch.cat([zlat, pq, self.reserved.expand(B, T, -1, self.d_model)], dim=2) + self.pos_embed_lat  # (B,T,L+Np,D)
+        x = torch.cat([zlat, pq, self.reserved.expand(B, T, -1, self.d_model)], dim=2)   # (B,T,L+Np,D)
         x = self.drop(x)
         space_mask = modality_mask(L, [self.num_patches, self.num_reserved], encoder=False, device=x.device)
 

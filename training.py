@@ -235,7 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mtp", type=int, default=8)
     p.add_argument("--num_tasks", type=int, default=10)
     p.add_argument("--task_id", type=int, default=0)
-    p.add_argument("--eval_context_len", type=int, default=12)
+    p.add_argument("--eval_context_len", type=int, default=4)
     p.add_argument("--buffer", type=str, default="")
 
     # Discretization / vocab

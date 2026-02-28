@@ -292,15 +292,6 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         a, b = x.chunk(2, dim=-1)
         return a * F.silu(b)
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    d = x.size(-1)
-    if d % 2 != 0:
-        raise ValueError(f"RoPE needs even last dim, got {d}.")
-    x1 = x[..., : d // 2]
-    x2 = x[..., d // 2 :]
-    return torch.cat([-x2, x1], dim=-1)
-
-
 # --- PASTE INTO utils.py ---
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
