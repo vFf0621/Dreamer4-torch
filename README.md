@@ -17,7 +17,7 @@ Action embeddings are interleaved with the latent, not added, as in previous imp
 
 Below are the training artifacts:
 
-<img width="2528" height="1328" alt="W B Chart 2_28_2026, 6_45_44 PM" src="https://github.com/user-attachments/assets/d67e7c2b-4ab0-4bd5-8370-ade4b840114f" />
+<img width="1200" height="600" alt="W B Chart 2_28_2026, 6_45_44 PM" src="https://github.com/user-attachments/assets/d67e7c2b-4ab0-4bd5-8370-ade4b840114f" />
 
 
 
