@@ -27,9 +27,7 @@ And the reconstructed sequence:
 
 For the dynamics:
 
-<img width="200" height="200" alt="W B Chart 2_1_2026, 10_31_16 AM" src="https://github.com/user-attachments/assets/e350a4fe-c6d9-4a93-b995-57768b06b527" />
-
-<img width="200" height="200" alt="W B Chart 2_1_2026, 10_31_28 AM" src="https://github.com/user-attachments/assets/c9a35ad2-d289-4317-b210-1898bef29282" />
+<img width="500" height="300" alt="W B Chart 2_28_2026, 10_55_36 PM" src="https://github.com/user-attachments/assets/714304b4-c737-42f7-9c47-b57f96455ec9" />
 
 Imagined Trajectory:
 
