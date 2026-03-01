@@ -731,6 +731,7 @@ class Dreamer4(nn.Module):
         self.value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp)
         self.kmax_prob = kmax_prob
         self.t_value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp)
+        self.t_value = None
         self.disc = 0.997
       #  self.encoder.load_state_dict(torch.load("enc.pt"))
        
@@ -763,7 +764,6 @@ class Dreamer4(nn.Module):
             {'params': self.t_policy.parameters()},], eps = 1e-5,
          lr=policy_lr, capturable=True, weight_decay=dyn_decay)
 
-        self.t_value.load_state_dict(self.value.state_dict())
         self.to(self.device)
 
     def reset(self):
@@ -1237,7 +1237,7 @@ class Dreamer4(nn.Module):
             return z_inp, h, lp, kl, imagined_actions
     def decode(self, latents):
         return self.decoder(latents)
-    def multistep_aux_losses(self, feat, actions, rewards, t_policy=False):
+    def multistep_aux_losses(self, feat, actions, rewards, termination, t_policy=False):
         """
         Auxiliary Loss:
         Predict NEXT K steps for both Action and Reward.
@@ -1358,7 +1358,7 @@ class Dreamer4(nn.Module):
 
         r_mask = (t_idx + k_idx) < T_rp1                          # [1, L, K_use]
 
-        _, _, rew_logits, _ = self.reward(feat)
+        _, _, rew_logits, term_dist = self.reward(feat)
         rew_logits = rew_logits[:, :L_use, :K_use]                # [B, L, K_use, bins]
 
         raw_rew_loss = soft_ce(
@@ -1371,17 +1371,43 @@ class Dreamer4(nn.Module):
         r_mask_exp = r_mask.expand_as(raw_rew_loss)
         rew_loss = (raw_rew_loss * r_mask_exp).sum() / (r_mask_exp.sum() + 1e-6)
 
-        return act_loss, rew_loss
+        # ======================================================================
+        # Termination HEAD (Predict r_{t+1..t+K})
+        # ======================================================================
+
+        t_tp1 = termination[:, :]         # [B, T_r-1]
+        T_tp1 = T_r - 1
+
+        req_len_t = L_use + K - 1
+        pad_len_t = max(0, req_len_t - T_tp1)
+        if pad_len_t > 0:
+            t_padded = F.pad(t_tp1, (0, pad_len_t), mode="constant", value=0.0)
+        else:
+            t_padded = t_tp1
+
+        t_win = t_padded.unfold(dimension=1, size=K, step=1)      # [B, Lp, K]
+        t_tgt = t_win[:, :L_use].contiguous()[:, :, :K_use]       # [B, L, K_use]
+
+        term_logits = term_dist.logits
+        term_logits = term_logits[:, :L_use, :K_use]                # [B, L, K_use, bins]
+
+        term_loss = F.binary_cross_entropy_with_logits(
+            term_logits,
+            t_tgt,
+            reduction='none'
+        ) # typically [B, L, K_use]
+        t_mask = r_mask.clone()
+        t_mask_exp = t_mask.expand_as(term_loss)
+
+        term_loss = (t_mask_exp * term_loss).sum() / (t_mask_exp.sum() + 1e-6)
+
+        return act_loss, rew_loss, term_loss
 
 
     def unfreeze_agent_token(self):
     
         self.transformer.agent_token.requires_grad_(True)
 
-    def update_ema(self):
-        with torch.no_grad():
-            for ema_param, param in zip(self.t_value.parameters(), self.value.parameters()):
-                ema_param.mul_(self.ema).add_(param * (1 - self.ema))
     def freeze_agent_token(self):
         for p in self.transformer.parameters():
             p.requires_grad_(True)
@@ -1477,18 +1503,9 @@ class Dreamer4(nn.Module):
                 N = self.shortcut_kmax
                 h_with_grad = self.transformer(noised, actions[:,:-1], signals=self.make_signals_indices(B, noised.size(1), 1, N, 0),)[1]
             
-                action_loss, reward_loss = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:])
+                action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:], termination.float())
                                                 
-                term_target = termination[:, :].float()
-                if term_target.dim()==3: term_target = term_target.squeeze(-1)
-                rew_pred = self.reward(h_with_grad[:,:])
-                term_logits = concat_mtp(rew_pred[-1].logits, self.aux_horizon)
-
-                pos_w = torch.tensor(15.0, device=term_logits.device)
-                term_loss = F.binary_cross_entropy_with_logits(
-                                        term_logits[:,:], term_target[:,:],
-                                        pos_weight=pos_w
-                                    ) 
+             
                 ac_loss =  action_loss+reward_loss+term_loss + dyn_loss
 
                 (ac_loss.mean()/self.grad_accum).backward()
@@ -1537,7 +1554,6 @@ class Dreamer4(nn.Module):
             
 
                         V_full = self.value(h_t[:,:])[0] 
-                        V_targ  = self.t_value(h_t[:,:])[0]
                         bs = lambda_returns(r_seq[:,:], cont_t[:,:],  lambda_=self.lambda_, discount=self.disc, boot=V_full[:, :]).squeeze(-1) 
                     disc= self.disc
                     weight = torch.cumprod(disc * (cont_t[:,:] > 0.5), 1) /disc 
@@ -1567,7 +1583,7 @@ class Dreamer4(nn.Module):
         if train_reward:
             logger["finetune_bc_loss"] = action_loss.mean().detach().item()
             logger["reward_loss"] = reward_loss.detach().item()
-            logger["termination_loss"] = term_loss.detach().item()
+            logger["termination_loss"] = term_loss.mean().detach().item()
 
             logger["reward_policy_gn"] = reward_policy_model_gn
         elif policy:
