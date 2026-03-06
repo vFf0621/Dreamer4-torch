@@ -653,7 +653,7 @@ class TokenDynamics(nn.Module):
             tok_mask = self.agent_mask(S, agent_idx, device=device, Nr=self.Nr)  # keep agent mask
 
             if blk.time_attn_enabled:
-                x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, agent_idx=None)
+                x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, agent_idx=agent_idx)
             else:
                 x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, mask=tok_mask, agent_idx=agent_idx)
 
