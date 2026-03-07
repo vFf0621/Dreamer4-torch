@@ -31,7 +31,6 @@ class Policy(nn.Module):
                 nn.RMSNorm(latent_dim*2), 
                 nn.Linear(latent_dim*2, action_dim * num_bins * mtp)
             )
-        self.agent_token = nn.Parameter(0.02*torch.randn(1,1,1,latent_dim))
         self.eps = 1e-8
 
     def forward(self, posterior: torch.Tensor, sample=True):
