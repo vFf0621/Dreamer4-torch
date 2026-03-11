@@ -132,10 +132,12 @@ def apply_random_patch_mask(
 
     # --- choose mask ratio per frame ---
     if mask_ratio is None:
-        ratios = torch.rand(B, T, device=device) * max_mask_ratio  # (B,T) in [0, max_mask_ratio]
+        ratios = torch.rand(B, 1, device=device) * max_mask_ratio  # (B,1)
     else:
-        # constant ratio everywhere
-        ratios = torch.full((B, T), float(mask_ratio), device=device).clamp(0.0, max_mask_ratio)
+        ratios = torch.full((B, 1), float(mask_ratio), device=device).clamp(0.0, max_mask_ratio)
+
+    # expand across time
+    ratios = ratios.expand(B, T)  # (B,T)
 
     # keep count per frame (at least 1 patch)
     keep_counts = torch.floor(P * (1.0 - ratios)).to(torch.long).clamp(min=1, max=P)  # (B,T)
