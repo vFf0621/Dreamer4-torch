@@ -327,7 +327,11 @@ class Encoder(nn.Module):
 
         self.ln_out = nn.RMSNorm(d_model)
         self.readout = nn.Linear(d_model, out_dim)
-
+        self.mask =  modality_mask(
+                L=self.latent_tokens,
+                modality_sizes=[self.num_patches, self.num_reserved],
+                device=frames.device
+            )
     def forward(self, frames: torch.Tensor, return_tokens= True) -> torch.Tensor:
         B, T, C, H, W = frames.shape
         p = self.patch
@@ -337,11 +341,7 @@ class Encoder(nn.Module):
         patches = F.unfold(x, kernel_size=p, stride=p)                       # (B*T, C*p*p, Np)
         patches = patches.transpose(1, 2).contiguous()                       # (B*T, Np, patch_dim)
         patches = patches.view(B, T, self.num_patches, -1)                   # (B,T,Np,patch_dim)
-        space_mask = modality_mask(
-            L=self.latent_tokens,
-            modality_sizes=[self.num_patches, self.num_reserved],
-            device=frames.device
-        ) 
+        space_mask = self.mask
         
         proj = self.patch_proj(patches)                             # (B,T,Np,D)
         lat = self.latent_tok.view(1, 1, self.latent_tokens, self.d_model).expand(B, T, -1, -1) 
@@ -1699,7 +1699,11 @@ class Decoder(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         self.ln_out = nn.RMSNorm(d_model)
         self.to_patch = nn.Linear(d_model, img_channels * patch * patch)
-
+        self.mask = modality_mask(
+                L=self.latent_tokens,
+                modality_sizes=[self.num_patches, self.num_reserved],
+                device=frames.device
+            )
     def unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
         BT, P, Dp = patches.shape
         C = self.img_channels
@@ -1728,7 +1732,7 @@ class Decoder(nn.Module):
         # IMPORTANT: put latents FIRST, then patch queries
         x = torch.cat([zlat, pq, self.reserved.expand(B, T, -1, self.d_model)], dim=2)   # (B,T,L+Np,D)
         x = self.drop(x)
-        space_mask = modality_mask(L, [self.num_patches, self.num_reserved], encoder=False, device=x.device)
+        space_mask = self.mask
 
         # ---- transformer ----
         for blk in self.blocks:
