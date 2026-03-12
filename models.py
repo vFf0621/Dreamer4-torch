@@ -1705,7 +1705,8 @@ class Decoder(nn.Module):
         self.mask = modality_mask(
                 L=self.latent_tokens,
                 modality_sizes=[self.num_patches, self.num_reserved],
-                device=frames.device
+                device=frames.device,
+            encoder=False
             )
         self.space_mask = None
     def unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
