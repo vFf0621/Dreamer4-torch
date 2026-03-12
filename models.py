@@ -327,11 +327,7 @@ class Encoder(nn.Module):
 
         self.ln_out = nn.RMSNorm(d_model)
         self.readout = nn.Linear(d_model, out_dim)
-        self.mask =  modality_mask(
-                L=self.latent_tokens,
-                modality_sizes=[self.num_patches, self.num_reserved],
-                device=frames.device
-            )
+        self.mask =  None
     def forward(self, frames: torch.Tensor, return_tokens= True) -> torch.Tensor:
         B, T, C, H, W = frames.shape
         p = self.patch
@@ -346,7 +342,14 @@ class Encoder(nn.Module):
         proj = self.patch_proj(patches)                             # (B,T,Np,D)
         lat = self.latent_tok.view(1, 1, self.latent_tokens, self.d_model).expand(B, T, -1, -1) 
         x = torch.cat([lat, proj, self.reserved.expand(B,T,-1,self.d_model)], dim=2)                     # (B,T,S,D) with S=L+Np      
-
+        if self.space_mask is None:
+            # ---- Mask for space-only blocks (assumes token order: [lat | patches | reserved]) ----
+            self.space_mask = modality_mask(
+                    L=self.latent_tokens,
+                    modality_sizes=[self.num_patches, self.num_reserved],
+                    device=frames.device
+                )
+        space_mask=self.space_mask
         x = self.drop(x)
         for blk in self.blocks:
             if blk.time_attn_enabled:
@@ -1704,6 +1707,7 @@ class Decoder(nn.Module):
                 modality_sizes=[self.num_patches, self.num_reserved],
                 device=frames.device
             )
+        self.space_mask = None
     def unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
         BT, P, Dp = patches.shape
         C = self.img_channels
@@ -1732,8 +1736,14 @@ class Decoder(nn.Module):
         # IMPORTANT: put latents FIRST, then patch queries
         x = torch.cat([zlat, pq, self.reserved.expand(B, T, -1, self.d_model)], dim=2)   # (B,T,L+Np,D)
         x = self.drop(x)
-        space_mask = self.mask
-
+        if self.space_mask is None:
+            # ---- Mask for space-only blocks (assumes token order: [lat | patches | reserved]) ----
+            self.space_mask = modality_mask(
+                    L=self.latent_tokens,
+                    modality_sizes=[self.num_patches, self.num_reserved],
+                    device=frames.device
+                )
+        space_mask=self.space_mask
         # ---- transformer ----
         for blk in self.blocks:
             if blk.time_attn_enabled:
