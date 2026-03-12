@@ -458,7 +458,7 @@ def modality_mask(
             allow[offset : offset + size, :L] = True
             offset += size
 
-    return ~allow
+    return allow
 import seaborn as sns
 import matplotlib.pyplot as plt
 import seaborn as sns
