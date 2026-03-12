@@ -421,33 +421,42 @@ def gumbel_softmax(
     #    detach hard so gradients flow through 'y' (the soft version)
     return y_hard - y.detach() + y
 def modality_mask(
-    L: int,                   
+    L: int,                    
     modality_sizes: list[int], 
     device=None,
-    encoder=True  # <--- You must pass False for the Decoder!
+    encoder=True
 ) -> torch.Tensor:
     
     Np = sum(modality_sizes)
     S  = L + Np
     allow = torch.zeros((S, S), dtype=torch.bool, device=device)
     
-    if not encoder:
+    if encoder:
         # --- ENCODER LOGIC ---
-        # 1. Latents read from everything (to encode)
+        # 1. Agent (Latents) reads everything
         allow[:L, :] = True 
         
-        # 2. Patches read from Patches (spatial context)
-        #    BUT Patches DO NOT read from Latents (prevent leakage)
-        allow[L:, L:] = True
+        # 2. Modalities read ONLY themselves (Isolated spatial context)
+        #    They DO NOT read the Agent, and DO NOT read other modalities.
+        offset = L
+        for size in modality_sizes:
+            allow[offset : offset + size, offset : offset + size] = True
+            offset += size
 
     else:
         # --- DECODER LOGIC ---
-        # 1. Latents read ONLY from Latents (keep source pure)
+        # 1. Agent (Latents) reads ONLY itself (Keep source pure)
         allow[:L, :L] = True
         
-        # 2. Patches read from Patches (to form image) 
-        #    AND Patches read from Latents (CRITICAL: this is the gradient path)
-        allow[L:, :] = True  # <--- This fixes the zero grad
+        # 2. Modalities read themselves AND the Agent 
+        #    (CRITICAL for gradient path, but still NO cross-modality attention)
+        offset = L
+        for size in modality_sizes:
+            # Modality reads itself
+            allow[offset : offset + size, offset : offset + size] = True
+            # Modality reads the Agent (Latents)
+            allow[offset : offset + size, :L] = True
+            offset += size
 
     return ~allow
 import seaborn as sns
