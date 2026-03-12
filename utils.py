@@ -431,7 +431,7 @@ def modality_mask(
     S  = L + Np
     allow = torch.zeros((S, S), dtype=torch.bool, device=device)
     
-    if not encoder:
+    if encoder:
         # --- ENCODER LOGIC ---
         # 1. Agent (Latents) reads everything
         allow[:L, :] = True 
@@ -458,7 +458,7 @@ def modality_mask(
             allow[offset : offset + size, :L] = True
             offset += size
 
-    return ~allow
+    return allow
 import seaborn as sns
 import matplotlib.pyplot as plt
 import seaborn as sns
