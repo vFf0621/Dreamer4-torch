@@ -317,8 +317,6 @@ class Encoder(nn.Module):
         self.patch_proj = nn.Sequential(nn.RMSNorm(patch_dim), nn.Linear(patch_dim, d_model))
         self.latent_tok = nn.Parameter(torch.randn(1, 1, latent_tokens, d_model) * 0.02)
         self.drop = nn.Dropout(dropout)
-        self.reserved = nn.Parameter(torch.randn(1, 1, num_reserved, d_model) * 0.02)
-        self.num_reserved=num_reserved
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == 0)
@@ -341,12 +339,12 @@ class Encoder(nn.Module):
         
         proj = self.patch_proj(patches)                             # (B,T,Np,D)
         lat = self.latent_tok.view(1, 1, self.latent_tokens, self.d_model).expand(B, T, -1, -1) 
-        x = torch.cat([lat, proj, self.reserved.expand(B,T,-1,self.d_model)], dim=2)                     # (B,T,S,D) with S=L+Np      
+        x = torch.cat([lat, proj], dim=2)                     # (B,T,S,D) with S=L+Np      
         if self.space_mask is None:
             # ---- Mask for space-only blocks (assumes token order: [lat | patches | reserved]) ----
             self.space_mask = modality_mask(
                     L=self.latent_tokens,
-                    modality_sizes=[self.num_patches, self.num_reserved],
+                    modality_sizes=[self.num_patches],
                     device=frames.device
                 )
         space_mask=self.space_mask
@@ -1687,8 +1685,6 @@ class Decoder(nn.Module):
         g2 = h // patch
         self.grid = (g1, g2)
         self.num_patches = g1 * g2
-        self.reserved = nn.Parameter(torch.randn(1, 1, num_reserved, d_model) * 0.02)
-        self.num_reserved=num_reserved
 
         self.patch_queries = nn.Parameter(torch.randn(1, 1, self.num_patches, d_model) * 0.02)
 
@@ -1704,7 +1700,7 @@ class Decoder(nn.Module):
         self.to_patch = nn.Linear(d_model, img_channels * patch * patch)
         self.mask = modality_mask(
                 L=self.latent_tokens,
-                modality_sizes=[self.num_patches, self.num_reserved],
+                modality_sizes=[self.num_patches, ],
                 device=frames.device,
             encoder=False
             )
@@ -1732,16 +1728,14 @@ class Decoder(nn.Module):
             L = K
         else:
             raise ValueError(f"Expected z dim 3 or 4, got {tuple(z.shape)}")
-        # ---- patch queries ----
         pq = self.patch_queries.expand(B, T, self.num_patches, self.d_model)
-        # IMPORTANT: put latents FIRST, then patch queries
-        x = torch.cat([zlat, pq, self.reserved.expand(B, T, -1, self.d_model)], dim=2)   # (B,T,L+Np,D)
+        x = torch.cat([zlat, pq], dim=2)   # (B,T,L+Np,D)
         x = self.drop(x)
         if self.space_mask is None:
             # ---- Mask for space-only blocks (assumes token order: [lat | patches | reserved]) ----
             self.space_mask = modality_mask(
                     L=self.latent_tokens,
-                    modality_sizes=[self.num_patches, self.num_reserved],
+                    modality_sizes=[self.num_patches],
                     device=frames.device
                 )
         space_mask=self.space_mask
@@ -1754,7 +1748,7 @@ class Decoder(nn.Module):
         x = self.ln_out(x)
 
         # ---- decode ONLY patch tokens ----
-        patch_tok = x[:, :, L:-self.num_reserved, :]           # (B,T,Np,D)
+        patch_tok = x[:, :, L:, :]           # (B,T,Np,D)
         # sanity check
         assert patch_tok.shape[2] == self.num_patches, (patch_tok.shape, self.num_patches)
 
