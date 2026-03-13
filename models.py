@@ -31,6 +31,7 @@ class Policy(nn.Module):
                 nn.RMSNorm(latent_dim*2), 
                 nn.Linear(latent_dim*2, action_dim * num_bins * mtp)
             )
+      #  self.agent_token = nn.Parameter(0.02*torch.randn(1,1,1,latent_dim))
         self.eps = 1e-8
 
     def forward(self, posterior: torch.Tensor, sample=True):
@@ -42,7 +43,6 @@ class Policy(nn.Module):
             dist: Categorical Distribution object
         """
         B, L, D = posterior.shape
-    
         # Features
         x = self.network(posterior)
 
@@ -60,7 +60,6 @@ class Policy(nn.Module):
         dist_act = td.Categorical(probs=prob[:,:,0])
         idx = dist_act.sample()
         action = two_hot_inv(logits[:,:,0], self.num_bins, -1.0, 1.0)
-        prob_0 = prob[:,:,0]
         # logp of the sampled bins
         logp = dist_act.log_prob(idx)   # [B,L,A]
         logp = logp.sum(-1)             # [B,L]        logp = logp.sum(-1) 
@@ -284,82 +283,117 @@ class CausalSTBlock(nn.Module):
         x = x + xs.reshape(B, T, N, D)
         x = x + self.mlp(x)
         return x.squeeze(2) if x.shape[2] == 1 else x
+
 class Encoder(nn.Module):
     def __init__(
         self,
         img_channels: int = 3,
-        h:int = 96,
-        w:int = 96,
+        h: int = 96,
+        w: int = 96,
         patch: int = 16,
         d_model: int = 256,
         n_heads: int = 8,
+        pose_freqs: int = 10,
         depth: int = 6,
+        pose_dim: int = 7,
         latent_tokens: int = 64,
         time_every: int = 2,
         dropout: float = 0.05,
         out_dim: int = 16,     # Dz
         max_T: int = 256,
-        num_reserved = 4,
-        pool: str = "first",      # "mean" or "first"
+        pool: str = "first",   # "mean" or "first"
     ):
         super().__init__()
         assert (h % patch == 0) and (w % patch == 0)
         assert pool in ("mean", "first")
+
         self.pool = pool
         self.z_dim = out_dim
         self.patch = patch
         self.latent_tokens = latent_tokens
         self.d_model = d_model
-        grid = (h // patch, w//patch)
+
+        grid = (h // patch, w // patch)
         self.num_patches = grid[0] * grid[1]
-        N = self.num_patches + latent_tokens
+
         patch_dim = img_channels * patch * patch
         self.patch_proj = nn.Sequential(nn.RMSNorm(patch_dim), nn.Linear(patch_dim, d_model))
+
         self.latent_tok = nn.Parameter(torch.randn(1, 1, latent_tokens, d_model) * 0.02)
         self.drop = nn.Dropout(dropout)
+
+        
         blocks = []
         for i in range(depth):
-            use_time = ((i+1) % time_every == 0)
+            use_time = ((i + 1) % time_every == 0)
             blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time))
         self.blocks = nn.ModuleList(blocks)
 
-        self.ln_out = nn.RMSNorm(d_model)
-        self.readout = nn.Linear(d_model, out_dim)
-        self.mask =  None
-    def forward(self, frames: torch.Tensor, return_tokens= True) -> torch.Tensor:
-        B, T, C, H, W = frames.shape
-        p = self.patch
-        assert H % p == 0 and W % p == 0, (H, W, p)
+        # pose -> sinusoidal -> FiLM params for patches
+        #self.pose_encoder = SinusoidalEncoding(num_freqs=pose_freqs)
 
-        x = frames.reshape(B * T, C, H, W)                                   # (B*T,C,H,W)
-        patches = F.unfold(x, kernel_size=p, stride=p)                       # (B*T, C*p*p, Np)
-        patches = patches.transpose(1, 2).contiguous()                       # (B*T, Np, patch_dim)
-        patches = patches.view(B, T, self.num_patches, -1)                   # (B,T,Np,patch_dim)
-        space_mask = self.mask
-        
-        proj = self.patch_proj(patches)                             # (B,T,Np,D)
-        lat = self.latent_tok.view(1, 1, self.latent_tokens, self.d_model).expand(B, T, -1, -1) 
-        x = torch.cat([lat, proj], dim=2)                     # (B,T,S,D) with S=L+Np      
-        if self.space_mask is None:
+        # IMPORTANT: this assumes SinusoidalEncoding returns sin+cos concatenated
+       # encoded_pose_dim = pose_dim * 2 * pose_freqs
+
+        # Output per-frame FiLM: (gamma, beta) in R^D
+        #self.pose_proj = nn.Linear(encoded_pose_dim, 2 * d_model)
+        self.space_mask = None
+        self.ln_out = nn.RMSNorm(d_model)
+        self.readout = nn.Sequential(nn.Linear(d_model, out_dim), nn.RMSNorm(out_dim))
+
+    def forward(self, frames: torch.Tensor) -> torch.Tensor:
+
+        def _forward(z,):
+            B, T, C, H, W = frames.shape
+            p = self.patch
+            assert H % p == 0 and W % p == 0, (H, W, p)
+            #if poses.ndim == 4:
+             #   poses = poses.squeeze(2)        # ---- Patchify ----
+            x = frames.view(B * T, C, H, W)                         # (B*T,C,H,W)
+            patches = F.unfold(x, kernel_size=p, stride=p)          # (B*T, C*p*p, Np)
+            patches = patches.transpose(1, 2).contiguous()          # (B*T, Np, patch_dim)
+            patches = patches.view(B, T, self.num_patches, -1)      # (B,T,Np,patch_dim)
+            proj = self.patch_proj(patches)                         # (B,T,Np,D)
+
+            # ---- Pose FiLM on patches (better variant) ----
+            #pose_emb = self.pose_encoder(poses)                     # (B,T, pose_dim*2*freq)
+            #film = self.pose_proj(pose_emb)                         # (B,T, 2D)
+            #gamma, beta = film.chunk(2, dim=-1)                     # (B,T,D), (B,T,D)
+
+            # broadcast over patches
+            #gamma = gamma.unsqueeze(2)                              # (B,T,1,D)
+            #beta  = beta.unsqueeze(2)                               # (B,T,1,D)
+           # proj = proj * (1.0 + gamma) + beta                      # (B,T,Np,D)
+
+            # ---- Latents ----
+            lat = z.expand(B, T, -1, -1).contiguous() # (B,T,L,D)
+            if self.space_mask is None:
             # ---- Mask for space-only blocks (assumes token order: [lat | patches | reserved]) ----
-            self.space_mask = modality_mask(
+                self.space_mask = modality_mask(
                     L=self.latent_tokens,
                     modality_sizes=[self.num_patches],
                     device=frames.device
+                    
                 )
-        space_mask=self.space_mask
-        x = self.drop(x)
-        for blk in self.blocks:
-            if blk.time_attn_enabled:
-                x = blk(x, mask=None,)          # no space mask here
-            else:
-                x = blk(x, mask=space_mask)    # modality mask only here
-        x = self.ln_out(x[:,:,:self.latent_tokens])  
+            space_mask=self.space_mask
+            
 
-        pre = (self.readout(x))
-        ztok = torch.tanh(pre)   # [B,T,Np,Dz]
-        return ztok
+            # ---- Token sequence ----
+            x = torch.cat([lat, proj], dim=2)  # (B,T,S,D)
+            x = self.drop(x)
 
+            for blk in self.blocks:
+                if blk.time_attn_enabled:
+                    x = blk(x, mask=None)
+                else:
+                    x = blk(x, mask=space_mask)
+
+            x = self.ln_out(x[:, :, :self.latent_tokens])           # keep only latents
+            pre = self.readout(x)                                   # (B,T,L,Dz)
+            ztok = torch.tanh(pre)
+            return ztok
+        z=torch.tanh(_forward(self.latent_tok))
+        return z, z
 
 class TokenDynamics(nn.Module):
     """
@@ -429,11 +463,9 @@ class TokenDynamics(nn.Module):
 
         self.action_pad = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
         self.action_lookup = action_lookup
-
+        act_embed_dim = self.action_bins*self.action_dim
         # --- Action embedding (true lookup, no one-hot materialization) ---
-        self.action_embs = nn.ModuleList([nn.Embedding(action_bins, self.d_model) for _ in range(self.action_dim)] )
-        self.action_normalize = nn.RMSNorm(d_model)
-        # --- z + signal -> model dim --
+        self.action_embs = nn.Sequential(nn.RMSNorm(act_embed_dim), nn.Linear(act_embed_dim, self.d_model), nn.RMSNorm(d_model))
 
         # Agent token (learned)
         self.agent_token = nn.Parameter(0.02 * torch.randn(1, 1, num_tasks, d_model))
@@ -496,23 +528,9 @@ class TokenDynamics(nn.Module):
         out = torch.cat([z_grp, a_grp], dim=3)  # [B,T,Sa,g+1,D]
         return out.reshape(B, T, Nz + Sa, D)
 
-# Forwar 
-    # -----------------------------
-    # Discretization helpers
-    # -----------------------------
-    def discretize_actions_to_indices(self, actions: torch.Tensor) -> torch.Tensor:
-        """
-        actions: [B, T, A] in [-1, 1]
-        returns: [B, T, A] long in [0, action_bins-1]
-        """
-        
-        normed = (actions.clamp(-1,1) + 1.0) * 0.5  # [0,1]
-        idx = (normed * (self.action_bins-1)).round().long()
-        idx = torch.clamp(idx, 0, self.action_bins - 1)
-        return idx
+
 
     def align_actions(self, actions, T, B):
-
         if actions.dim() != 3:
             raise ValueError(...)
         Ba, Ta, A = actions.shape
@@ -595,15 +613,11 @@ class TokenDynamics(nn.Module):
             raise ValueError(f"signals has T={signals.size(1)} but z_tokens has T={T}.")
 
         acts_bt = self.align_actions(actions, T, B)          # [B, T-1, A]
-        act_idx = self.discretize_actions_to_indices(acts_bt)                        # [B, T-1, A]
+        act_two_hot = two_hot(acts_bt, -1.0, 1.0, self.action_bins).reshape(B, -1, 1, self.action_bins * self.action_dim)                     # [B, T-1, A]
 
-        a = 0
-        for i, emb in enumerate(self.action_embs):
-            a = a + emb(act_idx[..., i])                                             # [B, T-1, D]
-        a = self.action_normalize(a)
-
-        a_emb = a[:, :, None, :]                                                     # [B, T-1, 1, D]
-        if a.size(1) == z_tokens.size(1)-1:
+                                                    # [B, T-1, D]
+        a_emb = self.action_embs(act_two_hot[:, :, :])                                                     # [B, T-1, 1, D]
+        if a_emb.size(1) == z_tokens.size(1)-1:
             pad = self.action_pad.expand(B, 1, 1, -1)                                     # [B, 1, 1, D]
             a_emb = torch.cat([pad, a_emb ], dim=1)                                        # [B, T, 1, D]
         a_tokens = a_emb.expand(-1, -1, self.Sa, -1) + self.action_conditioner  # [B,T,Sa,D]
@@ -677,12 +691,12 @@ class Dreamer4(nn.Module):
                  rep_depth = 8, rep_d_model=256, dyn_d_model=256, num_heads=8, dropout=0.1, k_max=8, mtp=8, 
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
-                 dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, 
+                 dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=False, symlog_for_value=False, 
                 kmax_prob=0.1):
         super(Dreamer4, self).__init__()
         self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patch, d_model=rep_d_model,
                                 n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=2,
-                                out_dim=z_dim, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
+                                out_dim=z_dim, dropout=dropout, max_T=max_imag_len)
         self.ema = 0.98
         self.device="cuda" if torch.cuda.is_available() else "cpu"
         self.pretrain = False
@@ -697,6 +711,7 @@ class Dreamer4(nn.Module):
             level_dim=level_embed_dim,
             dropout=dropout,
             n_heads=num_heads,
+            action_dim =action_dim,
             d_model=dyn_d_model,
             Sa = Sa, 
             Nr = Nr, 
@@ -707,7 +722,12 @@ class Dreamer4(nn.Module):
         )
         self.lambda_=lambda_
         self.decoder = Decoder(img_channels=ch, w = w, h=h, patch=patch, z_dim=z_dim, d_model=rep_d_model, n_heads=num_heads,
-                               depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
+                               depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len)
+       # self.canonical_decoder = Decoder(img_channels=ch, w = w, h=h, patch=patch, z_dim=z_dim, d_model=rep_d_model, n_heads=num_heads,
+        #                       depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
+        #self.canonical_decoder1 = Decoder(img_channels=ch, w = w, h=h, patch=patch, z_dim=z_dim, d_model=rep_d_model, n_heads=num_heads,
+         #                      depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
+
         self.imagination_steps = max_imag_len - 1
         self.rminv = -reward_clamp
         self.rmaxv = reward_clamp
@@ -719,6 +739,9 @@ class Dreamer4(nn.Module):
         self.batch_size = batch_size
         self.action_dim=action_dim
         self.shortcut_kmax = k_max
+        self.sym_rew = symlog_for_reward,
+
+        self.sym_val = symlog_for_value
         self.z_buffer = None
         self.aux_horizon = mtp+1
         self.policy_num_bins = policy_bins
@@ -726,21 +749,21 @@ class Dreamer4(nn.Module):
         self.steps = 0
         self.policy = Policy(action_dim=action_dim, latent_dim=dyn_d_model, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
         self.t_policy = Policy(action_dim=action_dim, latent_dim=dyn_d_model, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
-        self.reward = Reward(bin_num=self.bin_num, latent_dim=dyn_d_model, mtp=self.aux_horizon, r_max=reward_clamp)
+        self.reward = Reward(bin_num=self.bin_num, latent_dim=dyn_d_model, mtp=self.aux_horizon, r_max=reward_clamp, sym=self.sym_rew)
         self.train_policy = False
-        self.value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp)
+        self.value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp,sym= self.sym_val)
         self.kmax_prob = kmax_prob
-        self.t_value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp)
         self.t_value = None
         self.disc = 0.997
-      #  self.encoder.load_state_dict(torch.load("enc.pt"))
-       
-  #      self.decoder.load_state_dict(torch.load("dec.pt"))
         self.tau_ctx = 0.1
         self.lpips = LPIPSLoss(reduction="none",)
         self.rep_optim = torch.optim.AdamW(
             [{'params': self.encoder.parameters()}, 
-            {'params': self.decoder.parameters()},]
+            {'params': self.decoder.parameters()},
+        #    {'params': self.canonical_decoder.parameters()},
+         #   {'params': self.canonical_decoder1.parameters()}
+
+            ]
         , lr=rep_lr, capturable=True, weight_decay=rep_decay)
         self.reset()
         self.dyn_optim = torch.optim.AdamW(            
@@ -756,112 +779,139 @@ class Dreamer4(nn.Module):
             {'params': self.value.parameters()},
             ],eps = 1e-5, lr=policy_lr, capturable=True,weight_decay=policy_decay)
         if ckpt:
-            self.load_state_dict(torch.load(ckpt))
+            self.load_state_dict(torch.load(ckpt), strict=False)
         self.t_policy.load_state_dict(self.policy.state_dict(), )
 
         self.reward_optim = torch.optim.AdamW(
             [{'params': self.reward.parameters()}, 
             {'params': self.t_policy.parameters()},], eps = 1e-5,
          lr=policy_lr, capturable=True, weight_decay=dyn_decay)
-
         self.to(self.device)
+        #self.encoder.load_state_dict(torch.load("enc.pt"))
+        self.policy.agent_token= None
+        self.t_policy.agent_token= None
+        #self.decoder.load_state_dict(torch.load("dec.pt"))
 
     def reset(self):
         self.state_buffer = None
         self.action_buffer = torch.zeros(1, 0, self.action_dim, device=self.device)
 
+
     def mix_tau_ctx(self, src):
         return src*(1-self.tau_ctx) + self.tau_ctx*torch.randn_like(src)
-    def action_step(self, s):
+    def action_step(self, s, show_recon=True):
         """
         One environment step -> one action.
-
-        Uses "clean-level" signals for the transformer context.
-        NOTE: whether "clean" is tau_idx=N or tau_idx=N-1 depends on your LUT convention.
-            In your earlier code, tau_lut has length N+1 and uses tau_idx==N as the special max/clean entry.
-            So we use tau_idx=N here.
+        Visualizes the agent's internal reconstructions during inference.
         """
         with torch.no_grad():
             device = self.device
             s = s.to(device)
 
-            # -----------------------------
-            # init buffers
-            # -----------------------------
+            # 1. Update State Buffer
             if self.state_buffer is None:
-                # [B=1, T=1, ...]
-                self.state_buffer = s.unsqueeze(0).unsqueeze(0)
+                self.state_buffer = s.unsqueeze(0).unsqueeze(0) # [B=1, T=1, C, H, W]
             else:
-                self.state_buffer = torch.cat(
-                    [self.state_buffer, s.unsqueeze(0).unsqueeze(0)], dim=1
-                )
+                self.state_buffer = torch.cat([self.state_buffer, s.unsqueeze(0).unsqueeze(0)], dim=1)
+                
+            # 2. Enforce State Context Length (T <= eval_ctx)
+            if self.state_buffer.size(1) > self.eval_ctx:
+                self.state_buffer = self.state_buffer[:, -self.eval_ctx:]
 
-            # Encode full state context: [B, T, Nz, Dz]
-            z = self.encoder(self.state_buffer)
-            B, T, Nz, _ = z.shape
+            # 3. Encode State Context (Get BOTH latents)
+            z_tv, z_ego = self.encoder(self.state_buffer)
+            B, T, Nz, _ = z_tv.shape
 
-            # Make sure action_buffer exists and is correctly aligned:
-            # transformer typically expects actions of length T-1 (transitions) or T depending on your impl.
+            # --- VISUALIZATION BLOCK ---
+            if show_recon:
+                # Isolate the current timestep latents: [B, 1, Nz, Dz]
+                curr_z = z_tv[:, :]
+               # curr_z_ego = z_ego[:, -1:]
+                
+                # Decode topview (canonical decoder outputs 2 views concatenated in channel dim)
+                view1 = self.decoder(curr_z)[:,-1:
+                ]     # [B, 1, C*2, H, W]
+              #  view2 = self.canonical_decoder1(curr_z_tv)     # [B, 1, C*2, H, W]
+                
+                # Decode ego view (standard decoder)
+                #ego_view = self.decoder(curr_z_ego)                 # [B, 1, C, H, W]
+                
+                def format_tensor_to_cv2(tensor):
+                    """Converts [B, T, C, H, W] tensor in [0, 1] to cv2 BGR image."""
+                    img = tensor[0, 0].cpu().numpy().transpose(1, 2, 0) # [H, W, C]
+                    img = (img * 255).clip(0, 255).astype(np.uint8)
+                    if img.shape[-1] == 3: # Convert RGB to BGR for OpenCV
+                        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                    return img
+
+                # Format current observation and all reconstructions
+                img_orig = format_tensor_to_cv2(self.state_buffer[:, -1:])
+                #img_ego = format_tensor_to_cv2(ego_view)
+                img_tv1 = format_tensor_to_cv2(view1)
+                #img_tv2 = format_tensor_to_cv2(view2)
+                
+                # Concatenate horizontally: [Ground Truth | Ego Recon | TopView 1 | TopView 2]
+                combined = np.concatenate([img_orig, img_tv1], axis=1)
+                
+                # Scale up the image so it's easy to see on screen (96x96 is very small)
+                scale = 3
+                h, w = combined.shape[:2]
+                combined_large = cv2.resize(combined, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+                
+                cv2.imshow(f"Agent {self.agent_id} Reconstructions", combined_large)
+                cv2.waitKey(1) # Renders the frame and immediately continues
+            # ---------------------------
+
+            # 4. Initialize or Align Action Buffer
+            A = int(getattr(self, "action_dim", 2))
             if self.action_buffer is None:
-                # We'll build actions as [B, 0, A] initially, then append one per step.
-                # You MUST know action_dim. If you have it stored, use it; otherwise infer from policy output later.
-                A = int(getattr(self, "action_dim", 2))
-                self.action_buffer = torch.zeros((B, 0, A), device=device, dtype=z.dtype)
+                self.action_buffer = torch.zeros((B, 0, A), device=device, dtype=z_tv.dtype)
+            
+            # Enforce Action Context Length (Ta == T - 1)
+            target_action_len = max(0, T - 1)
+            if self.action_buffer.size(1) > target_action_len:
+                self.action_buffer = self.action_buffer[:, -target_action_len:]
 
-            # -----------------------------
-            # Signals: clean context
-            # -----------------------------
+            # 5. Build Signals and Forward Transformer
             N = int(getattr(self, "shortcut_kmax", 64))
-            # If your convention is tau_idx in [0..N] with tau_idx==N being the special "clean/max" entry:
             sigs = self.make_signals_indices(B, T, Nz, tau_idx=N, k_idx=0)
 
-            # -----------------------------
-            # Optional: small eval noise for robustness
-            # -----------------------------
-            z_in = self.mix_tau_ctx(z) 
-            # -----------------------------
-            # Align actions to context length
-            # -----------------------------
-            # If we have T states in buffer, we have (T-1) actions that lead between them.
-            # So feed at most T-1 actions.
-           # [B, T-1, A]
-            # Forward world model / transformer
-            # Expected signature (based on your earlier code):
-            if self.action_buffer.size(1) == z_in.size(1):
-                self.action_buffer = self.action_buffer[:, 1:]
- 
-            actions_ctx = self.action_buffer
-            assert actions_ctx.size(1)  == z_in.size(1) -1 
-            z_pred, h = self.transformer(z_in, actions_ctx[:,:], signals=sigs)
+            # NOTE: passing z_tv since your policy is currently trained strictly on topview latents
+            z_pred, h = self.transformer(z_tv, self.action_buffer, signals=sigs)
 
+            # 6. Policy Prediction
             a, *_ = self.policy(h[:, -1:])
 
-            # --- append then re-enforce invariant ---
+            # 7. Append new action for the NEXT step
             self.action_buffer = torch.cat([self.action_buffer, a], dim=1)
 
-            self.state_buffer = self.state_buffer[:,-self.eval_ctx:]
             return a[0, 0].detach().cpu().numpy()
-
-
     def evaluate(self, buffer, steps=4): 
-        s, a = buffer.sample_seq( 1, 64)[:2]
+        s, s1, a , r, d, = buffer.sample_seq( 1, 64)
         s = torch.from_numpy(s).to(self.device).float()
         a = torch.from_numpy(a).to(self.device).float()
-        
+
         with torch.no_grad():
-            z = self.encoder(s)
-            z_eval = self.latent_imagination(z[:,:], a[:,:], num_iter=a.size(1) - 1, eval_=False,random=False, forced=True)[0]
-            self.decode_and_save(z_eval, "single_frame")
-            z_eval = self.latent_imagination(z[:,:], a[:], num_iter=a.size(1) - 1, eval_=False,random=True, forced=False)[0]
+            z_tv, z = self.encoder(s)
+           
+            self.decode_and_save(z_tv, 'reconst')
+
+            z = self.latent_imagination(z_tv[:,:], a[:,:], num_iter=a.size(1) - 1, eval_=False,random=False, forced=True)[0]
+            self.decode_and_save(z, "single_frame")
+            z_eval = self.latent_imagination(z_tv[:,:], a[:], num_iter=a.size(1) - 1, eval_=False,random=True, forced=False)[0]
             self.decode_and_save(z_eval, 'random')
         return
     
 
     def decode_and_save(self, z_in, name):
-            decoded = self.decode(z_in).detach().cpu().numpy()
-            for i in range(decoded.shape[1]):
-                cv2.imwrite(f"./eval_imgs/{name}_{i}.png", 255 * decoded[0, i].transpose(1, 2, 0)[..., ::-1])
-                
+            view1 = self.decoder(z_in)
+            #view2 = self.canonical_decoder1(z_in)
+
+            view1 = view1.detach().cpu().numpy()
+            #view2 = view2.detach().cpu().numpy()
+            save_frames(view1, f"{name}_view1")
+            #save_frames(view2, f"{name}_view2")
+
             return
 
     def make_signals_indices(self, B, T, Nz, tau_idx=0, k_idx=0):
@@ -1118,7 +1168,7 @@ class Dreamer4(nn.Module):
                 z_inp = z_all
 
             a_exec = actions[:,:z_inp.size(1)-1]
-            if not eval_ and not get_feat:
+            if not eval_:
                 z_inp = z_all[:,:1]
                 a_exec = actions[:,:0]
         
@@ -1360,12 +1410,12 @@ class Dreamer4(nn.Module):
 
         _, _, rew_logits, term_dist = self.reward(feat)
         rew_logits = rew_logits[:, :L_use, :K_use]                # [B, L, K_use, bins]
-
+        print(r_tgt.max())
         raw_rew_loss = soft_ce(
             rew_logits,
             r_tgt,
             self.reward_bins,
-            self.rminv, self.rmaxv,
+            self.rminv, self.rmaxv,self.sym_rew
         ).mean([-1]) # typically [B, L, K_use]
 
         r_mask_exp = r_mask.expand_as(raw_rew_loss)
@@ -1431,9 +1481,9 @@ class Dreamer4(nn.Module):
         for i in tqdm(range(self.grad_accum)):
             s = buffer.sample_seq(self.batch_size, k)
 
-            states, actions, reward, termination, = s
-            full_sequence = states[0].transpose(0,2,3,1)
-
+            states, targ_states, actions, reward, termination = s
+            targ_states = torch.from_numpy(targ_states).to(self.device).float()
+       
             states = torch.from_numpy(states).to(self.device).float()
             actions = torch.from_numpy(actions).to(self.device).float()
             reward = torch.from_numpy(reward).to(self.device).float()
@@ -1442,25 +1492,44 @@ class Dreamer4(nn.Module):
             if not model and not policy and not train_reward:
                 self.encoder.train()
                 self.decoder.train()
+              #  self.canonical_decoder.train()
+               # self.canonical_decoder1.train()
 
-                z_t   = self.encoder(apply_random_patch_mask(states, max_mask_ratio=0.9, patch_size=self.encoder.patch)[0])
+                z_t, z   = self.encoder(apply_random_patch_mask(states, max_mask_ratio=0.9, patch_size=self.encoder.patch)[0])
+                #reconst_1= self.canonical_decoder(z_t)
+
+                #reconst_2= self.canonical_decoder1(z_t)
+
                 reconst = self.decode(z_t)
-                
-                full_sequence = reconst[0].clone().detach().cpu().numpy().transpose(0,2,3,1)
-                if self.steps %100 ==0 and i ==0:
-                    for i in range(full_sequence.shape[0]):
-                        frame_bgr = full_sequence[i][..., ::-1] *255
-                        cv2.imwrite(f"./eval_imgs/reconst_{i}.png", frame_bgr.astype(np.uint8))        
+               # reconst_1 = 2 * reconst_1 - 1
+               # reconst_2 = 2 * reconst_2- 1
+
+                B, T, C, H, W = reconst.shape
+                targ_states = 2 * targ_states - 1
+
+                targ_states1, targ_states2 = targ_states.chunk(2,2)
+
                 reconst = 2 * reconst - 1
-                targ_state = 2 * states - 1
-                mse = ((F.mse_loss(reconst, targ_state, reduction="none").squeeze(-1))).mean()
-                lp  = (self.lpips(reconst, targ_state))
-                reconst_loss = (mse + 0.2 * lp.mean() )
+
+                states = 2 * states - 1
+
+                #mse1 = ((F.mse_loss(reconst_1, targ_states1, reduction="none").squeeze(-1))).mean()
+                #lp1  = (self.lpips(reconst_1, targ_states1))
+
+                #mse2 = ((F.mse_loss(reconst_2, targ_states2, reduction="none").squeeze(-1))).mean()
+                #lp2  = (self.lpips(reconst_2, targ_states2))
+
+                #reconst_loss = (mse1 + mse2 + 0.2* (lp1.mean() +lp2.mean() ))
+                mse_ = ((F.mse_loss(reconst, states, reduction="none").squeeze(-1))).mean()
+                lp_  = (self.lpips(reconst, states))
+                reconst_loss =(mse_ + 0.2* lp_.mean() ) #+ reconst_loss
 
                 (reconst_loss).backward()
 
                 encoder_gn = adaptive_grad_clip(self.encoder, 0.3)
                 decoder_gn = adaptive_grad_clip(self.decoder, 0.3)
+              #  decoder1_gn = adaptive_grad_clip(self.canonical_decoder, 0.3)
+             #   decoder2_gn = adaptive_grad_clip(self.canonical_decoder1, 0.3)
 
                 if i == self.grad_accum-1:
 
@@ -1475,7 +1544,7 @@ class Dreamer4(nn.Module):
 
                         # Apply mask and encode once
                         # This ensures s_{t+1} has the same embedding whether it's looked at as "current" or "next"
-                z_t = self.encoder(full_sequence).detach()
+                z_t = self.encoder(full_sequence, )[0].detach()
                         # Split into current and next steps
                 self.freeze_agent_token()
                 kl_loss, _ = self.shortcut_forcing( z_t, actions)
@@ -1494,7 +1563,7 @@ class Dreamer4(nn.Module):
                     (self.dyn_optim).step()
                     self.dyn_optim.zero_grad()
             if train_reward:
-                clean_latents = self.encoder((states)).detach()
+                clean_latents = self.encoder(states)[0].detach()
                 B, T, Nz, _ = clean_latents.shape
 
                 noised = self.mix_tau_ctx(clean_latents) 
@@ -1522,14 +1591,14 @@ class Dreamer4(nn.Module):
                                             self.decoder,
 
                                         ]): 
-                    initial_latent = self.encoder(states[:, :])
+                    initial_latent = self.encoder(states[:, :])[0]
                     B, T, Nz, _ = initial_latent.shape
 
                     H = torch.randint(low=self.batch_lengths[0],high=self.horizon_length - 1, size=(1,))[0].item()
                     z_0 = initial_latent[:,:].detach()
                     
                     imag_z, h_t, lp, kl_prior, imagined_actions = self.latent_imagination(
-                                z_0, actions[:, :], offset=self.eval_ctx, num_iter=H) 
+                                z_0, actions[:, :], offset=self.eval_ctx // 2, num_iter=H) 
                     self.decode_and_save(imag_z, "imagined") 
                     mixed_z = self.mix_tau_ctx(z_0)
                     N = self.shortcut_kmax
@@ -1538,7 +1607,7 @@ class Dreamer4(nn.Module):
                                                         signals=self.make_signals_indices(B, T, 1, N, 0)
                                                         )[1]
             
-                    action_loss, reward_loss = self.multistep_aux_losses(h_wo_grad[:,:], actions[:,:], reward[:,:], t_policy=True)
+                    action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_wo_grad[:,:], actions[:,:], reward[:,:], termination.float(), t_policy=True)
 
                     with torch.no_grad():
                                                                      
@@ -1548,7 +1617,7 @@ class Dreamer4(nn.Module):
                         term_probs = termination.probs
                         term_probs = concat_mtp(term_probs, self.aux_horizon)
                         cont_state =1-(term_probs).float()   
-                        r_seq = mask_after_done(r_seq[...,0], (r_seq < -5 )[...,0]| (cont_state < 0.5) ) 
+                        r_seq = mask_after_done(r_seq[...,0], (cont_state < 0.5) ) 
                         cont_t = cont_state[:, :]         
                         cont_t = mask_after_done(cont_t, cont_t < 0.5)
             
@@ -1557,11 +1626,11 @@ class Dreamer4(nn.Module):
                         bs = lambda_returns(r_seq[:,:], cont_t[:,:],  lambda_=self.lambda_, discount=self.disc, boot=V_full[:, :]).squeeze(-1) 
                     disc= self.disc
                     weight = torch.cumprod(disc * (cont_t[:,:] > 0.5), 1) /disc 
-                    weight = mask_after_done(weight, (r_seq < -5 )| (cont_state < 0.5) )[:,:-1]
+                    weight = mask_after_done(weight, (cont_state < 0.5) )[:,:-1]
                     adv = (bs - self.value(h_t[:,:-1])[0].squeeze(-1).detach()) * weight                    
                     v_pred = self.value(h_t[:,:].detach())[1]
                     bs_padded=torch.cat([bs, 0 * bs[:, -1:]], 1)
-                    value_loss = (weight*soft_ce(v_pred, bs_padded, self.reward_bins, self.rminv, self.rmaxv, sym= True)[:,:-1, 0]).mean()
+                    value_loss = (weight*soft_ce(v_pred, bs_padded, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
                  #   value_loss = value_loss +  (weight* soft_ce(v_pred, V_targ, self.reward_bins, self.rminv, self.rmaxv)[:,:-1, 0]).mean()
                     lp_t = lp.squeeze(-1)[:,:-1]
                     base = torch.ones_like(adv)
@@ -1569,13 +1638,12 @@ class Dreamer4(nn.Module):
                     neg =  ((adv<0) * lp_t*weight).sum()/ (base[adv < 0]).sum().clamp(min=1)
                     actor_loss = 0.5*(pos + neg).mean()+ 3e-1*((kl_prior[:,:-1] * weight).mean())
 
-                    ((actor_loss + value_loss + reward_loss)/self.grad_accum).backward()
+                    ((actor_loss + value_loss + reward_loss+term_loss)/self.grad_accum).backward()
                     model_gn =adaptive_grad_clip(self, 0.3)
 
                     if i==self.grad_accum - 1:
                         (self.policy_optim).step()
                         self.reward_optim.step()
-                        self.update_ema()
 
         if model:   
             logger["model_gn"] = model_gn 
@@ -1604,11 +1672,13 @@ class Dreamer4(nn.Module):
             logger["reconst"] = reconst_loss.detach().item()
             logger["encoder_gn"] = encoder_gn 
             logger["decoder_gn"] = decoder_gn 
+         #   logger["decoder1_gn"] = decoder1_gn 
+          #  logger["decoder2_gn"] = decoder2_gn 
 
         return logger
 
 class Reward(nn.Module):
-    def __init__(self, bin_num: int, latent_dim: int, mtp: int = 1,r_max: float = 6):
+    def __init__(self, bin_num: int, latent_dim: int, mtp: int = 1,r_max: float = 6, sym=False):
         super().__init__()
         self.mtp = int(mtp)
         self.bin_num = int(bin_num)
@@ -1627,6 +1697,7 @@ class Reward(nn.Module):
             nn.RMSNorm(latent_dim),
             nn.Linear(latent_dim, self.mtp),
         )
+        self.sym=sym
 
     def forward(self, x: torch.Tensor):
         B, L, _ = x.shape
@@ -1634,7 +1705,7 @@ class Reward(nn.Module):
 
         r_logits_all = self.reward_head(h).view(B, L, self.mtp, self.bin_num)  
         r_logits_1 = r_logits_all[:, :, 0]                                     
-        r_mean = two_hot_inv(r_logits_all, self.bin_num, -self.r_max, self.r_max)                                       
+        r_mean = two_hot_inv(r_logits_all, self.bin_num, -self.r_max, self.r_max, self.sym)                                       
 
         term_logits = self.term_head(h)                                        
         term_logits = term_logits.squeeze(-1)                              
@@ -1643,14 +1714,15 @@ class Reward(nn.Module):
         return r_mean, r_logits_1, r_logits_all, term_dist
 
 class Value(nn.Module):
-    def __init__(self,latent_dim, hidden_dim,bin_num, num_layers=4, r_max=6):
+    def __init__(self,latent_dim, hidden_dim,bin_num, num_layers=4, r_max=6,sym=False ):
         super().__init__()
         self.network = build_network(latent_dim, hidden_dim, num_layers, "SwiGLU",bin_num)
         self.bin_num = bin_num
+        self.sym=sym
         self.r_max=r_max
     def forward(self, x):
         x = self.network(x)
-        return two_hot_inv(x, self.bin_num, -self.r_max, self.r_max, True), x
+        return two_hot_inv(x, self.bin_num, -self.r_max, self.r_max, self.sym), x
 
 class Decoder(nn.Module):
     def __init__(
@@ -1668,7 +1740,6 @@ class Decoder(nn.Module):
         dropout: float = 0.05,
         max_T: int = 256,
         output_range: str = "0_1",
-        num_reserved = 4,
     ):
         super().__init__()
         assert (h % patch == 0) and (w % patch == 0)
@@ -1698,12 +1769,6 @@ class Decoder(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         self.ln_out = nn.RMSNorm(d_model)
         self.to_patch = nn.Linear(d_model, img_channels * patch * patch)
-        self.mask = modality_mask(
-                L=self.latent_tokens,
-                modality_sizes=[self.num_patches, ],
-                device=frames.device,
-            encoder=False
-            )
         self.space_mask = None
     def unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
         BT, P, Dp = patches.shape
@@ -1728,31 +1793,33 @@ class Decoder(nn.Module):
             L = K
         else:
             raise ValueError(f"Expected z dim 3 or 4, got {tuple(z.shape)}")
-        pq = self.patch_queries.expand(B, T, self.num_patches, self.d_model)
-        x = torch.cat([zlat, pq], dim=2)   # (B,T,L+Np,D)
-        x = self.drop(x)
-        if self.space_mask is None:
-            # ---- Mask for space-only blocks (assumes token order: [lat | patches | reserved]) ----
-            self.space_mask = modality_mask(
-                    L=self.latent_tokens,
-                    modality_sizes=[self.num_patches],
-                    device=frames.device
-                )
-        space_mask=self.space_mask
-        # ---- transformer ----
-        for blk in self.blocks:
-            if blk.time_attn_enabled:
-                x = blk(x)          # no space mask here
-            else:
-                x = blk(x,  mask=space_mask)    # modality mask only here
-        x = self.ln_out(x)
 
-        # ---- decode ONLY patch tokens ----
-        patch_tok = x[:, :, L:, :]           # (B,T,Np,D)
-        # sanity check
-        assert patch_tok.shape[2] == self.num_patches, (patch_tok.shape, self.num_patches)
+        def _forward(patch_queries):
 
-        patches = self.to_patch(patch_tok).contiguous().view(B * T, self.num_patches, -1)
-        frames = self.unpatchify(patches).view(B, T, self.img_channels, self.h, self.w)
+        # ---- patch queries ----
+            pq = patch_queries.expand(B, T, self.num_patches, self.d_model)
+            # IMPORTANT: put latents FIRST, then patch queries
+            x = torch.cat([self.drop(zlat), pq], 2)
 
-        return torch.sigmoid(frames) if self.output_range == "0_1" else torch.tanh(frames)
+            if self.space_mask is None:
+                self.space_mask = modality_mask(L, [self.num_patches], encoder=False, device=x.device)
+            space_mask = self.space_mask
+            # ---- transformer ----
+            for blk in self.blocks:
+                if blk.time_attn_enabled:
+                    x = blk(x)          # no space mask here
+                else:
+                    x = blk(x,  mask=space_mask)    # modality mask only here
+            x = self.ln_out(x)
+
+            # ---- decode ONLY patch tokens ----
+            patch_tok = x[:, :, L:, :]           # (B,T,Np,D)
+            # sanity check
+            assert patch_tok.shape[2] == self.num_patches, (patch_tok.shape, self.num_patches)
+
+            patches = self.to_patch(patch_tok).contiguous().view(B * T, self.num_patches, -1)
+            frames = self.unpatchify(patches).view(B, T, self.img_channels, self.h, self.w)
+            return frames
+        top = _forward(self.patch_queries)
+       # direct = _forward(self.direct_patch_queries)
+        return torch.sigmoid(top) if self.output_range == "0_1" else torch.tanh(top)

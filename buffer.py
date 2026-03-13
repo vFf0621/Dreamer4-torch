@@ -1,21 +1,41 @@
 import numpy as np
+import numpy as np
 
 class ReplayBuffer:
     """
-    Same interface and base outputs as your buffer.
-    sample_seq() does NOT ignore short episodes. """
-    def __init__(self, buffer_limit=36000, obs_size=(3, 96, 96), action_size=2,
-                 obs_dtype=np.float32, seed=None):
+    Stores:
+      input_obs  : (C_in,H,W)  e.g. 6xHxW (top+random)
+      target_obs : (3,H,W)     top view only
+      action, reward, terminal
+      cam_pose   : (2,7)       per transition
+
+    sample_seq() follows next_idx pointers (no cross-episode, no padding).
+    """
+
+    def __init__(
+        self,
+        buffer_limit=100000,
+        input_obs_size=(3, 128, 128),
+        target_obs_size=(3, 128, 128),
+        action_size=8,
+        obs_dtype=np.float32,
+        seed=None
+    ):
         print("buffer limit is = ", buffer_limit)
 
         self.buffer_limit = int(buffer_limit)
-        self.obs_size = tuple(obs_size)
+        self.input_obs_size = tuple(input_obs_size)
+        self.target_obs_size = tuple(target_obs_size)
         self.action_size = int(action_size)
 
-        self.observation = np.zeros((self.buffer_limit, *self.obs_size), dtype=obs_dtype)
+        self.input_obs = np.zeros((self.buffer_limit, *self.input_obs_size), dtype=obs_dtype)
+        self.target_obs = np.zeros((self.buffer_limit, *self.target_obs_size), dtype=obs_dtype)
+
         self.action = np.zeros((self.buffer_limit, self.action_size), dtype=np.float32)
         self.reward = np.zeros((self.buffer_limit,), dtype=np.float32)
         self.terminal = np.zeros((self.buffer_limit,), dtype=np.bool_)
+
+        # (NEW) camera pose: [N, 2, 7] (top + random), each pose is (x,y,z,qw,qx,qy,qz)
 
         self.idx = 0
         self.full = False
@@ -26,7 +46,7 @@ class ReplayBuffer:
 
         # Protect against stale pointers under ring overwrites
         self.write_id = np.zeros((self.buffer_limit,), dtype=np.int64)
-        self.next_write_id = np.zeros((self.buffer_limit, ), dtype=np.int64)
+        self.next_write_id = np.zeros((self.buffer_limit,), dtype=np.int64)
         self._global_write_counter = np.int64(1)
 
         # For single-stream collection: link previous transition to current if not terminal
@@ -38,9 +58,18 @@ class ReplayBuffer:
     def __len__(self):
         return self.size()
 
-    def add(self, state, action, reward, next_state, done):
+    def add(
+        self,
+        input_obs,
+        target_obs,
+        action,
+        reward,
+        done,
+        next_input_obs=None,   # accepted but not stored (pointer graph already provides next)
+    ):
         if self.full:
             return
+
         i = self.idx
 
         # Overwrite-safe reset of outgoing pointer from this slot
@@ -48,7 +77,8 @@ class ReplayBuffer:
         self.next_write_id[i] = 0
 
         # Write transition
-        self.observation[i] = state
+        self.input_obs[i] = input_obs
+        self.target_obs[i] = target_obs
         self.action[i] = action
         self.reward[i] = reward
         self.terminal[i] = bool(done)
@@ -76,26 +106,40 @@ class ReplayBuffer:
             raise ValueError("Buffer is empty.")
         idxes = self.rng.integers(0, max_idx, size=int(n), endpoint=False)
         return (
-            self.observation[idxes, None],
+            self.input_obs[idxes, None],
+            self.target_obs[idxes, None],
             self.action[idxes, None],
             self.reward[idxes, None],
             self.terminal[idxes, None].astype(np.float32),
         )
-    def sample_probe(self, batch_size, chunk_size):
-        if getattr(self, "_probe_cache", None) is None:
-            self._probe_cache = (
-                self.observation[:chunk_size][None].copy(),
-                self.action[:chunk_size][None].copy(),
-                self.reward[:chunk_size][None].copy(),
-                self.terminal[:chunk_size][None].copy(),
-            )
-        return self._probe_cache
+
+    def save(self, path: str, meta: dict | None = None):
+        """
+        Save buffer contents to a compressed npz.
+        Only saves the filled portion.
+        """
+        n = self.size()
+        payload = dict(
+            input_obs=self.input_obs[:n],
+            target_obs=self.target_obs[:n],
+            action=self.action[:n],
+            reward=self.reward[:n],
+            terminal=self.terminal[:n],
+            next_idx=self.next_idx[:n],
+            write_id=self.write_id[:n],
+            next_write_id=self.next_write_id[:n],
+            size=np.array([n], dtype=np.int64),
+        )
+        if meta is not None:
+            # store meta as np object array (npz supports this)
+            payload["meta"] = np.array([meta], dtype=object)
+        np.savez_compressed(path, **payload)
 
     def sample_seq(self, batch_size, chunk_size, min_len=10, return_len=False):
         """
         No cross-episode chunks, no padding.
-        Enforces that every sampled start has avail_len >= min_len (default 10).
-        Returns sequences of length L_eff >= min_len.
+        Enforces that every sampled start has avail_len >= min_len.
+        Returns sequences of length L_eff >= min_len (min across batch), capped by chunk_size.
         """
         N = int(self.size())
         B = int(batch_size)
@@ -104,10 +148,6 @@ class ReplayBuffer:
 
         if N == 0:
             raise ValueError("Buffer is empty.")
-        if L < 1:
-            raise ValueError("chunk_size must be >= 1")
-        if min_len < 1:
-            raise ValueError("min_len must be >= 1")
         if L < min_len:
             raise ValueError(f"chunk_size ({L}) must be >= min_len ({min_len})")
 
@@ -119,45 +159,34 @@ class ReplayBuffer:
                 return 1
 
             for _ in range(1, Lmax):
-                if bool(self.terminal[cur]):  # episode ends at cur
+                if bool(self.terminal[cur]):
                     break
                 nxt = int(self.next_idx[cur])
                 if nxt < 0:
                     break
-                # overwrite-safe link check
                 if int(self.next_write_id[cur]) != int(self.write_id[nxt]):
                     break
-                # strict contiguity for single-stream buffer
                 if int(self.write_id[nxt]) != wid_cur + 1:
                     break
                 cur = nxt
                 wid_cur = int(self.write_id[cur])
                 length += 1
-
             return length
 
-        # --- Build candidate starts that can provide >= min_len steps ---
-        # (Uses Lmax=min_len so this filter is cheap-ish.)
         all_starts = np.arange(N, dtype=np.int64)
         ok_mask = np.fromiter((avail_len(s, min_len) >= min_len for s in all_starts),
-                            dtype=np.bool_, count=N)
+                              dtype=np.bool_, count=N)
         candidates = all_starts[ok_mask]
-
         if candidates.size < B:
-            raise ValueError(
-                f"Not enough starts with avail_len >= {min_len}: need {B}, have {candidates.size}."
-            )
+            raise ValueError(f"Not enough starts with avail_len >= {min_len}: need {B}, have {candidates.size}.")
 
         starts = self.rng.choice(candidates, size=B, replace=(candidates.size < B))
 
-        # Now compute the effective length for this batch, capped by chunk_size.
         avails = np.array([avail_len(s, L) for s in starts], dtype=np.int64)
         L_eff = int(avails.min())
         if L_eff < min_len:
-            # Should not happen because candidates ensured min_len, but keep as safety.
-            raise RuntimeError(f"L_eff {L_eff} < min_len {min_len}. Bug in avail_len/candidates filter.")
+            raise RuntimeError(f"L_eff {L_eff} < min_len {min_len}. Bug in candidate filter.")
 
-        # Gather indices by following next pointers for exactly L_eff steps
         idxs = np.empty((B, L_eff), dtype=np.int64)
         for i, s in enumerate(starts):
             cur = int(s)
@@ -166,11 +195,21 @@ class ReplayBuffer:
                 cur = int(self.next_idx[cur])
                 idxs[i, t] = cur
 
-        observation = self.observation[idxs]
-        action      = self.action[idxs]
-        reward      = self.reward[idxs]
-        done_seq    = self.terminal[idxs]
+        input_obs  = self.input_obs[idxs]
+        target_obs = self.target_obs[idxs]
+        action     = self.action[idxs]
+        reward     = self.reward[idxs]
+        done_seq   = self.terminal[idxs]
 
         if return_len:
-            return observation, action, reward, done_seq, L_eff
-        return observation, action, reward, done_seq
+            return input_obs, target_obs, action, reward, done_seq , L_eff
+        return input_obs, target_obs, action, reward, done_seq, 
+
+
+    def sample_probe(self, bs, bl ):
+        input_obs  = self.input_obs[:bl][None]
+        target_obs = self.target_obs[:bl][None]
+        action     = self.action[:bl][None]
+        reward     = self.reward[:bl][None]
+        done_seq   = self.terminal[ :bl][None]
+        return input_obs, target_obs, action, reward, done_seq, 
