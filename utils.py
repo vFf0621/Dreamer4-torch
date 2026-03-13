@@ -11,13 +11,20 @@ def soft_ce(pred, target, bins, minv, maxv):
     target = two_hot(target, minv, maxv, bins).squeeze(-2)
     return -(target * pred).sum(-1, keepdim=True)
 
+def symlog(x):
+    return torch.sign(x) * torch.log(1 + torch.abs(x))
+
+def symexp(x):
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
 
 
-def two_hot(x, minv, maxv, bins):
+def two_hot(x, minv, maxv, bins, sym=False):
     """Converts scalars (in last dim) to soft two-hot over NUM_BINS bins."""
     MAX_VAL=maxv
     MIN_VAL=minv
     NUM_BINS=bins
+	if sym:
+		x = symlog(x)
     x_clamped = torch.clamp((x), MIN_VAL, MAX_VAL)
     orig_shape = x_clamped.shape                      
     flat_x = x_clamped.reshape(-1)                    
@@ -41,12 +48,14 @@ def two_hot(x, minv, maxv, bins):
     new_shape = (*orig_shape, NUM_BINS)               
     return soft_two_hot.view(*new_shape)
 
-def two_hot_inv(x, bin_num, minv, maxv):
+def two_hot_inv(x, bin_num, minv, maxv, sym=False):
     """Converts a batch of soft two-hot encoded vectors to scalars."""
     dreg_bins = torch.linspace(minv, maxv, bin_num, device=x.device, dtype=x.dtype)
     x = F.softmax(x, dim=-1)
     x = torch.sum(x * dreg_bins, dim=-1, keepdim=True)
-    return (x)
+    if sym:
+		x = symexp(x)
+	return (x)
 
 def concat_mtp(x, mtp):
     if len(x.shape) < 3:
