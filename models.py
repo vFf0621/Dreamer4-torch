@@ -1561,7 +1561,7 @@ class Dreamer4(nn.Module):
                     adv = (bs - self.value(h_t[:,:-1])[0].squeeze(-1).detach()) * weight                    
                     v_pred = self.value(h_t[:,:].detach())[1]
                     bs_padded=torch.cat([bs, 0 * bs[:, -1:]], 1)
-                    value_loss = (weight*soft_ce(v_pred, bs_padded, self.reward_bins, self.rminv, self.rmaxv)[:,:-1, 0]).mean()
+                    value_loss = (weight*soft_ce(v_pred, bs_padded, self.reward_bins, self.rminv, self.rmaxv, sym= True)[:,:-1, 0]).mean()
                  #   value_loss = value_loss +  (weight* soft_ce(v_pred, V_targ, self.reward_bins, self.rminv, self.rmaxv)[:,:-1, 0]).mean()
                     lp_t = lp.squeeze(-1)[:,:-1]
                     base = torch.ones_like(adv)
@@ -1650,7 +1650,7 @@ class Value(nn.Module):
         self.r_max=r_max
     def forward(self, x):
         x = self.network(x)
-        return two_hot_inv(x, self.bin_num, -self.r_max, self.r_max), x
+        return two_hot_inv(x, self.bin_num, -self.r_max, self.r_max, True), x
 
 class Decoder(nn.Module):
     def __init__(
