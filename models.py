@@ -59,7 +59,7 @@ class Policy(nn.Module):
         # For training stability, we often use expectation or straight-through sampling
         dist_act = td.Categorical(probs=prob[:,:,0])
         idx = dist_act.sample()
-        action = two_hot_inv(logits[:,:,0], self.num_bins, -0.7, 0.7)
+        action = two_hot_inv(logits[:,:,0], self.num_bins, -1.0, 1.0)
         prob_0 = prob[:,:,0]
         # logp of the sampled bins
         logp = dist_act.log_prob(idx)   # [B,L,A]
@@ -1334,7 +1334,7 @@ class Dreamer4(nn.Module):
             logits_bc,              # [B, L, K_use, Da, bins]
             a_tgt,                  # [B, L, K_use, Da]
             self.policy_num_bins,
-            -0.7, 0.7,
+            -1.0, 1.0,
         ).mean([-2,-1])  # usually [B, L, K_use, Da] (or sometimes reduced)
         a_mask = a_mask.expand_as(raw_act_loss)                # [B,L,K]
 
