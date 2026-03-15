@@ -281,14 +281,14 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agent, ch, h, w, pat
         step = 0
         # --- Collection Phase ---
 
-        if not buffer.full or (buffer.full and ((mode=="policy") or (mode=="inference"))):
+        if not buffer.full or ( (mode=="inference")):
             while (not done.all()):
                 # Handle Actions
                 # Warmup: Random Action
                 if not train_policy and (mode != "inference"):
                    act = env.action_space.sample()
                     # Training: Model Action
-                elif train_policy or (mode=="inference"):
+                elif (mode=="inference"):
                     agent.encoder.eval()
                         # Assuming single agent, extracting index 0
                     state_tensor = torch.from_numpy(observation).to(agent.device)
@@ -343,8 +343,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agent, ch, h, w, pat
             agent.evaluate(buffer)
 
         # Reset agent internal state (RNN hidden states) for next episode
-        if not is_warmup:
-            agent.reset()
+        agent.reset()
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run simulate() with configurable hyperparameters.")
 
@@ -359,10 +358,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Observation / encoding
     p.add_argument("--ch", type=int, default=3, help="Image Channels")
-    p.add_argument("--h", type=int, default=128, help="Image Height")
-    p.add_argument("--w", type=int, default=128, help="Image Width")
-    p.add_argument("--patch", type=int, default=8, help="Patch Size")
-    p.add_argument("--latent_tokens", type=int, default=64, help="Nz")
+    p.add_argument("--h", type=int, default=256, help="Image Height")
+    p.add_argument("--w", type=int, default=256, help="Image Width")
+    p.add_argument("--patch", type=int, default=16, help="Patch Size")
+    p.add_argument("--latent_tokens", type=int, default=256, help="Nz")
     p.add_argument("--reserved_tokens", type=int, default=4, help="Nr")
 
     p.add_argument("--z_dim", type=int, default=16, help="Bottleneck")
@@ -372,7 +371,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--Sa", type=int, default=4)
 
     p.add_argument("--pred_dim", type=int, default=512)
-    p.add_argument("--rep_depth", type=int, default=6, help="Has to be a multiple of 2")
+    p.add_argument("--rep_depth", type=int, default=8, help="Has to be a multiple of 2")
     p.add_argument("--rep_d_model", type=int, default=256)
     p.add_argument("--dyn_d_model", type=int, default=512)
     p.add_argument("--num_heads", type=int, default=8)
@@ -381,7 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mtp", type=int, default=8)
     p.add_argument("--num_tasks", type=int, default=10)
     p.add_argument("--task_id", type=int, default=0)
-    p.add_argument("--eval_context_len", type=int, default=15)
+    p.add_argument("--eval_context_len", type=int, default=20)
     p.add_argument("--buffer", type=str, default="")
 
     # Discretization / vocab
@@ -393,26 +392,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ckpt", type=str, default=None)
     p.add_argument("--dyn_lr", type=float, default=4e-5)
     p.add_argument("--dyn_decay", type=float, default=1e-4)
-    p.add_argument("--rep_lr", type=float, default=1e-4)
+    p.add_argument("--rep_lr", type=float, default=4e-5)
     p.add_argument("--lambda_", type=float, default=0.95)
-    p.add_argument("--symlog_for_reward", type=bool, default=False)
-    p.add_argument("--symlog_for_value", type=bool, default=False)
-
+    p.add_argument("--symlog_for_reward", action="store_true", help="Enable symlog for reward", default=False)
+    p.add_argument("--symlog_for_value", action="store_true", help="Enable symlog for value", default=False)
     p.add_argument("--rep_decay", type=float, default=1e-3)
     p.add_argument("--policy_lr", type=float, default=7e-4)
     p.add_argument("--policy_decay", type=float, default=1e-4)
-    p.add_argument("--render_mode", type=str, default="human")
+    p.add_argument("--render_mode", type=str, default="rgb_array")
     p.add_argument("--train_mode", type=str, default="pretrain")
     # Training
     p.add_argument(
         "--batch_lens",
         type=int,
         nargs=2,
-        default=(15, 50),
+        default=(15, 40),
         metavar=("MIN_LEN", "MAX_LEN"),
         help="Batch length range, e.g. --batch_lens 45 65",
     )
-    p.add_argument("--batch_size", type=int, default=3)
+    p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--accum", type=int, default=2)
     p.add_argument("--max_imag_len", type=int, default=30)
     # For memory considerations

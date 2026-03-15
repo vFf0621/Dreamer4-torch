@@ -9,6 +9,7 @@ import cv2
 from collections import deque
 import numpy as np
 from torch.cuda.amp import autocast, GradScaler
+from torchmetrics.image import PeakSignalNoiseRatio
 
 import math
 class Policy(nn.Module):
@@ -446,6 +447,7 @@ class TokenDynamics(nn.Module):
         self.action_dim = action_dim
         self.action_bins = action_bins
         self.d_model = d_model
+        self.Dz = Dz
         self.Nz = latent_tokens
         self.num_task = num_tasks
         self.mask_last_action = mask_last_action
@@ -608,7 +610,7 @@ class TokenDynamics(nn.Module):
             z_tokens = torch.cat([z_tokens, last_z], dim=1)
 
         B, T, Nz_in, Dz = z_tokens.shape
-
+        z_tokens = z_tokens.reshape(B,T,self.Nz, self.Dz)
         if signals.size(1) != T:
             raise ValueError(f"signals has T={signals.size(1)} but z_tokens has T={T}.")
 
@@ -678,7 +680,7 @@ class TokenDynamics(nn.Module):
 
         hist = self.recover_z(x[:,:,:Nmain])     
 
-        hist = hist.reshape(B, T*Nz_in, self.d_model)     # [B,T*Nz,D]
+        hist = hist.reshape(B, T*self.Nz, self.d_model)     # [B,T*Nz,D]
         z = self.out(hist)                              # [B,T*Nz,Dz]
         z_pred = z.view(B, T, Nz_in, Dz)            # [B,T,Nz,Dz]                        # [B,T,Nz,D]
 
@@ -703,23 +705,7 @@ class Dreamer4(nn.Module):
         self.agent_id = agent_id
         self.eval_ctx = eval_context_len
         # --- TokenDynamics --      -
-        # level_vocab, step_vocab match
-        self.transformer = TokenDynamics(
-            device=self.device, 
-            use_agent_token=True, 
-            level_vocab=level_vocab,
-            level_dim=level_embed_dim,
-            dropout=dropout,
-            n_heads=num_heads,
-            action_dim =action_dim,
-            d_model=dyn_d_model,
-            Sa = Sa, 
-            Nr = Nr, 
-            max_T = max_imag_len,
-            num_tasks=num_tasks,
-            time_every=4,
-            latent_tokens=latent_tokens
-        )
+
         self.lambda_=lambda_
         self.decoder = Decoder(img_channels=ch, w = w, h=h, patch=patch, z_dim=z_dim, d_model=rep_d_model, n_heads=num_heads,
                                depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len)
@@ -739,7 +725,7 @@ class Dreamer4(nn.Module):
         self.batch_size = batch_size
         self.action_dim=action_dim
         self.shortcut_kmax = k_max
-        self.sym_rew = symlog_for_reward,
+        self.sym_rew = symlog_for_reward
 
         self.sym_val = symlog_for_value
         self.z_buffer = None
@@ -753,9 +739,35 @@ class Dreamer4(nn.Module):
         self.train_policy = False
         self.value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp,sym= self.sym_val)
         self.kmax_prob = kmax_prob
+        self.expanding_ratio = 2
         self.t_value = None
         self.disc = 0.997
+        self.psnr = PeakSignalNoiseRatio((-1,1))
+    
+        if ckpt:
+            self.load_state_dict(torch.load(ckpt), strict=False)
+
+        self.transformer = TokenDynamics(
+            device=self.device, 
+            Dz = int(z_dim / self.expanding_ratio),
+            use_agent_token=True, 
+            level_vocab=level_vocab,
+            level_dim=level_embed_dim,
+            dropout=dropout,
+            n_heads=num_heads,
+            action_dim =action_dim,
+            d_model=dyn_d_model,
+            Sa = Sa, 
+            Nr = Nr, 
+            max_T = max_imag_len,
+            num_tasks=num_tasks,
+            time_every=4,
+            latent_tokens=latent_tokens * self.expanding_ratio
+        )
         self.tau_ctx = 0.1
+        #self.encoder.load_state_dict(torch.load("./enc.pt"))
+        #self.decoder.load_state_dict(torch.load("./dec.pt"))
+   
         self.lpips = LPIPSLoss(reduction="none",)
         self.rep_optim = torch.optim.AdamW(
             [{'params': self.encoder.parameters()}, 
@@ -778,19 +790,16 @@ class Dreamer4(nn.Module):
             {'params': self.policy.parameters()}, 
             {'params': self.value.parameters()},
             ],eps = 1e-5, lr=policy_lr, capturable=True,weight_decay=policy_decay)
-        if ckpt:
-            self.load_state_dict(torch.load(ckpt), strict=False)
         self.t_policy.load_state_dict(self.policy.state_dict(), )
 
         self.reward_optim = torch.optim.AdamW(
             [{'params': self.reward.parameters()}, 
             {'params': self.t_policy.parameters()},], eps = 1e-5,
          lr=policy_lr, capturable=True, weight_decay=dyn_decay)
-        self.to(self.device)
-        #self.encoder.load_state_dict(torch.load("enc.pt"))
         self.policy.agent_token= None
         self.t_policy.agent_token= None
-        #self.decoder.load_state_dict(torch.load("dec.pt"))
+
+        self.to(self.device)
 
     def reset(self):
         self.state_buffer = None
@@ -807,7 +816,7 @@ class Dreamer4(nn.Module):
         with torch.no_grad():
             device = self.device
             s = s.to(device)
-
+            assert s.max() <= 1
             # 1. Update State Buffer
             if self.state_buffer is None:
                 self.state_buffer = s.unsqueeze(0).unsqueeze(0) # [B=1, T=1, C, H, W]
@@ -994,11 +1003,11 @@ class Dreamer4(nn.Module):
 
             packed = torch.cat([z_prev, z], dim=1)
 
-            x1_hat = self.transformer(
+            z1_hat = self.transformer(
                 packed, actions[:,:], sigs, detach_agent=False, task_id=self.task_id
             )[0][:, -1:]
 
-            v = (x1_hat - z) / max(1e-5, 1.0 - tau)
+            v = (z1_hat - z) / max(1e-5, 1.0 - tau)
             z = z + v * d_tau
         return z.clamp(-1, 1) if clamp else z
 
@@ -1069,7 +1078,7 @@ class Dreamer4(nn.Module):
         # ============================
         # student prediction
         # ============================
-        x1_hat = self.transformer(
+        z1_hat = self.transformer(
             z_targ,
             actions[:, :-1],
             signals=self.make_signals_indices(B, T, 1, tau_idx, k_pow),
@@ -1112,9 +1121,9 @@ class Dreamer4(nn.Module):
         # ============================
         # losses
         # ============================
-        loss_base = F.mse_loss(x1_hat, z1_clean.detach(), reduction="none")
+        loss_base = F.mse_loss(z1_hat, z1_clean.detach(), reduction="none")
 
-        v_student = (x1_hat - z_targ) / (1.0 - tau).clamp(min=1e-5)
+        v_student = (z1_hat - z_targ) / (1.0 - tau).clamp(min=1e-5)
         loss_boot = (1.0 - tau).pow(2) * F.mse_loss(v_student, avg_vel, reduction="none")
         loss_boot = loss_boot * valid_mid
 
@@ -1123,13 +1132,8 @@ class Dreamer4(nn.Module):
         w_tau = (0.9 * tau + 0.1)
 
         loss = (loss * w_tau ).mean()
-
-        return loss, {
-            "tau_mean": tau.mean().item(),
-            "tauN_frac": (tau_idx == N).float().mean().item(),
-            "base_frac": is_base.float().mean().item(),
-        }
-
+        psnr = self.psnr(z1_hat, z_t)
+        return loss, psnr
 
 
     def save_checkpoint(self, name):
@@ -1251,13 +1255,13 @@ class Dreamer4(nn.Module):
                     kl = torch.zeros((a.size(0), 1, 1), device=device)
                 else:
                     # Policy Sampling
-                    a, log_p, _, base_p, idx = self.policy(h_last)
+                    a, log_p, base_p, _, idx = self.policy(h_last)
                     a_list.append(a)
                     lp_list.append(log_p)
                     # Compute KL divergence for auxiliary loss
                     with torch.no_grad():
-                        _, log_q, _, base_q, _ = self.t_policy(h_last)
-                    kl_step = kl_div(base_p.logits, base_q.logits).sum(-1)
+                        _, log_q, base_q, _, _ = self.t_policy(h_last)
+                    kl_step = kl_div(base_p.logits, base_q.logits).sum([-2,-1])
                     kl = kl_step
 
                 kl_list.append(kl)
@@ -1362,6 +1366,26 @@ class Dreamer4(nn.Module):
         K_pred = logits_bc.shape[2]
         K_use = min(K, K_pred)
         logits_bc = logits_bc[:, :, :K_use]                     # [B, L, K_use, Da, bins]
+        
+        # ======================================================================
+        # PREPARE TERMINATION TARGETS & DONE MASK
+        # ======================================================================
+        t_tp1 = termination[:, :]         # [B, T_r-1]
+        T_tp1 = T_r - 1
+
+        req_len_t = L_use + K - 1
+        pad_len_t = max(0, req_len_t - T_tp1)
+        if pad_len_t > 0:
+            t_padded = F.pad(t_tp1, (0, pad_len_t), mode="constant", value=0.0)
+        else:
+            t_padded = t_tp1
+
+        t_win = t_padded.unfold(dimension=1, size=K, step=1)      # [B, Lp, K]
+        t_tgt = t_win[:, :L_use].contiguous()[:, :, :K_use]       # [B, L, K_use]
+
+        # Create done_mask: True for everything up to and including the first 'done'.
+        # Using .float() ensures cumsum works safely even if termination is a boolean tensor.
+        done_mask = (torch.cumsum(t_tgt.float(), dim=-1) - t_tgt.float()) <= 0  # [B, L, K_use]
 
         # ---- FIX: ensure a_tgt is [B, L, K_use, Da] ----
         # Some codepaths / layouts can yield [B, L, Da, K]. Detect and swap.
@@ -1375,10 +1399,12 @@ class Dreamer4(nn.Module):
         # Now slice to K_use
         a_tgt = a_tgt[:, :, :K_use]
 
-        # Mask: valid if (t + k) < T_ap1
+        # Mask: valid if (t + k) < T_ap1 AND we are not past a done flag
         t_idx = torch.arange(L_use, device=device).view(1, L_use, 1)
         k_idx = torch.arange(K_use, device=device).view(1, 1, K_use)
-        a_mask = (t_idx + k_idx) < T_ap1                          # [1, L, K_use]
+        
+        a_mask = (t_idx + k_idx) <= T_ap1 + 1                         # [1, L, K_use]
+        a_mask = a_mask & done_mask                                   # [B, L, K_use]
 
         raw_act_loss = soft_ce(
             logits_bc,              # [B, L, K_use, Da, bins]
@@ -1386,9 +1412,9 @@ class Dreamer4(nn.Module):
             self.policy_num_bins,
             -1.0, 1.0,
         ).mean([-2,-1])  # usually [B, L, K_use, Da] (or sometimes reduced)
-        a_mask = a_mask.expand_as(raw_act_loss)                # [B,L,K]
-
-        act_loss = (raw_act_loss * a_mask).sum() / (a_mask.sum() + 1e-6)
+        
+        a_mask_exp = a_mask.expand_as(raw_act_loss)                   # [B, L, K_use]
+        act_loss = (raw_act_loss * a_mask_exp).sum() / (a_mask_exp.sum() + 1e-6)
 
         # ======================================================================
         # REWARD HEAD (Predict r_{t+1..t+K})
@@ -1405,48 +1431,33 @@ class Dreamer4(nn.Module):
 
         r_win = r_padded.unfold(dimension=1, size=K, step=1)      # [B, Lp, K]
         r_tgt = r_win[:, :L_use].contiguous()[:, :, :K_use]       # [B, L, K_use]
+        r_mask = (t_idx + k_idx) <= T_rp1 + 1                        # [1, L, K_use]
+        r_mask = r_mask & done_mask                                  # [B, L, K_use]
 
-        r_mask = (t_idx + k_idx) < T_rp1                          # [1, L, K_use]
-
-        _, _, rew_logits, term_dist = self.reward(feat)
+        rew_pred, _, rew_logits, term_dist = self.reward(feat)
         rew_logits = rew_logits[:, :L_use, :K_use]                # [B, L, K_use, bins]
-        print(r_tgt.max())
         raw_rew_loss = soft_ce(
             rew_logits,
             r_tgt,
             self.reward_bins,
-            self.rminv, self.rmaxv,self.sym_rew
+            self.rminv, self.rmaxv, self.sym_rew
         ).mean([-1]) # typically [B, L, K_use]
 
         r_mask_exp = r_mask.expand_as(raw_rew_loss)
         rew_loss = (raw_rew_loss * r_mask_exp).sum() / (r_mask_exp.sum() + 1e-6)
-
         # ======================================================================
         # Termination HEAD (Predict r_{t+1..t+K})
         # ======================================================================
-
-        t_tp1 = termination[:, :]         # [B, T_r-1]
-        T_tp1 = T_r - 1
-
-        req_len_t = L_use + K - 1
-        pad_len_t = max(0, req_len_t - T_tp1)
-        if pad_len_t > 0:
-            t_padded = F.pad(t_tp1, (0, pad_len_t), mode="constant", value=0.0)
-        else:
-            t_padded = t_tp1
-
-        t_win = t_padded.unfold(dimension=1, size=K, step=1)      # [B, Lp, K]
-        t_tgt = t_win[:, :L_use].contiguous()[:, :, :K_use]       # [B, L, K_use]
-
         term_logits = term_dist.logits
         term_logits = term_logits[:, :L_use, :K_use]                # [B, L, K_use, bins]
 
         term_loss = F.binary_cross_entropy_with_logits(
             term_logits,
-            t_tgt,
+            t_tgt.float(), # Target expects float for BCE
             reduction='none'
         ) # typically [B, L, K_use]
-        t_mask = r_mask.clone()
+        
+        t_mask = r_mask.clone() # re-uses the boundary + done mask computed in Reward Head
         t_mask_exp = t_mask.expand_as(term_loss)
 
         term_loss = (t_mask_exp * term_loss).sum() / (t_mask_exp.sum() + 1e-6)
@@ -1547,7 +1558,7 @@ class Dreamer4(nn.Module):
                 z_t = self.encoder(full_sequence, )[0].detach()
                         # Split into current and next steps
                 self.freeze_agent_token()
-                kl_loss, _ = self.shortcut_forcing( z_t, actions)
+                kl_loss, psnr = self.shortcut_forcing( z_t, actions)
                 kl = kl_loss.detach().item()
                 dyn_loss = kl_loss 
 
@@ -1565,7 +1576,7 @@ class Dreamer4(nn.Module):
             if train_reward:
                 clean_latents = self.encoder(states)[0].detach()
                 B, T, Nz, _ = clean_latents.shape
-
+                
                 noised = self.mix_tau_ctx(clean_latents) 
                 
                 self.unfreeze_agent_token()
@@ -1598,7 +1609,7 @@ class Dreamer4(nn.Module):
                     z_0 = initial_latent[:,:].detach()
                     
                     imag_z, h_t, lp, kl_prior, imagined_actions = self.latent_imagination(
-                                z_0, actions[:, :], offset=self.eval_ctx // 2, num_iter=H) 
+                                z_0, actions[:, :], num_iter=H) 
                     self.decode_and_save(imag_z, "imagined") 
                     mixed_z = self.mix_tau_ctx(z_0)
                     N = self.shortcut_kmax
@@ -1613,14 +1624,12 @@ class Dreamer4(nn.Module):
                                                                      
                         r_full, _, _, termination = self.reward(h_t[:, :])
                         r_seq = concat_mtp(r_full[:,:],self.aux_horizon)  
-                        
                         term_probs = termination.probs
                         term_probs = concat_mtp(term_probs, self.aux_horizon)
                         cont_state =1-(term_probs).float()   
                         r_seq = mask_after_done(r_seq[...,0], (cont_state < 0.5) ) 
                         cont_t = cont_state[:, :]         
                         cont_t = mask_after_done(cont_t, cont_t < 0.5)
-            
 
                         V_full = self.value(h_t[:,:])[0] 
                         bs = lambda_returns(r_seq[:,:], cont_t[:,:],  lambda_=self.lambda_, discount=self.disc, boot=V_full[:, :]).squeeze(-1) 
@@ -1636,9 +1645,9 @@ class Dreamer4(nn.Module):
                     base = torch.ones_like(adv)
                     pos = -((adv>=0) * lp_t*weight).sum() / (base[adv >= 0]).sum().clamp(min=1)
                     neg =  ((adv<0) * lp_t*weight).sum()/ (base[adv < 0]).sum().clamp(min=1)
-                    actor_loss = 0.5*(pos + neg).mean()+ 3e-1*((kl_prior[:,:-1] * weight).mean())
+                    actor_loss = 0.5*(pos + neg).mean()+ 3e-1*((kl_prior[:,:-1]).mean())
 
-                    ((actor_loss + value_loss + reward_loss+term_loss)/self.grad_accum).backward()
+                    ((actor_loss + value_loss + reward_loss+action_loss.mean()+term_loss)/self.grad_accum).backward()
                     model_gn =adaptive_grad_clip(self, 0.3)
 
                     if i==self.grad_accum - 1:
@@ -1648,6 +1657,7 @@ class Dreamer4(nn.Module):
         if model:   
             logger["model_gn"] = model_gn 
             logger["shortcut_loss"] = kl
+            logger["psnr"] = psnr.item()
         if train_reward:
             logger["finetune_bc_loss"] = action_loss.mean().detach().item()
             logger["reward_loss"] = reward_loss.detach().item()
