@@ -60,11 +60,9 @@ class Policy(nn.Module):
         # For training stability, we often use expectation or straight-through sampling
         dist_act = td.Categorical(probs=prob[:,:,0])
         idx = dist_act.sample()
-        action = two_hot_inv(logits[:,:,0], self.num_bins, -1.0, 1.0)
-        # logp of the sampled bins
         logp = dist_act.log_prob(idx)   # [B,L,A]
         logp = logp.sum(-1)             # [B,L]        logp = logp.sum(-1) 
-        action = action.squeeze(-1)
+        action = idx_to_bin_center(idx, self.num_bins, -1, 1)
         return action, logp, dist, dist_act, idx
 
 class GQA(nn.Module):
@@ -1425,15 +1423,10 @@ class Dreamer4(nn.Module):
         a_mask = (t_idx + k_idx) <= T_ap1 + 1                         # [1, L, K_use]
         a_mask = a_mask & done_mask                                   # [B, L, K_use]
 
-        raw_act_loss = soft_ce(
-            logits_bc,              # [B, L, K_use, Da, bins]
-            a_tgt,                  # [B, L, K_use, Da]
-            self.policy_num_bins,
-            -1.0, 1.0,
-        ).mean([-2,-1])  # usually [B, L, K_use, Da] (or sometimes reduced)
+        raw_act_loss = -dist.log_prob(centered_to_idx(a_tgt, self.policy_num_bins, -1, 1)).sum(-1) # usually [B, L, K_use, Da] (or sometimes reduced)
         
         a_mask_exp = a_mask.expand_as(raw_act_loss)                   # [B, L, K_use]
-        act_loss = (raw_act_loss * a_mask_exp).sum() / (a_mask_exp.sum() + 1e-6).mean()
+        act_loss = (raw_act_loss * a_mask_exp).sum() / (a_mask_exp.sum() + 1e-6)
 
         # ======================================================================
         # REWARD HEAD (Predict r_{t+1..t+K})
@@ -1629,7 +1622,7 @@ class Dreamer4(nn.Module):
                     
                     imag_z, h_t, lp, kl_prior, imagined_actions = self.latent_imagination(
                                 z_0, actions[:, :], num_iter=H) 
-                    #self.decode_and_save(imag_z, "imagined") 
+                    self.decode_and_save(imag_z, "imagined") 
                     mixed_z = self.mix_tau_ctx(z_0)
                     N = self.shortcut_kmax
 
@@ -1667,7 +1660,7 @@ class Dreamer4(nn.Module):
                     neg =  ((adv<0) * lp_t*weight).sum()/ (base[adv < 0]).sum().clamp(min=1)
                     actor_loss = 0.5*(pos + neg).mean()+ 3e-1*((kl_prior[:,:-1]).mean())
 
-                    ((actor_loss + value_loss +action_loss+ reward_loss+term_loss)/self.grad_accum).backward()
+                    ((actor_loss + value_loss +action_loss.mean()+ reward_loss+term_loss)/self.grad_accum).backward()
                     model_gn =adaptive_grad_clip(self, 0.3)
                     if i==self.grad_accum - 1:
                         (self.policy_optim).step()
