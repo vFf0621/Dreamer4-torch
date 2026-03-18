@@ -613,10 +613,10 @@ class TokenDynamics(nn.Module):
             raise ValueError(f"signals has T={signals.size(1)} but z_tokens has T={T}.")
 
         acts_bt = self.align_actions(actions, T, B)          # [B, T-1, A]
-        act_two_hot = two_hot(acts_bt, -1.0, 1.0, self.action_bins).reshape(B, -1, 1, self.action_bins * self.action_dim)                     # [B, T-1, A]
-
+        act_idx= centered_to_idx(acts_bt, self.action_bins,-1.0, 1.0, )                    # [B, T-1, A]
+        act_onehot = int_to_one_hot(act_idx, self.action_bins).float().reshape(B, -1, 1, self.action_bins * self.action_dim)
                                                     # [B, T-1, D]
-        a_emb = self.action_embs(act_two_hot[:, :, :])                                                     # [B, T-1, 1, D]
+        a_emb = self.action_embs(act_onehot[:, :, :])                                                     # [B, T-1, 1, D]
         if a_emb.size(1) == z_tokens.size(1)-1:
             pad = self.action_pad.expand(B, 1, 1, -1)                                     # [B, 1, 1, D]
             a_emb = torch.cat([pad, a_emb ], dim=1)                                        # [B, T, 1, D]

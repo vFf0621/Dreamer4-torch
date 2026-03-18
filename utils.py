@@ -5,11 +5,9 @@ import torch.distributions as td
 from torch.distributions.transforms import TanhTransform
 from collections.abc import Iterable
 import torch.nn.init as init
-def soft_ce(pred, target, bins, minv, maxv):
-    """Computes the cross entropy loss between predictions and soft targets."""
-    pred = F.log_softmax(pred, dim=-1)
-    target = two_hot(target, minv, maxv, bins).squeeze(-2)
-    return -(target * pred).sum(-1, keepdim=True)
+import cv2
+import math
+
 
 def symlog(x):
     return torch.sign(x) * torch.log(1 + torch.abs(x))
@@ -17,15 +15,22 @@ def symlog(x):
 def symexp(x):
     return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
 
+def soft_ce(pred, target, bins, minv, maxv, sym=False):
+    """Computes the cross entropy loss between predictions and soft targets."""
+    pred = F.log_softmax(pred, dim=-1)
+    target = two_hot(target, minv, maxv, bins, sym).squeeze(-2)
+    return -(target * pred).sum(-1, keepdim=True)
+
 
 def two_hot(x, minv, maxv, bins, sym=False):
     """Converts scalars (in last dim) to soft two-hot over NUM_BINS bins."""
     MAX_VAL=maxv
     MIN_VAL=minv
     NUM_BINS=bins
-	if sym:
-		x = symlog(x)
-    x_clamped = torch.clamp((x), MIN_VAL, MAX_VAL)
+    if sym:
+    
+        x = symlog(x)
+    x_clamped = torch.clamp(x, MIN_VAL, MAX_VAL)
     orig_shape = x_clamped.shape                      
     flat_x = x_clamped.reshape(-1)                    
 
@@ -48,14 +53,14 @@ def two_hot(x, minv, maxv, bins, sym=False):
     new_shape = (*orig_shape, NUM_BINS)               
     return soft_two_hot.view(*new_shape)
 
-def two_hot_inv(x, bin_num, minv, maxv, sym=False):
+def two_hot_inv(x, bin_num, minv, maxv,sym=False):
     """Converts a batch of soft two-hot encoded vectors to scalars."""
     dreg_bins = torch.linspace(minv, maxv, bin_num, device=x.device, dtype=x.dtype)
     x = F.softmax(x, dim=-1)
     x = torch.sum(x * dreg_bins, dim=-1, keepdim=True)
     if sym:
-		x = symexp(x)
-	return (x)
+        x = symexp(x)
+    return x
 
 def concat_mtp(x, mtp):
     if len(x.shape) < 3:
@@ -98,6 +103,32 @@ def int_to_one_hot(x, num_classes):
 	one_hot = torch.zeros(*x.shape, num_classes, device=x.device)
 	one_hot.scatter_(-1, x.unsqueeze(-1), 1)
 	return one_hot
+
+def idx_to_bin_center(idx, num_bins, vmin, vmax):
+    bin_width = (vmax - vmin) / num_bins
+    return vmin + (idx.float()) * bin_width        # logp of the sampled bins
+def centered_to_idx(values: torch.Tensor, num_bins: int, vmin=-1.0, vmax=1.0):
+    """
+    Convert centered continuous values → discrete bin indices.
+
+    Args:
+        values: (...,) float tensor
+        num_bins: number of bins
+        vmin, vmax: value range
+
+    Returns:
+        idx: (...,) long tensor in [0, num_bins-1]
+    """
+    # Normalize to [0, num_bins-1]
+    scaled = (values - vmin) / (vmax - vmin) * (num_bins - 1)
+    
+    # Round to nearest bin
+    idx = torch.round(scaled)
+    
+    # Clamp to valid range
+    idx = torch.clamp(idx, 0, num_bins - 1).long()
+    
+    return idx
 def apply_random_patch_mask(
     images: torch.Tensor,
     patch_size: int = 16,
@@ -135,6 +166,7 @@ def apply_random_patch_mask(
     device = images.device
 
     # --- choose mask ratio per frame ---
+    # --- choose mask ratio per sequence ---
     if mask_ratio is None:
         ratios = torch.rand(B, 1, device=device) * max_mask_ratio  # (B,1)
     else:
@@ -142,7 +174,6 @@ def apply_random_patch_mask(
 
     # expand across time
     ratios = ratios.expand(B, T)  # (B,T)
-
     # keep count per frame (at least 1 patch)
     keep_counts = torch.floor(P * (1.0 - ratios)).to(torch.long).clamp(min=1, max=P)  # (B,T)
 
@@ -268,7 +299,7 @@ def lambda_returns(reward, contprob, boot,lambda_=0.95, discount=0.997):
     
     # Shift value to get V_{t+1}. For last step, bootstrap with V_{T-1} (or provide an explicit boot value)
     rets = [boot[:, -1]]
-    live = (contprob[:, 1:] > 0.5).float() * discount
+    live = (contprob[:, 1:]).float() * discount
     cont = lambda_
     interm = reward[:, 1:] + (1 - cont) * live * boot[:, 1:]
     for t in reversed(range(live.shape[1])):
@@ -374,7 +405,11 @@ class RoPE1D(nn.Module):
 
 def causal_mask(T: int, device=None) -> torch.Tensor:
     return ~torch.triu(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1)
+def save_frames(frames, name):
 
+    for i in range(frames.shape[1]):
+                cv2.imwrite(f"./eval_imgs/{name}_{i}.png", 255 * frames[0, i].transpose(1, 2, 0)[..., ::-1])
+    return
 def unimix_probs(probs, eps=0.01, dim=-1):
     # probs: [..., num_bins]
     num_bins = probs.size(dim)
@@ -461,7 +496,6 @@ def modality_mask(
             # Modality reads the Agent (Latents)
             allow[offset : offset + size, :L] = True
             offset += size
-
     return allow
 import seaborn as sns
 import matplotlib.pyplot as plt
