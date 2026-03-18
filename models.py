@@ -1433,7 +1433,7 @@ class Dreamer4(nn.Module):
         ).mean([-2,-1])  # usually [B, L, K_use, Da] (or sometimes reduced)
         
         a_mask_exp = a_mask.expand_as(raw_act_loss)                   # [B, L, K_use]
-        act_loss = (raw_act_loss * a_mask_exp).sum() / (a_mask_exp.sum() + 1e-6)
+        act_loss = (raw_act_loss * a_mask_exp).sum() / (a_mask_exp.sum() + 1e-6).mean()
 
         # ======================================================================
         # REWARD HEAD (Predict r_{t+1..t+K})
@@ -1629,7 +1629,7 @@ class Dreamer4(nn.Module):
                     
                     imag_z, h_t, lp, kl_prior, imagined_actions = self.latent_imagination(
                                 z_0, actions[:, :], num_iter=H) 
-                    self.decode_and_save(imag_z, "imagined") 
+                    #self.decode_and_save(imag_z, "imagined") 
                     mixed_z = self.mix_tau_ctx(z_0)
                     N = self.shortcut_kmax
 
@@ -1667,7 +1667,7 @@ class Dreamer4(nn.Module):
                     neg =  ((adv<0) * lp_t*weight).sum()/ (base[adv < 0]).sum().clamp(min=1)
                     actor_loss = 0.5*(pos + neg).mean()+ 3e-1*((kl_prior[:,:-1]).mean())
 
-                    ((actor_loss + value_loss + reward_loss+term_loss)/self.grad_accum).backward()
+                    ((actor_loss + value_loss +action_loss+ reward_loss+term_loss)/self.grad_accum).backward()
                     model_gn =adaptive_grad_clip(self, 0.3)
                     if i==self.grad_accum - 1:
                         (self.policy_optim).step()
