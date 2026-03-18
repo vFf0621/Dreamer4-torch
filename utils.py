@@ -53,9 +53,9 @@ def two_hot(x, minv, maxv, bins, sym=False):
     new_shape = (*orig_shape, NUM_BINS)               
     return soft_two_hot.view(*new_shape)
 
-def two_hot_inv(x, bin_num, minv, maxv,sym=False):
+def two_hot_inv(x, num_bins, minv, maxv,sym=False):
     """Converts a batch of soft two-hot encoded vectors to scalars."""
-    dreg_bins = torch.linspace(minv, maxv, bin_num, device=x.device, dtype=x.dtype)
+    dreg_bins = torch.linspace(minv, maxv, num_bins, device=x.device, dtype=x.dtype)
     x = F.softmax(x, dim=-1)
     x = torch.sum(x * dreg_bins, dim=-1, keepdim=True)
     if sym:

@@ -60,9 +60,11 @@ class Policy(nn.Module):
         # For training stability, we often use expectation or straight-through sampling
         dist_act = td.Categorical(probs=prob[:,:,0])
         idx = dist_act.sample()
-        logp = dist_act.log_prob(idx)   # [B,L,A]
-        logp = logp.sum(-1)             # [B,L]        logp = logp.sum(-1) 
-        action = idx_to_bin_center(idx, self.num_bins, -1, 1)
+        action = two_hot_inv(logits[:,:,0],self.num_bins, -1.0, 1.0)
+        # logp of the sampled bins
+        logp = -prob[:,:,0].log().squeeze(-2) * two_hot(action, bins=self.num_bins, minv=-1.0, maxv=1.0).detach().squeeze(-2)   # [B,L,A]
+        logp = logp.sum([-2, -1])             # [B,L]        logp = logp.sum(-1) 
+        action = action.squeeze(-1)
         return action, logp, dist, dist_act, idx
 
 class GQA(nn.Module):
@@ -613,10 +615,10 @@ class TokenDynamics(nn.Module):
             raise ValueError(f"signals has T={signals.size(1)} but z_tokens has T={T}.")
 
         acts_bt = self.align_actions(actions, T, B)          # [B, T-1, A]
-        act_idx= centered_to_idx(acts_bt, self.action_bins,-1.0, 1.0, )                    # [B, T-1, A]
-        act_onehot = int_to_one_hot(act_idx, self.action_bins).float().reshape(B, -1, 1, self.action_bins * self.action_dim)
+        act_two_hot = two_hot(acts_bt, -1.0, 1.0, self.action_bins).reshape(B, -1, 1, self.action_bins * self.action_dim)                     # [B, T-1, A]
+
                                                     # [B, T-1, D]
-        a_emb = self.action_embs(act_onehot[:, :, :])                                                     # [B, T-1, 1, D]
+        a_emb = self.action_embs(act_two_hot[:, :, :])                                                     # [B, T-1, 1, D]
         if a_emb.size(1) == z_tokens.size(1)-1:
             pad = self.action_pad.expand(B, 1, 1, -1)                                     # [B, 1, 1, D]
             a_emb = torch.cat([pad, a_emb ], dim=1)                                        # [B, T, 1, D]
@@ -1423,7 +1425,12 @@ class Dreamer4(nn.Module):
         a_mask = (t_idx + k_idx) <= T_ap1 + 1                         # [1, L, K_use]
         a_mask = a_mask & done_mask                                   # [B, L, K_use]
 
-        raw_act_loss = -dist.log_prob(centered_to_idx(a_tgt, self.policy_num_bins, -1, 1)).sum(-1) # usually [B, L, K_use, Da] (or sometimes reduced)
+        raw_act_loss = soft_ce(
+            logits_bc,              # [B, L, K_use, Da, bins]
+            a_tgt,                  # [B, L, K_use, Da]
+            self.policy_num_bins,
+            -1.0, 1.0,
+        ).mean([-2,-1])  # usually [B, L, K_use, Da] (or sometimes reduced)
         
         a_mask_exp = a_mask.expand_as(raw_act_loss)                   # [B, L, K_use]
         act_loss = (raw_act_loss * a_mask_exp).sum() / (a_mask_exp.sum() + 1e-6)
@@ -1654,8 +1661,10 @@ class Dreamer4(nn.Module):
                     value_loss = (weight*soft_ce(v_pred, bs_padded, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
                     V_targ = self.t_value(h_t)[0].detach()
                     value_loss = value_loss +  (weight* soft_ce(v_pred, V_targ, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
-                    lp_t = lp.squeeze(-1)[:,:-1]
+                    lp_t = lp[:,:-1]
                     base = torch.ones_like(adv)
+
+
                     pos = -((adv>=0) * lp_t*weight).sum() / (base[adv >= 0]).sum().clamp(min=1)
                     neg =  ((adv<0) * lp_t*weight).sum()/ (base[adv < 0]).sum().clamp(min=1)
                     actor_loss = 0.5*(pos + neg).mean()+ 3e-1*((kl_prior[:,:-1]).mean())
