@@ -726,7 +726,7 @@ class Dreamer4(nn.Module):
         self.action_dim=action_dim
         self.shortcut_kmax = k_max
         self.sym_rew = symlog_for_reward
-
+        self.pi_hard_update = 100
         self.sym_val = symlog_for_value
         self.z_buffer = None
         self.aux_horizon = mtp+1
@@ -740,13 +740,13 @@ class Dreamer4(nn.Module):
         self.value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp,sym= self.sym_val)
         self.kmax_prob = kmax_prob
         self.expanding_ratio = 2
-        self.t_value = None
+        with torch.no_grad():
+            self.t_value =Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp,sym= self.sym_val)
+            self.t_value.load_state_dict(self.value.state_dict()) 
         self.disc = 0.997
         self.psnr = PeakSignalNoiseRatio((-1,1))
     
-        if ckpt:
-            self.load_state_dict(torch.load(ckpt), strict=False)
-
+        
         self.transformer = TokenDynamics(
             device=self.device, 
             Dz = int(z_dim / self.expanding_ratio),
@@ -767,7 +767,9 @@ class Dreamer4(nn.Module):
         self.tau_ctx = 0.1
         #self.encoder.load_state_dict(torch.load("./enc.pt"))
         #self.decoder.load_state_dict(torch.load("./dec.pt"))
-   
+        if ckpt:
+            self.load_state_dict(torch.load(ckpt), strict=False)
+
         self.lpips = LPIPSLoss(reduction="none",)
         self.rep_optim = torch.optim.AdamW(
             [{'params': self.encoder.parameters()}, 
@@ -794,7 +796,7 @@ class Dreamer4(nn.Module):
 
         self.reward_optim = torch.optim.AdamW(
             [{'params': self.reward.parameters()}, 
-            {'params': self.t_policy.parameters()},], eps = 1e-5,
+            {'params': self.policy.parameters()},], eps = 1e-5,
          lr=policy_lr, capturable=True, weight_decay=dyn_decay)
         self.policy.agent_token= None
         self.t_policy.agent_token= None
@@ -804,8 +806,25 @@ class Dreamer4(nn.Module):
     def reset(self):
         self.state_buffer = None
         self.action_buffer = torch.zeros(1, 0, self.action_dim, device=self.device)
-
-
+    
+    
+    def hard_update(self, target_net: nn.Module, online_net: nn.Module):
+        """
+        Updates the target network parameters using hard update.
+        """
+        with torch.no_grad():
+            target_net.load_state_dict(online_net.state_dict())
+    def soft_update(self, target_net: nn.Module, online_net: nn.Module):
+        """
+        Updates the target network parameters using an exponential moving average.
+        tau: The soft update coefficient (usually between 0.001 and 0.05).
+        """
+        tau=self.ema
+        with torch.no_grad():
+            for target_param, online_param in zip(target_net.parameters(), online_net.parameters()):
+                # target = target + tau * (online - target)
+                # which is mathematically identical to: target = (1-tau)*target + tau*online
+                target_param.data.lerp_(online_param.data, tau)
     def mix_tau_ctx(self, src):
         return src*(1-self.tau_ctx) + self.tau_ctx*torch.randn_like(src)
     def action_step(self, s, show_recon=True):
@@ -905,9 +924,9 @@ class Dreamer4(nn.Module):
            
             self.decode_and_save(z_tv, 'reconst')
 
-            z = self.latent_imagination(z_tv[:,:], a[:,:], num_iter=a.size(1) - 1, eval_=False,random=False, forced=True)[0]
+            z = self.latent_imagination(z_tv[:,:].clone(), a[:,:], num_iter=a.size(1) - 1, eval_=False,random=False, forced=True)[0]
             self.decode_and_save(z, "single_frame")
-            z_eval = self.latent_imagination(z_tv[:,:], a[:], num_iter=a.size(1) - 1, eval_=False,random=True, forced=False)[0]
+            z_eval = self.latent_imagination(z_tv[:,:].clone(), a[:], num_iter=a.size(1) - 1, eval_=False,random=True, forced=False)[0]
             self.decode_and_save(z_eval, 'random')
         return
     
@@ -1255,13 +1274,13 @@ class Dreamer4(nn.Module):
                     kl = torch.zeros((a.size(0), 1, 1), device=device)
                 else:
                     # Policy Sampling
-                    a, log_p, base_p, _, idx = self.policy(h_last)
+                    a, log_p, _, base_p, idx = self.policy(h_last)
                     a_list.append(a)
                     lp_list.append(log_p)
                     # Compute KL divergence for auxiliary loss
                     with torch.no_grad():
-                        _, log_q, base_q, _, _ = self.t_policy(h_last)
-                    kl_step = kl_div(base_p.logits, base_q.logits).sum([-2,-1])
+                        _, log_q, _, base_q, _ = self.t_policy(h_last)
+                    kl_step = kl_div(base_p.logits, base_q.logits).sum([-1])
                     kl = kl_step
 
                 kl_list.append(kl)
@@ -1586,7 +1605,7 @@ class Dreamer4(nn.Module):
                 action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:], termination.float())
                                                 
              
-                ac_loss =  action_loss+reward_loss+term_loss + dyn_loss
+                ac_loss =  0.1*(action_loss+reward_loss+term_loss) + 5 *  dyn_loss
 
                 (ac_loss.mean()/self.grad_accum).backward()
                 reward_policy_model_gn = adaptive_grad_clip(self, 0.3)
@@ -1618,7 +1637,7 @@ class Dreamer4(nn.Module):
                                                         signals=self.make_signals_indices(B, T, 1, N, 0)
                                                         )[1]
             
-                    action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_wo_grad[:,:], actions[:,:], reward[:,:], termination.float(), t_policy=True)
+                    action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_wo_grad[:,:], actions[:,:], reward[:,:], termination.float(), t_policy=False)
 
                     with torch.no_grad():
                                                                      
@@ -1640,19 +1659,22 @@ class Dreamer4(nn.Module):
                     v_pred = self.value(h_t[:,:].detach())[1]
                     bs_padded=torch.cat([bs, 0 * bs[:, -1:]], 1)
                     value_loss = (weight*soft_ce(v_pred, bs_padded, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
-                 #   value_loss = value_loss +  (weight* soft_ce(v_pred, V_targ, self.reward_bins, self.rminv, self.rmaxv)[:,:-1, 0]).mean()
+                    V_targ = self.t_value(h_t)[0].detach()
+                    value_loss = value_loss +  (weight* soft_ce(v_pred, V_targ, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
                     lp_t = lp.squeeze(-1)[:,:-1]
                     base = torch.ones_like(adv)
                     pos = -((adv>=0) * lp_t*weight).sum() / (base[adv >= 0]).sum().clamp(min=1)
                     neg =  ((adv<0) * lp_t*weight).sum()/ (base[adv < 0]).sum().clamp(min=1)
                     actor_loss = 0.5*(pos + neg).mean()+ 3e-1*((kl_prior[:,:-1]).mean())
 
-                    ((actor_loss + value_loss + reward_loss+action_loss.mean()+term_loss)/self.grad_accum).backward()
+                    ((actor_loss + value_loss + reward_loss+term_loss)/self.grad_accum).backward()
                     model_gn =adaptive_grad_clip(self, 0.3)
-
                     if i==self.grad_accum - 1:
                         (self.policy_optim).step()
                         self.reward_optim.step()
+                        self.soft_update(self.t_value, self.value)
+                        if self.steps % self.pi_hard_update == 0:
+                            self.hard_update(self.t_policy, self.policy)
 
         if model:   
             logger["model_gn"] = model_gn 

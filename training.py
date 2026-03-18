@@ -240,7 +240,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agent, ch, h, w, pat
         buffer = load_replay(buffer)
     else:
         buffer = ReplayBuffer(
-        buffer_limit=buffer_limit,
+        buffer_limit=1,
         input_obs_size=(ch, h ,w),
         target_obs_size=(ch, h, w),
         action_size=action_dim,
@@ -281,7 +281,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agent, ch, h, w, pat
         step = 0
         # --- Collection Phase ---
 
-        if not buffer.full or ( (mode=="inference")):
+        if ( (mode=="inference")):
             while (not done.all()):
                 # Handle Actions
                 # Warmup: Random Action
@@ -373,14 +373,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pred_dim", type=int, default=512)
     p.add_argument("--rep_depth", type=int, default=8, help="Has to be a multiple of 2")
     p.add_argument("--rep_d_model", type=int, default=256)
-    p.add_argument("--dyn_d_model", type=int, default=512)
+    p.add_argument("--dyn_d_model", type=int, default=256)
     p.add_argument("--num_heads", type=int, default=8)
     p.add_argument("--dropout", type=float, default=0.01)
     p.add_argument("--k_max", type=int, default=128, help="Has to be a power of 2")
     p.add_argument("--mtp", type=int, default=8)
     p.add_argument("--num_tasks", type=int, default=10)
     p.add_argument("--task_id", type=int, default=0)
-    p.add_argument("--eval_context_len", type=int, default=20)
+    p.add_argument("--eval_context_len", type=int, default=15)
     p.add_argument("--buffer", type=str, default="")
 
     # Discretization / vocab
@@ -393,11 +393,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dyn_lr", type=float, default=4e-5)
     p.add_argument("--dyn_decay", type=float, default=1e-4)
     p.add_argument("--rep_lr", type=float, default=4e-5)
-    p.add_argument("--lambda_", type=float, default=0.95)
+    p.add_argument("--lambda_", type=float, default=0.98)
     p.add_argument("--symlog_for_reward", action="store_true", help="Enable symlog for reward", default=False)
     p.add_argument("--symlog_for_value", action="store_true", help="Enable symlog for value", default=False)
     p.add_argument("--rep_decay", type=float, default=1e-3)
-    p.add_argument("--policy_lr", type=float, default=7e-4)
+    p.add_argument("--policy_lr", type=float, default=1e-4)
     p.add_argument("--policy_decay", type=float, default=1e-4)
     p.add_argument("--render_mode", type=str, default="rgb_array")
     p.add_argument("--train_mode", type=str, default="pretrain")
