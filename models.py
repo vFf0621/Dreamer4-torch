@@ -33,9 +33,8 @@ class Policy(nn.Module):
                 nn.Linear(latent_dim*2, action_dim * num_bins * mtp)
             )
       #  self.agent_token = nn.Parameter(0.02*torch.randn(1,1,1,latent_dim))
-        self.eps = 1e-8
 
-    def forward(self, posterior: torch.Tensor, sample=True):
+    def forward(self, posterior: torch.Tensor, sample=False):
         """
         posterior: [B, L, D]
         Returns:
@@ -43,6 +42,17 @@ class Policy(nn.Module):
             logits: [B, L, A, Bins]
             dist: Categorical Distribution object
         """
+        def unimix_probs(probs: torch.Tensor, unimix: float = 0.01, dim: int = -1):
+            """
+            logits: (..., K)
+            returns mixed probs: (1-unimix)*softmax(logits) + unimix*uniform
+            """
+            if not (0.0 <= unimix <= 1.0):
+                raise ValueError(f"unimix must be in [0,1], got {unimix}")
+
+            K = logits.shape[dim]
+            uniform = torch.full_like(probs, 1.0 / K)
+            return (1.0 - unimix) * probs + unimix * uniform
         B, L, D = posterior.shape
         # Features
         x = self.network(posterior)
@@ -53,16 +63,21 @@ class Policy(nn.Module):
 
         # --- 2. MTP Head (Auxiliary) ---
         # [B, L, MTP, A, Bins]
-        prob = torch.softmax(logits, -1)
         # prob = unimix_probs(prob)
         # --- 3. Sampling ---
-        dist = td.Categorical(probs=prob)
+        if sample:
+            prob = F.gumbel_softmax(logits=logits, tau=1.0, hard=False)
+        else:
+            prob = F.softmax(logits, -1)
+        prob = unimix_probs(prob)
+        dist = td.Independent(td.Categorical(probs=(prob)),2)
         # For training stability, we often use expectation or straight-through sampling
-        dist_act = td.Categorical(probs=prob[:,:,0])
+        dist_act =td.Independent(td.Categorical(probs=prob[:,:,0]), 1)
         idx = dist_act.sample()
         action = two_hot_inv(logits[:,:,0],self.num_bins, -1.0, 1.0)
         # logp of the sampled bins
-        logp = -prob[:,:,0].log().squeeze(-2) * two_hot(action, bins=self.num_bins, minv=-1.0, maxv=1.0).detach().squeeze(-2)   # [B,L,A]
+        logp = F.log_softmax(logits[:,:,0], -1).squeeze(-2) * two_hot(action, bins=self.num_bins, minv=-1.0, maxv=1.0).detach().squeeze(-2)   # [B,L,A]
+        
         logp = logp.sum([-2, -1])             # [B,L]        logp = logp.sum(-1) 
         action = action.squeeze(-1)
         return action, logp, dist, dist_act, idx
@@ -740,9 +755,6 @@ class Dreamer4(nn.Module):
         self.value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp,sym= self.sym_val)
         self.kmax_prob = kmax_prob
         self.expanding_ratio = 2
-        with torch.no_grad():
-            self.t_value =Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp,sym= self.sym_val)
-            self.t_value.load_state_dict(self.value.state_dict()) 
         self.disc = 0.997
         self.psnr = PeakSignalNoiseRatio((-1,1))
     
@@ -780,26 +792,29 @@ class Dreamer4(nn.Module):
             ]
         , lr=rep_lr, capturable=True, weight_decay=rep_decay)
         self.reset()
+        with torch.no_grad():
+            self.t_value =Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp,sym= self.sym_val)
+            self.t_value.load_state_dict(self.value.state_dict()) 
+
         self.dyn_optim = torch.optim.AdamW(            
             [{'params': self.policy.parameters()}, 
             {'params': self.reward.parameters()}, 
             {'params': self.transformer.parameters()}, ],
 
             lr=dyn_lr, capturable=True,weight_decay=dyn_decay)
-
+        with torch.no_grad():
+            self.t_policy.load_state_dict(self.policy.state_dict(), )
+        self.policy.apply(init_weights)
 
         self.policy_optim= torch.optim.AdamW([
             {'params': self.policy.parameters()}, 
             {'params': self.value.parameters()},
             ],eps = 1e-5, lr=policy_lr, capturable=True,weight_decay=policy_decay)
-        self.t_policy.load_state_dict(self.policy.state_dict(), )
-
+   
         self.reward_optim = torch.optim.AdamW(
             [{'params': self.reward.parameters()}, 
-            {'params': self.policy.parameters()},], eps = 1e-5,
+            {'params': self.t_policy.parameters()},], eps = 1e-5,
          lr=policy_lr, capturable=True, weight_decay=dyn_decay)
-        self.policy.agent_token= None
-        self.t_policy.agent_token= None
 
         self.to(self.device)
 
@@ -819,7 +834,7 @@ class Dreamer4(nn.Module):
         Updates the target network parameters using an exponential moving average.
         tau: The soft update coefficient (usually between 0.001 and 0.05).
         """
-        tau=self.ema
+        tau=1-self.ema
         with torch.no_grad():
             for target_param, online_param in zip(target_net.parameters(), online_net.parameters()):
                 # target = target + tau * (online - target)
@@ -908,7 +923,7 @@ class Dreamer4(nn.Module):
             z_pred, h = self.transformer(z_tv, self.action_buffer, signals=sigs)
 
             # 6. Policy Prediction
-            a, *_ = self.policy(h[:, -1:])
+            a, *_ = self.policy(h[:, -1:], sample=False)
 
             # 7. Append new action for the NEXT step
             self.action_buffer = torch.cat([self.action_buffer, a], dim=1)
@@ -1279,8 +1294,8 @@ class Dreamer4(nn.Module):
                     lp_list.append(log_p)
                     # Compute KL divergence for auxiliary loss
                     with torch.no_grad():
-                        _, log_q, _, base_q, _ = self.t_policy(h_last)
-                    kl_step = kl_div(base_p.logits, base_q.logits).sum([-1])
+                        _, log_q,_ , base_q, _ = self.t_policy(h_last)
+                    kl_step = td.kl_divergence(base_p, base_q)
                     kl = kl_step
 
                 kl_list.append(kl)
@@ -1379,7 +1394,7 @@ class Dreamer4(nn.Module):
         # Forward
         out = self.policy(feat) if not t_policy else self.t_policy(feat)
         _, _, dist, _, _ = out
-        logits_bc = dist.logits[:, :L_use]                      # [B, L_use, K_pred, Da, bins]
+        logits_bc = dist.base_dist.logits[:, :L_use]                      # [B, L_use, K_pred, Da, bins]
 
         # Align horizons
         K_pred = logits_bc.shape[2]
@@ -1637,7 +1652,8 @@ class Dreamer4(nn.Module):
                                                         signals=self.make_signals_indices(B, T, 1, N, 0)
                                                         )[1]
             
-                    action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_wo_grad[:,:], actions[:,:], reward[:,:], termination.float(), t_policy=False)
+                    action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_wo_grad[:,:], actions[:,:], reward[:,:], termination.float(), t_policy=True)
+                    disc= self.disc
 
                     with torch.no_grad():
                                                                      
@@ -1649,18 +1665,33 @@ class Dreamer4(nn.Module):
                         r_seq = mask_after_done(r_seq[...,0], (cont_state < 0.5) ) 
                         cont_t = cont_state[:, :]         
                         cont_t = mask_after_done(cont_t, cont_t < 0.5)
+                        r_rp, _, _, term_rp = self.reward(h_wo_grad[:, :])
+                        V_rp = self.value(h_wo_grad[:,:])[0] 
+                        cont_rp = (1-term_rp.probs[:,:])
+
+                        cont_rp = concat_mtp(cont_rp, self.aux_horizon)
+                        r_rp = concat_mtp(r_rp, self.aux_horizon)
 
                         V_full = self.value(h_t[:,:])[0] 
+                        r_rp_seq = mask_after_done(r_rp[...,0], (cont_rp < 0.5) ) 
+
                         bs = lambda_returns(r_seq[:,:], cont_t[:,:],  lambda_=self.lambda_, discount=self.disc, boot=V_full[:, :]).squeeze(-1) 
-                    disc= self.disc
+                        rp_targ = lambda_returns(r_rp, cont_rp,  lambda_=self.lambda_, discount=self.disc, boot=V_rp[:, :]).squeeze(-1) 
+                        weight_rp = torch.cumprod(disc * (cont_rp > 0.5), 1) /disc 
+                        weight_rp = mask_after_done(weight_rp, (cont_rp < 0.5) )[:,:-1]
+                    rp_targ=torch.cat([rp_targ, 0 * rp_targ[:, -1:]], 1)
+
+                    V_rp_pred = self.value(h_wo_grad[:,:])[0] 
+                    rploss = (soft_ce(V_rp_pred,rp_targ .self.reward_bins, self.rminv, self.rmaxv, self.sym_val) * weight_rp)[:,:-1].mean()
                     weight = torch.cumprod(disc * (cont_t[:,:] > 0.5), 1) /disc 
                     weight = mask_after_done(weight, (cont_state < 0.5) )[:,:-1]
                     adv = (bs - self.value(h_t[:,:-1])[0].squeeze(-1).detach()) * weight                    
                     v_pred = self.value(h_t[:,:].detach())[1]
                     bs_padded=torch.cat([bs, 0 * bs[:, -1:]], 1)
-                    value_loss = (weight*soft_ce(v_pred, bs_padded, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
                     V_targ = self.t_value(h_t)[0].detach()
-                    value_loss = value_loss +  (weight* soft_ce(v_pred, V_targ, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
+                    value_loss = (weight* soft_ce(v_pred, V_targ, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
+                    valud_loss = value_loss + (weight * soft_ce(v_pred, bs, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
+                    value_loss = value_loss + rploss
                     lp_t = lp[:,:-1]
                     base = torch.ones_like(adv)
 
@@ -1675,8 +1706,6 @@ class Dreamer4(nn.Module):
                         (self.policy_optim).step()
                         self.reward_optim.step()
                         self.soft_update(self.t_value, self.value)
-                        if self.steps % self.pi_hard_update == 0:
-                            self.hard_update(self.t_policy, self.policy)
 
         if model:   
             logger["model_gn"] = model_gn 

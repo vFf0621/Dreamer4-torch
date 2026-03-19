@@ -380,7 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mtp", type=int, default=8)
     p.add_argument("--num_tasks", type=int, default=10)
     p.add_argument("--task_id", type=int, default=0)
-    p.add_argument("--eval_context_len", type=int, default=20)
+    p.add_argument("--eval_context_len", type=int, default=15)
     p.add_argument("--buffer", type=str, default="")
 
     # Discretization / vocab
@@ -393,11 +393,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dyn_lr", type=float, default=4e-5)
     p.add_argument("--dyn_decay", type=float, default=1e-4)
     p.add_argument("--rep_lr", type=float, default=4e-5)
-    p.add_argument("--lambda_", type=float, default=0.98)
+    p.add_argument("--lambda_", type=float, default=0.95)
     p.add_argument("--symlog_for_reward", action="store_true", help="Enable symlog for reward", default=True)
     p.add_argument("--symlog_for_value", action="store_true", help="Enable symlog for value", default=True)
     p.add_argument("--rep_decay", type=float, default=1e-3)
-    p.add_argument("--policy_lr", type=float, default=1e-4)
+    p.add_argument("--policy_lr", type=float, default=3e-4)
     p.add_argument("--policy_decay", type=float, default=1e-4)
     p.add_argument("--render_mode", type=str, default="rgb_array")
     p.add_argument("--train_mode", type=str, default="pretrain")
@@ -412,7 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--accum", type=int, default=2)
-    p.add_argument("--max_imag_len", type=int, default=30)
+    p.add_argument("--max_imag_len", type=int, default=20)
     # For memory considerations
 
     # Flags (default True -> allow toggling off with --no-*)
