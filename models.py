@@ -1676,21 +1676,21 @@ class Dreamer4(nn.Module):
                         r_rp_seq = mask_after_done(r_rp[...,0], (cont_rp < 0.5) ) 
 
                         bs = lambda_returns(r_seq[:,:], cont_t[:,:],  lambda_=self.lambda_, discount=self.disc, boot=V_full[:, :]).squeeze(-1) 
-                        rp_targ = lambda_returns(r_rp, cont_rp,  lambda_=self.lambda_, discount=self.disc, boot=V_rp[:, :]).squeeze(-1) 
+                        rp_targ = lambda_returns(r_rp_seq, cont_rp,  lambda_=self.lambda_, discount=self.disc, boot=V_rp[:, :]).squeeze(-1) 
                         weight_rp = torch.cumprod(disc * (cont_rp > 0.5), 1) /disc 
                         weight_rp = mask_after_done(weight_rp, (cont_rp < 0.5) )[:,:-1]
                     rp_targ=torch.cat([rp_targ, 0 * rp_targ[:, -1:]], 1)
 
-                    V_rp_pred = self.value(h_wo_grad[:,:])[0] 
-                    rploss = (soft_ce(V_rp_pred,rp_targ .self.reward_bins, self.rminv, self.rmaxv, self.sym_val) * weight_rp)[:,:-1].mean()
+                    V_rp_pred = self.value(h_wo_grad[:,:])[1] 
+                    rploss = (soft_ce(V_rp_pred,rp_targ , self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0] * weight_rp).mean()
                     weight = torch.cumprod(disc * (cont_t[:,:] > 0.5), 1) /disc 
                     weight = mask_after_done(weight, (cont_state < 0.5) )[:,:-1]
                     adv = (bs - self.value(h_t[:,:-1])[0].squeeze(-1).detach()) * weight                    
-                    v_pred = self.value(h_t[:,:].detach())[1]
+                    V_pred = self.value(h_t[:,:].detach())[1]
                     bs_padded=torch.cat([bs, 0 * bs[:, -1:]], 1)
                     V_targ = self.t_value(h_t)[0].detach()
-                    value_loss = (weight* soft_ce(v_pred, V_targ, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
-                    valud_loss = value_loss + (weight * soft_ce(v_pred, bs, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
+                    value_loss = (weight* soft_ce(V_pred[:,:], V_targ, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
+                    valud_loss = value_loss + (weight * soft_ce(V_pred, bs_padded, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
                     value_loss = value_loss + rploss
                     lp_t = lp[:,:-1]
                     base = torch.ones_like(adv)
