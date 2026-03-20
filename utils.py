@@ -77,7 +77,23 @@ def init_weights(m):
         if m.bias is not None:
             init.zeros_(m.bias)
             
-            
+def idx_to_value(idx: torch.Tensor,
+                 num_bins: int,
+                 low: float,
+                 high: float) -> torch.Tensor:
+    """
+    Map discrete bin index → bin center value.
+    Consistent with two_hot / two_hot_inv.
+    """
+    idx = idx.to(torch.float32)
+
+    if num_bins == 1:
+        return torch.full_like(idx, (low + high) / 2.0)
+
+    # Same spacing as two_hot (NUM_BINS - 1)
+    step = (high - low) / (num_bins - 1)
+
+    return low + idx * step
 def build_network(input_size, hidden_size, num_layers, activation, output_size, rms=True):
 
     layers = []

@@ -76,9 +76,10 @@ class Policy(nn.Module):
         idx = dist_act.sample()
         action = two_hot_inv(logits[:,:,0],self.num_bins, -1.0, 1.0)
         # logp of the sampled bins
-        logp = F.log_softmax(logits[:,:,0], -1).squeeze(-2) * two_hot(action, bins=self.num_bins, minv=-1.0, maxv=1.0).detach().squeeze(-2)   # [B,L,A]
-        
-        logp = logp.sum([-2, -1])             # [B,L]        logp = logp.sum(-1) 
+        logp =dist_act.log_prob(idx)
+                 # [B,L]        logp = logp.sum(-1) 
+        if sample:
+            action = idx_to_value(idx, self.num_bins, -1.0, 1.0)
         action = action.squeeze(-1)
         return action, logp, dist, dist_act, idx
 
@@ -804,7 +805,6 @@ class Dreamer4(nn.Module):
             lr=dyn_lr, capturable=True,weight_decay=dyn_decay)
         with torch.no_grad():
             self.t_policy.load_state_dict(self.policy.state_dict(), )
-        self.policy.apply(init_weights)
 
         self.policy_optim= torch.optim.AdamW([
             {'params': self.policy.parameters()}, 
@@ -1289,7 +1289,7 @@ class Dreamer4(nn.Module):
                     kl = torch.zeros((a.size(0), 1, 1), device=device)
                 else:
                     # Policy Sampling
-                    a, log_p, _, base_p, idx = self.policy(h_last)
+                    a, log_p, _, base_p, idx = self.policy(h_last, sample=True)
                     a_list.append(a)
                     lp_list.append(log_p)
                     # Compute KL divergence for auxiliary loss
@@ -1698,7 +1698,7 @@ class Dreamer4(nn.Module):
 
                     pos = -((adv>=0) * lp_t*weight).sum() / (base[adv >= 0]).sum().clamp(min=1)
                     neg =  ((adv<0) * lp_t*weight).sum()/ (base[adv < 0]).sum().clamp(min=1)
-                    actor_loss = 0.5*(pos + neg).mean()+ 3e-1*((kl_prior[:,:-1]).mean())
+                    actor_loss = 0.5*(pos + neg).mean()+ 0.3*((weight*kl_prior[:,:-1]).mean())
 
                     ((actor_loss + value_loss +action_loss.mean()+ reward_loss+term_loss)/self.grad_accum).backward()
                     model_gn =adaptive_grad_clip(self, 0.3)
