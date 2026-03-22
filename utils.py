@@ -53,10 +53,10 @@ def two_hot(x, minv, maxv, bins, sym=False):
     new_shape = (*orig_shape, NUM_BINS)               
     return soft_two_hot.view(*new_shape)
 
-def two_hot_inv(x, num_bins, minv, maxv,sym=False):
+def two_hot_inv(x, num_bins, minv, maxv,sym=False, temp=1.0):
     """Converts a batch of soft two-hot encoded vectors to scalars."""
     dreg_bins = torch.linspace(minv, maxv, num_bins, device=x.device, dtype=x.dtype)
-    x = F.softmax(x, dim=-1)
+    x = F.softmax(x/temp, dim=-1)
     x = torch.sum(x * dreg_bins, dim=-1, keepdim=True)
     if sym:
         x = symexp(x)
@@ -77,23 +77,7 @@ def init_weights(m):
         if m.bias is not None:
             init.zeros_(m.bias)
             
-def idx_to_value(idx: torch.Tensor,
-                 num_bins: int,
-                 low: float,
-                 high: float) -> torch.Tensor:
-    """
-    Map discrete bin index → bin center value.
-    Consistent with two_hot / two_hot_inv.
-    """
-    idx = idx.to(torch.float32)
 
-    if num_bins == 1:
-        return torch.full_like(idx, (low + high) / 2.0)
-
-    # Same spacing as two_hot (NUM_BINS - 1)
-    step = (high - low) / (num_bins - 1)
-
-    return low + idx * step
 def build_network(input_size, hidden_size, num_layers, activation, output_size, rms=True):
 
     layers = []
@@ -257,26 +241,26 @@ def mask_after_done(inp, contprob, thresh=0.5):
     """
     inp:   [B, T] or [B, T, 1]
     contprob: [B, T] or [B, T, 1]   (continuation probability in [0,1])
-
-    Masks reward so that once contprob < thresh occurs,
-    reward at that timestep and all future timesteps become 0.
     """
-    inp = inp.squeeze(-1)
-    contprob = contprob.squeeze(-1)
+    # Safely handle dimensions
+    if inp.dim() == 3: inp = inp.squeeze(-1)
+    if contprob.dim() == 3: contprob = contprob.squeeze(-1)
 
     B, T = inp.shape
 
     # done mask: True where episode is considered ended
-    done = contprob  >= thresh   # [B, T]
+    done = contprob < thresh   # [B, T]
 
     # cumulative "has ended already" mask
-    ended = torch.cumsum(done.int(), dim=1) > 0   # [B, T], True after first done
-    ended = torch.cat([torch.zeros_like(ended[:,:1]), ended], 1)[:,:-1]
+    ended = torch.cumsum(done.int(), dim=1) > 0   
 
-    # mask rewards
-    out = inp.masked_fill(ended, 0.0)
+    # Create the exact 1.0 / 0.0 mask you want
+    # ~ended is True (1.0) for valid steps, False (0.0) for ended steps
+    mask = (~ended).to(inp.dtype)
 
-    return out
+    # Save the visualization
+    
+    return mask.squeeze(-1)
 
 
 def kl_div(p, q):
@@ -310,12 +294,11 @@ def lambda_returns(reward, contprob, boot,lambda_=0.95, discount=0.997):
     contprob = contprob.squeeze(-1)      # continuation probability in [0,1]
     boot    = boot.squeeze(-1)
     B, T = reward.shape
-
     # Effective discount per step: gamma_t = discount * contprob_t
     
     # Shift value to get V_{t+1}. For last step, bootstrap with V_{T-1} (or provide an explicit boot value)
     rets = [boot[:, -1]]
-    live = (contprob[:, 1:]).float() * discount
+    live = (contprob[:, 1:] > 0.5).float() * discount
     cont = lambda_
     interm = reward[:, 1:] + (1 - cont) * live * boot[:, 1:]
     for t in reversed(range(live.shape[1])):

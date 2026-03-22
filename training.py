@@ -187,13 +187,13 @@ def load_replay(
         buf._global_write_counter = np.int64(1)
 
     return buf
-def simulate(env, num_warmups, num_interaction_episodes,num_agent, ch, h, w, patch , Nr, latent_tokens, z_dim, action_dim, latent_dim, 
+def simulate(env, action_low, action_high, num_warmups, num_interaction_episodes,num_agent, ch, h, w, patch , Nr, latent_tokens, z_dim, action_dim, latent_dim, 
                  rep_depth , rep_d_model, dyn_d_model, num_heads, dropout, k_max, mtp, task_id, symlog_for_value,
                  symlog_for_reward,  kmax_prob, lambda_, buffer,
                  policy_bins , reward_bins , pretrain, reward_clamp,level_vocab , level_embed_dim,mode,num_tasks, Sa,
                  batch_lens, batch_size, accum, max_imag_len, buffer_limit, train, ckpt, rep_lr=1e-4, rep_decay=1e-3,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3 , save_every=500):
-    wandb.init(project="Dreamer4", entity="fguan", name=mode)
+    wandb.init(project="Dreamer4-multiview", entity="fguan", name=mode)
 
     agent = Dreamer4(agent_id=0, ch=ch, h=h,
                 w=w, 
@@ -226,6 +226,8 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agent, ch, h, w, pat
                 accum=accum, 
                 max_imag_len=max_imag_len, 
                 ckpt=ckpt, 
+                action_low = action_low,  
+                action_high = action_high,
                 dyn_lr=dyn_lr,
                 task_id = task_id,
                 rep_lr=rep_lr, 
@@ -272,8 +274,8 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agent, ch, h, w, pat
             train_policy = False#(epi > 900)
   
         elif mode=="policy":
-            train_reward=False
-            train_model =False#(epi > 0) and (epi <= 1200) 
+            train_reward=True
+            train_model =True#(epi > 0) and (epi <= 1200) 
             train_policy = True#(epi > 900)
 
         else:
@@ -303,7 +305,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agent, ch, h, w, pat
                 next_obs_proc = extract_input_and_target(next_observation)                
                 
                 step += 1
-                if step == 200:
+                if step == 500:
                     done = ~done
                     # Accumulate data for this step (Agent 0)
 
@@ -331,7 +333,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agent, ch, h, w, pat
         if mode != "inference" and train and (buffer.full or (mode=="policy" and epi > 5)): # Ensure min buffer size
                 # Note: buffer is passed directly; train_one_epoch handles sampling internally
             log_data = agent.train_step(writer, buffer, model=train_model, policy=train_policy, train_reward=train_reward)
-        wandb.log(data=log_data)
+        wandb.log(data=log_data, step=epi)
         if (epi)%save_every==0:
         # --- Checkpointing ---
             print(">>> Saving Parameters <<<")
@@ -380,13 +382,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mtp", type=int, default=8)
     p.add_argument("--num_tasks", type=int, default=10)
     p.add_argument("--task_id", type=int, default=0)
-    p.add_argument("--eval_context_len", type=int, default=15)
+    p.add_argument("--eval_context_len", type=int, default=16)
     p.add_argument("--buffer", type=str, default="")
+    p.add_argument("--action_high", type=int, default=1)
+    p.add_argument("--action_low", type=int, default=-1)
 
     # Discretization / vocab
     p.add_argument("--policy_bins", type=int, default=101)
     p.add_argument("--reward_bins", type=int, default=101)
-    p.add_argument("--reward_clamp_abs", type=float, default=1.1)
+    p.add_argument("--reward_clamp_abs", type=float, default=10)
     p.add_argument("--level_vocab", type=int, default=129)
     p.add_argument("--level_embed_dim", type=int, default=256)
     p.add_argument("--ckpt", type=str, default=None)
@@ -412,7 +416,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--accum", type=int, default=2)
-    p.add_argument("--max_imag_len", type=int, default=20)
+    p.add_argument("--max_imag_len", type=int, default=30)
     # For memory considerations
 
     # Flags (default True -> allow toggling off with --no-*)
@@ -465,6 +469,8 @@ def main():
         dyn_d_model=args.dyn_d_model,
         symlog_for_reward=args.symlog_for_reward,
         symlog_for_value=args.symlog_for_value,
+        action_low = args.action_low, 
+        action_high = args.action_high, 
 
         num_heads=args.num_heads,
         dropout=args.dropout,

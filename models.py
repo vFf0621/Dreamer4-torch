@@ -13,17 +13,18 @@ from torchmetrics.image import PeakSignalNoiseRatio
 
 import math
 class Policy(nn.Module):
-    def __init__(self, action_dim: int = 3, latent_dim: int = 128, mtp: int = 8, num_bins: int = 50):
+    def __init__(self, action_dim: int = 3, latent_dim: int = 128, mtp: int = 8, num_bins: int = 50,action_low = -1, action_high=1):
         super().__init__()
         self.action_dim = action_dim
         self.num_bins = num_bins
         self.mtp = mtp
-        
+        self.action_low = action_low
+        self.action_high = action_high
         # Helper for binning math
 
         # 1. Main Network
         # Output size: action_dim * num_bins
-        self.network = build_network(latent_dim, latent_dim*2, 2, "SwiGLU", latent_dim*4)
+        self.network = build_network(latent_dim, latent_dim*2, 2, "SwiGLU", latent_dim*4, )
         
         # BC Head (Multi-Step / MTP)
         # Output: [MTP, ActionDim, Bins]
@@ -42,17 +43,7 @@ class Policy(nn.Module):
             logits: [B, L, A, Bins]
             dist: Categorical Distribution object
         """
-        def unimix_probs(probs: torch.Tensor, unimix: float = 0.01, dim: int = -1):
-            """
-            logits: (..., K)
-            returns mixed probs: (1-unimix)*softmax(logits) + unimix*uniform
-            """
-            if not (0.0 <= unimix <= 1.0):
-                raise ValueError(f"unimix must be in [0,1], got {unimix}")
-
-            K = logits.shape[dim]
-            uniform = torch.full_like(probs, 1.0 / K)
-            return (1.0 - unimix) * probs + unimix * uniform
+   
         B, L, D = posterior.shape
         # Features
         x = self.network(posterior)
@@ -65,21 +56,20 @@ class Policy(nn.Module):
         # [B, L, MTP, A, Bins]
         # prob = unimix_probs(prob)
         # --- 3. Sampling ---
-        if sample:
-            prob = F.gumbel_softmax(logits=logits, tau=1.0, hard=False)
-        else:
-            prob = F.softmax(logits, -1)
-        prob = unimix_probs(prob)
-        dist = td.Independent(td.Categorical(probs=(prob)),2)
+        prob = F.softmax(logits, -1)
+        dist = td.Independent(td.Categorical(probs=(prob)),3)
         # For training stability, we often use expectation or straight-through sampling
-        dist_act =td.Independent(td.Categorical(probs=prob[:,:,0]), 1)
-        idx = dist_act.sample()
-        action = two_hot_inv(logits[:,:,0],self.num_bins, -1.0, 1.0)
+        dist_act =td.Independent(td.Categorical(probs=prob[:,:,0]), 2)
+        idx = dist_act.base_dist.probs.argmax(-1)
+        sample_idx = dist_act.sample()
+        action = two_hot_inv(logits[:,:,0],self.num_bins, self.action_low, self.action_high, temp=1.0)
         # logp of the sampled bins
-        logp =dist_act.log_prob(idx)
-                 # [B,L]        logp = logp.sum(-1) 
+
+        logp = dist_act.log_prob(idx)
         if sample:
-            action = idx_to_value(idx, self.num_bins, -1.0, 1.0)
+            action = idx_to_bin_center(sample_idx, self.num_bins, self.action_low, self.action_high)
+                 # [B,L]        logp = logp.sum(-1) 
+        
         action = action.squeeze(-1)
         return action, logp, dist, dist_act, idx
 
@@ -104,7 +94,6 @@ class GQA(nn.Module):
         self.k_norm = nn.RMSNorm(self.head_dim)
         self.device=device
         self.rope = RoPE1D(self.head_dim)
-        self.dropout = dropout
 
     def forward(self, x, x_k=None, attn_mask=None, key_padding_mask=None):
         B, Tq, D = x.shape
@@ -178,7 +167,7 @@ class GQA(nn.Module):
         out = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=final_bias,
-            dropout_p=self.dropout if self.training else 0.0,
+            dropout_p= 0.0,
             is_causal=False,   # IMPORTANT: we already applied causal bias
             enable_gqa=True,
         )
@@ -448,6 +437,8 @@ class TokenDynamics(nn.Module):
         use_agent_token: bool = True,
         latent_tokens: int = 32,
         device: str = "cuda",
+        action_low: int = -1,
+        action_high: int= 1,
         action_lookup: bool = True,
         Nr: int = 4,
         # behavior toggles
@@ -631,7 +622,7 @@ class TokenDynamics(nn.Module):
             raise ValueError(f"signals has T={signals.size(1)} but z_tokens has T={T}.")
 
         acts_bt = self.align_actions(actions, T, B)          # [B, T-1, A]
-        act_two_hot = two_hot(acts_bt, -1.0, 1.0, self.action_bins).reshape(B, -1, 1, self.action_bins * self.action_dim)                     # [B, T-1, A]
+        act_two_hot = two_hot(acts_bt, self.action_low, self.action_high, self.action_bins).reshape(B, -1, 1, self.action_bins * self.action_dim)                     # [B, T-1, A]
 
                                                     # [B, T-1, D]
         a_emb = self.action_embs(act_two_hot[:, :, :])                                                     # [B, T-1, 1, D]
@@ -705,7 +696,7 @@ class TokenDynamics(nn.Module):
 
 
 class Dreamer4(nn.Module):
-    def __init__(self,agent_id, ch=3, h=96, w=96, patch = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512, 
+    def __init__(self,agent_id, action_low, action_high, ch=3, h=96, w=96, patch = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512, 
                  rep_depth = 8, rep_d_model=256, dyn_d_model=256, num_heads=8, dropout=0.1, k_max=8, mtp=8, 
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
@@ -721,14 +712,12 @@ class Dreamer4(nn.Module):
         self.agent_id = agent_id
         self.eval_ctx = eval_context_len
         # --- TokenDynamics --      -
-
+        self.rl_warmups = 100
         self.lambda_=lambda_
         self.decoder = Decoder(img_channels=ch, w = w, h=h, patch=patch, z_dim=z_dim, d_model=rep_d_model, n_heads=num_heads,
                                depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len)
-       # self.canonical_decoder = Decoder(img_channels=ch, w = w, h=h, patch=patch, z_dim=z_dim, d_model=rep_d_model, n_heads=num_heads,
-        #                       depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
-        #self.canonical_decoder1 = Decoder(img_channels=ch, w = w, h=h, patch=patch, z_dim=z_dim, d_model=rep_d_model, n_heads=num_heads,
-         #                      depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
+        self.canonical_decoder = Decoder(img_channels=ch, w = w, h=h, patch=patch, z_dim=z_dim, d_model=rep_d_model, n_heads=num_heads,
+                               depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
 
         self.imagination_steps = max_imag_len - 1
         self.rminv = -reward_clamp
@@ -740,6 +729,8 @@ class Dreamer4(nn.Module):
         self.grad_accum = accum       
         self.batch_size = batch_size
         self.action_dim=action_dim
+        self.action_low = action_low,
+        self.action_high = action_high
         self.shortcut_kmax = k_max
         self.sym_rew = symlog_for_reward
         self.pi_hard_update = 100
@@ -749,8 +740,8 @@ class Dreamer4(nn.Module):
         self.policy_num_bins = policy_bins
         self.bin_num = reward_bins
         self.steps = 0
-        self.policy = Policy(action_dim=action_dim, latent_dim=dyn_d_model, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
-        self.t_policy = Policy(action_dim=action_dim, latent_dim=dyn_d_model, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
+        self.policy = Policy(action_low = action_low,action_high = action_high,action_dim=action_dim, latent_dim=dyn_d_model, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
+        self.t_policy = Policy(action_low = action_low,action_high = action_high, action_dim=action_dim, latent_dim=dyn_d_model, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
         self.reward = Reward(bin_num=self.bin_num, latent_dim=dyn_d_model, mtp=self.aux_horizon, r_max=reward_clamp, sym=self.sym_rew)
         self.train_policy = False
         self.value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp,sym= self.sym_val)
@@ -767,6 +758,8 @@ class Dreamer4(nn.Module):
             level_vocab=level_vocab,
             level_dim=level_embed_dim,
             dropout=dropout,
+            action_low = action_low,
+            action_high = action_high.
             n_heads=num_heads,
             action_dim =action_dim,
             d_model=dyn_d_model,
@@ -799,6 +792,8 @@ class Dreamer4(nn.Module):
 
         self.dyn_optim = torch.optim.AdamW(            
             [{'params': self.policy.parameters()}, 
+            {'params': self.t_policy.parameters()}, 
+
             {'params': self.reward.parameters()}, 
             {'params': self.transformer.parameters()}, ],
 
@@ -806,15 +801,10 @@ class Dreamer4(nn.Module):
         with torch.no_grad():
             self.t_policy.load_state_dict(self.policy.state_dict(), )
 
-        self.policy_optim= torch.optim.AdamW([
-            {'params': self.policy.parameters()}, 
+        self.value_optim= torch.optim.AdamW([
             {'params': self.value.parameters()},
-            ],eps = 1e-5, lr=policy_lr, capturable=True,weight_decay=policy_decay)
+            ], lr=policy_lr, capturable=True,weight_decay=policy_decay)
    
-        self.reward_optim = torch.optim.AdamW(
-            [{'params': self.reward.parameters()}, 
-            {'params': self.t_policy.parameters()},], eps = 1e-5,
-         lr=policy_lr, capturable=True, weight_decay=dyn_decay)
 
         self.to(self.device)
 
@@ -918,7 +908,7 @@ class Dreamer4(nn.Module):
             # 5. Build Signals and Forward Transformer
             N = int(getattr(self, "shortcut_kmax", 64))
             sigs = self.make_signals_indices(B, T, Nz, tau_idx=N, k_idx=0)
-
+            z_tv=self.mix_tau_ctx(z_tv)
             # NOTE: passing z_tv since your policy is currently trained strictly on topview latents
             z_pred, h = self.transformer(z_tv, self.action_buffer, signals=sigs)
 
@@ -1289,15 +1279,14 @@ class Dreamer4(nn.Module):
                     kl = torch.zeros((a.size(0), 1, 1), device=device)
                 else:
                     # Policy Sampling
-                    a, log_p, _, base_p, idx = self.policy(h_last, sample=True)
+                    a, log_p, base_p, _, idx = self.policy(h_last, sample=True)
                     a_list.append(a)
-                    lp_list.append(log_p)
+                    lp_list.append(log_p.unsqueeze(1))
                     # Compute KL divergence for auxiliary loss
                     with torch.no_grad():
-                        _, log_q,_ , base_q, _ = self.t_policy(h_last)
+                        _, log_q,base_q, _, _ = self.t_policy(h_last)
                     kl_step = td.kl_divergence(base_p, base_q)
-                    kl = kl_step
-
+                    kl = kl_step.unsqueeze(1)
                 kl_list.append(kl)
 
                 # Accumulate actions
@@ -1330,8 +1319,8 @@ class Dreamer4(nn.Module):
         Auxiliary Loss:
         Predict NEXT K steps for both Action and Reward.
         Target at step t:
-        - Actions: a_{t+1}, ..., a_{t+K}
-        - Rewards: r_{t+1}, ..., r_{t+K}
+        - Actions: a_t, ..., a_{t+K-1}
+        - Rewards: r_t, ..., r_{t+K-1}
         """
 
         B, T_feat, D = feat.shape
@@ -1359,7 +1348,6 @@ class Dreamer4(nn.Module):
             raise ValueError(f"actions shape unexpected: {tuple(actions.shape)}")
 
         # If user accidentally passed [B, Da, T], fix it.
-        # We assume action_dim is the last dim in the correct layout.
         action_dim = getattr(self, "action_dim", actions_.size(-1))
         if actions_.size(-1) != action_dim and actions_.size(1) == action_dim:
             actions_ = actions_.transpose(1, 2).contiguous()  # [B, T, Da]
@@ -1368,136 +1356,132 @@ class Dreamer4(nn.Module):
         T_r = rewards_1d.size(1)
 
         # -----------------------
-        # Useable length (targets are shifted by +1)
+        # Useable length: Now covering the ENTIRE sequence (no -1 limits)
         # -----------------------
-        L_use = min(T_feat, T_a - 1, T_r - 1)
+        L_use = min(T_feat, T_a, T_r)
         L_use = max(0, L_use)
 
         feat = feat[:, :L_use]
 
         # ======================================================================
-        # ACTION HEAD (Predict a_{t+1..t+K})
+        # ACTION HEAD
         # ======================================================================
-        a_t = actions_[:, :]            # [B, T_a-1, Da]
-        T_ap1 = T_a - 1
-
+        a_t = actions_[:, :]            # [B, T_a, Da]
         req_len_a = L_use + K - 1
-        pad_len_a = max(0, req_len_a - T_ap1)
+        
+        # Calculate padding needed to ensure the window can slide to the end
+        pad_len_a = max(0, req_len_a - T_a)
         if pad_len_a > 0:
             a_padded = F.pad(a_t, (0, 0, 0, pad_len_a), mode="constant", value=0.0)
         else:
             a_padded = a_t
 
-        a_win = a_padded.unfold(dimension=1, size=K, step=1)   # usually [B, Lp, K, Da]
+        # PyTorch unfold on dim 1 always creates [B, Windows, Da, K]
+        a_win = a_padded.unfold(dimension=1, size=K, step=1)   
         a_tgt = a_win[:, :L_use].contiguous()
 
         # Forward
         out = self.policy(feat) if not t_policy else self.t_policy(feat)
         _, _, dist, _, _ = out
-        logits_bc = dist.base_dist.logits[:, :L_use]                      # [B, L_use, K_pred, Da, bins]
+        logits_bc = dist.base_dist.logits[:, :L_use]            # [B, L_use, K_pred, Da, bins]
 
         # Align horizons
         K_pred = logits_bc.shape[2]
         K_use = min(K, K_pred)
-        logits_bc = logits_bc[:, :, :K_use]                     # [B, L, K_use, Da, bins]
-        
+        logits_bc = logits_bc[:, :, :K_use]                     
+
         # ======================================================================
         # PREPARE TERMINATION TARGETS & DONE MASK
         # ======================================================================
-        t_tp1 = termination[:, :]         # [B, T_r-1]
-        T_tp1 = T_r - 1
-
+        t_tp1 = termination[:, :]         # [B, T_r]
         req_len_t = L_use + K - 1
-        pad_len_t = max(0, req_len_t - T_tp1)
+        pad_len_t = max(0, req_len_t - T_r)
+        
         if pad_len_t > 0:
             t_padded = F.pad(t_tp1, (0, pad_len_t), mode="constant", value=0.0)
         else:
             t_padded = t_tp1
 
-        t_win = t_padded.unfold(dimension=1, size=K, step=1)      # [B, Lp, K]
-        t_tgt = t_win[:, :L_use].contiguous()[:, :, :K_use]       # [B, L, K_use]
+        t_win = t_padded.unfold(dimension=1, size=K, step=1)      # [B, L_use, K]
+        t_tgt = t_win[:, :L_use].contiguous()[:, :, :K_use]       # [B, L_use, K_use]
 
         # Create done_mask: True for everything up to and including the first 'done'.
-        # Using .float() ensures cumsum works safely even if termination is a boolean tensor.
-        done_mask = (torch.cumsum(t_tgt.float(), dim=-1) - t_tgt.float()) <= 0  # [B, L, K_use]
+        done_mask = (torch.cumsum(t_tgt.float(), dim=-1) - t_tgt.float()) <= 0  
 
-        # ---- FIX: ensure a_tgt is [B, L, K_use, Da] ----
-        # Some codepaths / layouts can yield [B, L, Da, K]. Detect and swap.
-        if a_tgt.dim() != 4:
-            raise RuntimeError(f"a_tgt must be 4D [B,L,K,Da], got {a_tgt.shape}")
-
-        if a_tgt.shape[2] == logits_bc.shape[3] and a_tgt.shape[3] == logits_bc.shape[2]:
-            # a_tgt is [B, L, Da, K] -> [B, L, K, Da]
-            a_tgt = a_tgt.permute(0, 1, 3, 2).contiguous()
-
-        # Now slice to K_use
+        # ======================================================================
+        # FIX TARGET SHAPES & MASKS
+        # ======================================================================
+        # Permute from [B, L_use, Da, K] -> [B, L_use, K, Da] 
+        a_tgt = a_tgt.permute(0, 1, 3, 2).contiguous()
         a_tgt = a_tgt[:, :, :K_use]
 
-        # Mask: valid if (t + k) < T_ap1 AND we are not past a done flag
+        # Valid Index Mask: Ensure the target isn't pulling from the padded zero zone
         t_idx = torch.arange(L_use, device=device).view(1, L_use, 1)
         k_idx = torch.arange(K_use, device=device).view(1, 1, K_use)
         
-        a_mask = (t_idx + k_idx) <= T_ap1 + 1                         # [1, L, K_use]
+        # FIX: Strict less-than T_a prevents the off-by-one padding leak
+        a_mask = (t_idx + k_idx) < T_a                                # [1, L, K_use]
         a_mask = a_mask & done_mask                                   # [B, L, K_use]
 
         raw_act_loss = soft_ce(
-            logits_bc,              # [B, L, K_use, Da, bins]
-            a_tgt,                  # [B, L, K_use, Da]
+            logits_bc,              
+            a_tgt,                  
             self.policy_num_bins,
-            -1.0, 1.0,
-        ).mean([-2,-1])  # usually [B, L, K_use, Da] (or sometimes reduced)
+            self.policy.action_low,self.policy.action_high,
+        ).mean([-2,-1])  
         
-        a_mask_exp = a_mask.expand_as(raw_act_loss)                   # [B, L, K_use]
+        a_mask_exp = a_mask.expand_as(raw_act_loss)                   
         act_loss = (raw_act_loss * a_mask_exp).sum() / (a_mask_exp.sum() + 1e-6)
 
         # ======================================================================
-        # REWARD HEAD (Predict r_{t+1..t+K})
+        # REWARD HEAD
         # ======================================================================
-        r_tp1 = rewards_1d[:, :]         # [B, T_r-1]
-        T_rp1 = T_r - 1
-
+        r_tp1 = rewards_1d[:, :]         
         req_len_r = L_use + K - 1
-        pad_len_r = max(0, req_len_r - T_rp1)
+        pad_len_r = max(0, req_len_r - T_r)
+        
         if pad_len_r > 0:
             r_padded = F.pad(r_tp1, (0, pad_len_r), mode="constant", value=0.0)
         else:
             r_padded = r_tp1
 
-        r_win = r_padded.unfold(dimension=1, size=K, step=1)      # [B, Lp, K]
-        r_tgt = r_win[:, :L_use].contiguous()[:, :, :K_use]       # [B, L, K_use]
-        r_mask = (t_idx + k_idx) <= T_rp1 + 1                        # [1, L, K_use]
-        r_mask = r_mask & done_mask                                  # [B, L, K_use]
+        r_win = r_padded.unfold(dimension=1, size=K, step=1)      
+        r_tgt = r_win[:, :L_use].contiguous()[:, :, :K_use]       
+        
+        r_mask = (t_idx + k_idx) < T_r                               # [1, L, K_use]
+        r_mask = r_mask & done_mask                                  
 
         rew_pred, _, rew_logits, term_dist = self.reward(feat)
-        rew_logits = rew_logits[:, :L_use, :K_use]                # [B, L, K_use, bins]
+        rew_logits = rew_logits[:, :L_use, :K_use]                
+        
         raw_rew_loss = soft_ce(
             rew_logits,
             r_tgt,
             self.reward_bins,
             self.rminv, self.rmaxv, self.sym_rew
-        ).mean([-1]) # typically [B, L, K_use]
+        ).mean([-1]) 
 
         r_mask_exp = r_mask.expand_as(raw_rew_loss)
         rew_loss = (raw_rew_loss * r_mask_exp).sum() / (r_mask_exp.sum() + 1e-6)
+
         # ======================================================================
-        # Termination HEAD (Predict r_{t+1..t+K})
+        # Termination HEAD 
         # ======================================================================
         term_logits = term_dist.logits
-        term_logits = term_logits[:, :L_use, :K_use]                # [B, L, K_use, bins]
+        term_logits = term_logits[:, :L_use, :K_use]                
 
         term_loss = F.binary_cross_entropy_with_logits(
             term_logits,
-            t_tgt.float(), # Target expects float for BCE
+            t_tgt.float(), 
             reduction='none'
-        ) # typically [B, L, K_use]
+        ) 
         
-        t_mask = r_mask.clone() # re-uses the boundary + done mask computed in Reward Head
+        t_mask = r_mask.clone() 
         t_mask_exp = t_mask.expand_as(term_loss)
 
         term_loss = (t_mask_exp * term_loss).sum() / (t_mask_exp.sum() + 1e-6)
 
         return act_loss, rew_loss, term_loss
-
 
     def unfreeze_agent_token(self):
     
@@ -1519,10 +1503,9 @@ class Dreamer4(nn.Module):
         self.steps += 1
         k = buffer.rng.integers(self.batch_lengths[0], self.batch_lengths[1])
         self.rep_optim.zero_grad()
-        self.reward_optim.zero_grad()
         self.dyn_optim.zero_grad()
 
-        self.policy_optim.zero_grad(set_to_none=True)
+        self.value_optim.zero_grad(set_to_none=True)
         for i in tqdm(range(self.grad_accum)):
             s = buffer.sample_seq(self.batch_size, k)
 
@@ -1569,7 +1552,7 @@ class Dreamer4(nn.Module):
                 lp_  = (self.lpips(reconst, states))
                 reconst_loss =(mse_ + 0.2* lp_.mean() ) #+ reconst_loss
 
-                (reconst_loss).backward()
+                (reconst_loss/self.grad_accum).backward()
 
                 encoder_gn = adaptive_grad_clip(self.encoder, 0.3)
                 decoder_gn = adaptive_grad_clip(self.decoder, 0.3)
@@ -1580,7 +1563,7 @@ class Dreamer4(nn.Module):
 
                     (self.rep_optim).step()
                     self.rep_optim.zero_grad()
-            if model:
+            if model or policy:
                     
                     # Create the full trajectory first
                     # shape: (Batch, Sequence_Length + 1, ...)
@@ -1596,7 +1579,7 @@ class Dreamer4(nn.Module):
                 kl = kl_loss.detach().item()
                 dyn_loss = kl_loss 
 
-                if train_reward:
+                if train_reward or policy:
                     pass
                 else:                        # Scale the loss before backward
                     (dyn_loss/self.grad_accum).backward()
@@ -1607,7 +1590,8 @@ class Dreamer4(nn.Module):
                 if i == self.grad_accum-1 and not train_reward:
                     (self.dyn_optim).step()
                     self.dyn_optim.zero_grad()
-            if train_reward:
+        
+            if train_reward or policy:
                 clean_latents = self.encoder(states)[0].detach()
                 B, T, Nz, _ = clean_latents.shape
                 
@@ -1617,15 +1601,14 @@ class Dreamer4(nn.Module):
                 N = self.shortcut_kmax
                 h_with_grad = self.transformer(noised, actions[:,:-1], signals=self.make_signals_indices(B, noised.size(1), 1, N, 0),)[1]
             
-                action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:], termination.float())
+                action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:], termination.float(), policy)
                                                 
              
                 ac_loss =  0.1*(action_loss+reward_loss+term_loss) + 5 *  dyn_loss
-
-                (ac_loss.mean()/self.grad_accum).backward()
-                reward_policy_model_gn = adaptive_grad_clip(self, 0.3)
-                if i == self.grad_accum-1:
-                    
+                if not policy:
+                    (ac_loss.mean()/self.grad_accum).backward()
+                if i == self.grad_accum-1 and not policy:
+                    model_gn = adaptive_grad_clip(self, 0.3)
                     self.dyn_optim.step()
                     self.dyn_optim.zero_grad()
 
@@ -1643,84 +1626,80 @@ class Dreamer4(nn.Module):
                     z_0 = initial_latent[:,:].detach()
                     
                     imag_z, h_t, lp, kl_prior, imagined_actions = self.latent_imagination(
-                                z_0, actions[:, :], num_iter=H) 
-                    self.decode_and_save(imag_z, "imagined") 
+                                z_0, actions[:, :], num_iter=self.imagination_steps) 
                     mixed_z = self.mix_tau_ctx(z_0)
                     N = self.shortcut_kmax
 
-                    h_wo_grad = self.transformer(mixed_z, actions[:,:-1], 
-                                                        signals=self.make_signals_indices(B, T, 1, N, 0)
-                                                        )[1]
-            
-                    action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_wo_grad[:,:], actions[:,:], reward[:,:], termination.float(), t_policy=True)
+              
                     disc= self.disc
 
                     with torch.no_grad():
                                                                      
-                        r_full, _, _, termination = self.reward(h_t[:, :])
-                        r_seq = concat_mtp(r_full[:,:],self.aux_horizon)  
-                        term_probs = termination.probs
-                        term_probs = concat_mtp(term_probs, self.aux_horizon)
+                        r_full, _, _, term = self.reward(h_t[:, :])
+                        r_seq = r_full[:,:]
+                        term_probs = term.probs
+                        term_probs = (term_probs[:,:,0])
                         cont_state =1-(term_probs).float()   
-                        r_seq = mask_after_done(r_seq[...,0], (cont_state < 0.5) ) 
+                        r_seq = (r_seq[...,0] ) 
                         cont_t = cont_state[:, :]         
-                        cont_t = mask_after_done(cont_t, cont_t < 0.5)
-                        r_rp, _, _, term_rp = self.reward(h_wo_grad[:, :])
-                        V_rp = self.value(h_wo_grad[:,:])[0] 
-                        cont_rp = (1-term_rp.probs[:,:])
+                        cont_t = mask_after_done(cont_t, cont_t)
+                        r_rp, term_rp = reward, termination
+                        V_rp = self.value(h_with_grad[:,:])[0] 
+                        cont_rp = (1-term_rp[:,:])
 
-                        cont_rp = concat_mtp(cont_rp, self.aux_horizon)
-                        r_rp = concat_mtp(r_rp, self.aux_horizon)
+                        cont_rp = mask_after_done(cont_rp, cont_rp)
 
                         V_full = self.value(h_t[:,:])[0] 
-                        r_rp_seq = mask_after_done(r_rp[...,0], (cont_rp < 0.5) ) 
+                        r_rp_seq = (r_rp) 
 
                         bs = lambda_returns(r_seq[:,:], cont_t[:,:],  lambda_=self.lambda_, discount=self.disc, boot=V_full[:, :]).squeeze(-1) 
                         rp_targ = lambda_returns(r_rp_seq, cont_rp,  lambda_=self.lambda_, discount=self.disc, boot=V_rp[:, :]).squeeze(-1) 
-                        weight_rp = torch.cumprod(disc * (cont_rp > 0.5), 1) /disc 
-                        weight_rp = mask_after_done(weight_rp, (cont_rp < 0.5) )[:,:-1]
+                        weight_rp = torch.cumprod(disc * (cont_rp[:,:-1] > 0.5), 1) /disc 
                     rp_targ=torch.cat([rp_targ, 0 * rp_targ[:, -1:]], 1)
 
-                    V_rp_pred = self.value(h_wo_grad[:,:])[1] 
+                    V_rp_pred = self.value(h_with_grad[:,:].detach())[1] 
                     rploss = (soft_ce(V_rp_pred,rp_targ , self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0] * weight_rp).mean()
-                    weight = torch.cumprod(disc * (cont_t[:,:] > 0.5), 1) /disc 
-                    weight = mask_after_done(weight, (cont_state < 0.5) )[:,:-1]
-                    adv = (bs - self.value(h_t[:,:-1])[0].squeeze(-1).detach()) * weight                    
+                    weight = torch.cumprod(disc * (cont_t[:,:] > 0.5), 1)/disc 
+                    
+                    adv = (bs - self.value(h_t[:,:-1])[0].squeeze(-1).detach()) * weight[:,:-1]                    
                     V_pred = self.value(h_t[:,:].detach())[1]
                     bs_padded=torch.cat([bs, 0 * bs[:, -1:]], 1)
                     V_targ = self.t_value(h_t)[0].detach()
-                    value_loss = (weight* soft_ce(V_pred[:,:], V_targ, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
-                    valud_loss = value_loss + (weight * soft_ce(V_pred, bs_padded, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
+                    value_loss = (weight[:,:-1] * soft_ce(V_pred[:,:], V_targ, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
+                    value_loss = value_loss + (weight[:,:-1]  * soft_ce(V_pred, bs_padded, self.reward_bins, self.rminv, self.rmaxv, self.sym_val)[:,:-1, 0]).mean()
                     value_loss = value_loss + rploss
-                    lp_t = lp[:,:-1]
+
+                    lp_t = mask_after_done(cont_t, cont_t) * lp
+
                     base = torch.ones_like(adv)
+                    _,_,_,p,_ = self.policy(h_with_grad.detach())
+                    with torch.no_grad():
+                        _,_,_, q,_ = self.t_policy(h_with_grad)
+                    kl = td.kl_divergence(p, q).mean()
+                    pos = -(((adv>=0) * lp_t[:,:-1])*weight[:,:-1]).sum() / (base[adv >= 0]).sum().clamp(min=1)
 
-
-                    pos = -((adv>=0) * lp_t*weight).sum() / (base[adv >= 0]).sum().clamp(min=1)
-                    neg =  ((adv<0) * lp_t*weight).sum()/ (base[adv < 0]).sum().clamp(min=1)
-                    actor_loss = 0.5*(pos + neg).mean()+ 0.3*((weight*kl_prior[:,:-1]).mean())
-
-                    ((actor_loss + value_loss +action_loss.mean()+ reward_loss+term_loss)/self.grad_accum).backward()
-                    model_gn =adaptive_grad_clip(self, 0.3)
+                    neg =  (((adv<0) * lp_t[:,:-1])*weight[:,:-1]).sum()/ (base[adv < 0]).sum().clamp(min=1)
+                    actor_loss = 0.5*(pos + neg).mean()+ 0.3*((kl))
+                    ((actor_loss + value_loss +ac_loss.mean())/self.grad_accum).backward()
                     if i==self.grad_accum - 1:
-                        (self.policy_optim).step()
-                        self.reward_optim.step()
+                        model_gn =adaptive_grad_clip(self, 0.3)
+                        self.dyn_optim.step()
+
+                        (self.value_optim).step()
                         self.soft_update(self.t_value, self.value)
 
         if model:   
             logger["model_gn"] = model_gn 
-            logger["shortcut_loss"] = kl
+            logger["shortcut_loss"] = dyn_loss.item()
             logger["psnr"] = psnr.item()
         if train_reward:
             logger["finetune_bc_loss"] = action_loss.mean().detach().item()
             logger["reward_loss"] = reward_loss.detach().item()
             logger["termination_loss"] = term_loss.mean().detach().item()
+            logger["model_gn"] = model_gn
 
-            logger["reward_policy_gn"] = reward_policy_model_gn
-        elif policy:
+        if policy:
             logger["value_loss"] = value_loss.detach().item()
-            logger["finetune_bc_loss"] = action_loss.mean().detach().item()
-            logger["reward_loss"] = reward_loss.detach().item()
             logger["kl_prior"]= kl_prior.mean().detach().item()
             logger["r_min"]= r_seq.min().detach().item()
             logger["r_max"]= r_seq.max().detach().item()
@@ -1729,8 +1708,8 @@ class Dreamer4(nn.Module):
             logger["rollout_mean"]= bs.mean().detach().item()
             logger["rollout_max"]= bs.max().detach().item()
             logger["rollout_min"]= bs.min().detach().item()
-            logger["model_gn"] = model_gn
-            logger["actor_loss"] = actor_loss.detach().item()
+            if not isinstance(actor_loss, float):
+                logger["actor_loss"] = actor_loss.detach().item()
         elif not model and not train_reward and not policy:
             logger["reconst"] = reconst_loss.detach().item()
             logger["encoder_gn"] = encoder_gn 
@@ -1741,7 +1720,7 @@ class Dreamer4(nn.Module):
         return logger
 
 class Reward(nn.Module):
-    def __init__(self, bin_num: int, latent_dim: int, mtp: int = 1,r_max: float = 6, sym=False):
+    def __init__(self, bin_num: int, latent_dim: int, mtp: int = 1,r_max: float = 6, sym=False,binary=True):
         super().__init__()
         self.mtp = int(mtp)
         self.bin_num = int(bin_num)
@@ -1761,14 +1740,13 @@ class Reward(nn.Module):
             nn.Linear(latent_dim, self.mtp),
         )
         self.sym=sym
-
     def forward(self, x: torch.Tensor):
         B, L, _ = x.shape
         h = self.network(x)  
 
         r_logits_all = self.reward_head(h).view(B, L, self.mtp, self.bin_num)  
         r_logits_1 = r_logits_all[:, :, 0]                                     
-        r_mean = two_hot_inv(r_logits_all, self.bin_num, -self.r_max, self.r_max, self.sym)                                       
+        r_mean = two_hot_inv(r_logits_1, self.bin_num, -self.r_max, self.r_max, self.sym)                                       
 
         term_logits = self.term_head(h)                                        
         term_logits = term_logits.squeeze(-1)                              
