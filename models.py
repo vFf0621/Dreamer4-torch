@@ -1554,12 +1554,12 @@ class Dreamer4(nn.Module):
 
                 (reconst_loss/self.grad_accum).backward()
 
-                encoder_gn = adaptive_grad_clip(self.encoder, 0.3)
-                decoder_gn = adaptive_grad_clip(self.decoder, 0.3)
               #  decoder1_gn = adaptive_grad_clip(self.canonical_decoder, 0.3)
              #   decoder2_gn = adaptive_grad_clip(self.canonical_decoder1, 0.3)
 
                 if i == self.grad_accum-1:
+                    encoder_gn = adaptive_grad_clip(self.encoder, 0.3)
+                    decoder_gn = adaptive_grad_clip(self.decoder, 0.3)
 
                     (self.rep_optim).step()
                     self.rep_optim.zero_grad()
