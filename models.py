@@ -398,7 +398,7 @@ class Encoder(nn.Module):
             pre = self.readout(x)                                   # (B,T,L,Dz)
             ztok = torch.tanh(pre)
             return ztok
-        z=torch.tanh(_forward(self.latent_tok))
+        z=(_forward(self.latent_tok))
         return z, z
 
 class TokenDynamics(nn.Module):
