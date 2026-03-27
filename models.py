@@ -65,7 +65,7 @@ class Policy(nn.Module):
         action = two_hot_inv(logits[:,:,0],self.num_bins, self.action_low, self.action_high, temp=1.0)
         # logp of the sampled bins
 
-        logp = dist_act.log_prob(idx)
+        logp = dist_act.log_prob(sample_idx)
         if sample:
             action = idx_to_bin_center(sample_idx, self.num_bins, self.action_low, self.action_high)
                  # [B,L]        logp = logp.sum(-1) 
