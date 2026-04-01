@@ -407,7 +407,7 @@ class Encoder(nn.Module):
                 if mask:
                     N = proj.size(2)
                     n = torch.rand(1).item() * 0.9
-                    num_keep = max(1, int(N * (1-n))
+                    num_keep = max(1, int(N * (1-n)))
                     noise = torch.rand(B, T, N, device=proj.device)
                     ids_keep = noise.argsort(dim=2)[:, :, :num_keep]
                     proj = proj.gather(2, ids_keep.unsqueeze(-1).expand(-1, -1, -1, proj.size(-1)))
