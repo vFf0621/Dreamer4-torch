@@ -281,7 +281,7 @@ class CausalSTBlock(nn.Module):
                 raise ValueError(f"mask has shape {mask.shape}, expected ({N},{N}) or ({Ncat},{Ncat})")
            
         xs = self.space_attn(
-            x_space,n
+            x_space,
             attn_mask=final_mask,          # additive float mask (0 / -inf)
             key_padding_mask=space_kpm,    # True = PAD keys
         )[:, :N]  # drop reserved outputs
@@ -407,7 +407,7 @@ class Encoder(nn.Module):
                 if mask:
                     N = proj.size(2)
                     n = torch.rand(1).item() * 0.9
-                    num_keep = max(1, int(N * ))
+                    num_keep = max(1, int(N * n))
                     noise = torch.rand(B, T, N, device=proj.device)
                     ids_keep = noise.argsort(dim=2)[:, :, :num_keep]
                     proj = proj.gather(2, ids_keep.unsqueeze(-1).expand(-1, -1, -1, proj.size(-1)))
