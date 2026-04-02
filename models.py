@@ -333,118 +333,134 @@ class Encoder(nn.Module):
         time_every: int = 2,
         cnn: bool = False,
         dropout: float = 0.05,
-        out_dim: int = 16,     # Dz
+        out_dim: int = 16,
         max_T: int = 256,
-        pool: str = "first",   # "mean" or "first"
+        pool: str = "first",
+        masking_ratio: float = 0.9,
+        view_dropout: float = 0.45,
     ):
         super().__init__()
         assert (h % patch == 0) and (w % patch == 0)
         assert pool in ("mean", "first")
- 
+
         self.pool = pool
         self.z_dim = out_dim
         self.patch = patch
         self.latent_tokens = latent_tokens
         self.d_model = d_model
- 
-        # Calculate grid size (6x6 = 36 patches for 96x96 input)
+        self.masking_ratio = masking_ratio
+        self.view_dropout = view_dropout
+
         grid = (h // patch, w // patch)
         self.num_patches = grid[0] * grid[1]
         self.cnn = cnn
         if self.cnn:
             self.cnn_stem = CNNStem(img_channels=img_channels, d_model=d_model, patch=patch)
         else:
-            # FIX 1: Use full patch dimension (C * p * p) instead of just p
             patch_dim = img_channels * patch * patch
             self.patch_proj = nn.Sequential(nn.RMSNorm(patch_dim), nn.Linear(patch_dim, d_model))
- 
+
         self.latent_tok = nn.Parameter(torch.randn(1, 1, latent_tokens, d_model) * 0.02)
-        self.topview_latent_tok = nn.Parameter(torch.randn(1, 1, latent_tokens, d_model) * 0.02)
- 
+        self.t_latent_tok = nn.Parameter(torch.randn(1, 1, latent_tokens, d_model) * 0.02)
+
         self.drop = nn.Dropout(dropout)
- 
+
+        # Positional embedding — baked into patches before masking
+
+        # Learned mask token — lives in encoder
+        self.mask_token = nn.Parameter(torch.randn(1, 1, 1, d_model) * 0.02)
+
+        # Learned drop token — replaces all patches of a dropped view during view dropout
+
         blocks = []
         for i in range(depth):
             use_time = ((i + 1) % time_every == 0)
             blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time))
         self.blocks = nn.ModuleList(blocks)
- 
+
         self.space_mask = None
         self.ln_out = nn.RMSNorm(d_model)
         self.readout = nn.Sequential(nn.Linear(d_model, out_dim), nn.RMSNorm(out_dim))
- 
-    def forward(self, frames: torch.Tensor, mask=False) -> torch.Tensor:
-    
-        def _forward(z, frames):
-            B, T, C, H, W = frames.shape
+
+    def _patchify(self, frames):
+        B, T, C, H, W = frames.shape
+        if self.cnn:
+            x = frames.view(B * T, C, H, W)
+            proj = self.cnn_stem(x, B, T)
+        else:
+            p = self.patch
+            x = frames.view(B * T, C, H, W)
+            patches = F.unfold(x, kernel_size=p, stride=p)
+            patches = patches.transpose(1, 2).contiguous()
+            patches = patches.view(B, T, self.num_patches, -1)
+            proj = self.patch_proj(patches)
+        return proj
+
+    def _apply_mask(self, proj):
+        """Replace masked positions with learned mask token. Sequence length unchanged."""
+        B, T, N, D = proj.shape
+        num_masked = int(self.masking_ratio * N * torch.rand(1).item())
+
+        noise = torch.rand(B, T, N, device=proj.device)
+        ids_shuffle = noise.argsort(dim=2)
+        ids_masked = ids_shuffle[:, :, :num_masked]
+
+        # Binary mask: 1 = keep, 0 = replace with mask token
+        keep_mask = torch.ones(B, T, N, device=proj.device)
+        keep_mask.scatter_(2, ids_masked, 0.0)
+        keep_mask = keep_mask.unsqueeze(-1)  # (B, T, N, 1)
+
+        mask_tokens = self.mask_token.expand(B, T, N, -1)
+        proj = proj * keep_mask + mask_tokens * (1 - keep_mask)
+
+        return proj, ids_masked
+
+    def forward(self, frames1, mask=False):
+        B, T, C, H, W = frames1.shape
+
+        # frames1 = states      = random view (always available)
+        # frames2 = targ_states = fixed view (dropped at eval, z1 corresponds to this)
+
+        # Project random view (always present)
+        proj = self._patchify(frames1) 
+
+        def _forward(z, proj):
             
-            # CNN stem outputs (B, T, 36, d_model) for 96x96
-            if self.cnn:
-                x = frames.view(B * T, C, H, W)
-                proj = self.cnn_stem(x, B, T)
-                current_num_patches = proj.size(2) # Dynamically get 36
- 
-                # ---- Latents ----
- 
-                lat = z.expand(B, T, -1, -1).contiguous()
- 
-                if mask:
-                    N = proj.size(2)
-                    num_keep = max(1, int(N * 0.05))  # 95% masking ratio
-                    noise = torch.rand(B, T, N, device=proj.device)
-                    ids_keep = noise.argsort(dim=2)[:, :, :num_keep]
-                    proj = proj.gather(2, ids_keep.unsqueeze(-1).expand(-1, -1, -1, proj.size(-1)))
-                    current_num_patches = num_keep
-            
-            else:
-                p = self.patch
-                assert H % p == 0 and W % p == 0, (H, W, p)
-                x = frames.view(B * T, C, H, W)                         # (B*T,C,H,W)
-                patches = F.unfold(x, kernel_size=p, stride=p)          # (B*T, C*p*p, Np)
-                patches = patches.transpose(1, 2).contiguous()          # (B*T, Np, patch_dim)
-                patches = patches.view(B, T, self.num_patches, -1)      # (B,T,Np,patch_dim)
-                proj = self.patch_proj(patches)                         # (B,T,Np,D)
-                if mask:
-                    N = proj.size(2)
-                    n = torch.rand(1).item() * 0.9
-                    num_keep = max(1, int(N * (1-n)))
-                    noise = torch.rand(B, T, N, device=proj.device)
-                    ids_keep = noise.argsort(dim=2)[:, :, :num_keep]
-                    proj = proj.gather(2, ids_keep.unsqueeze(-1).expand(-1, -1, -1, proj.size(-1)))
-                # FIX 2: Define current_num_patches and lat in non-CNN branch
-                current_num_patches = proj.size(2)
-                lat = z.expand(B, T, -1, -1).contiguous()
- 
-            # FIX: Check if cached mask matches CURRENT dimensions
+            if mask and self.training:
+                proj, ids_masked1 = self._apply_mask(proj)
+
+            # --- View dropout: randomly drop frames2 (fixed/target view) during training ---
+            # Teaches z1 to work when the fixed view is absent at eval time.
+
+            # Sequence length is always constant — no rebuilding space_mask needed
+            current_num_patches = proj.size(2)
+            lat = z.expand(B, T, -1, -1).contiguous()
+
             if self.space_mask is None or self.space_mask.shape[0] != (self.latent_tokens + current_num_patches):
                 self.space_mask = modality_mask(
                     L=self.latent_tokens,
                     modality_sizes=[current_num_patches],
-                    device=frames.device
+                    device=frames1.device
                 )
             space_mask = self.space_mask
-            
-            # ---- Token sequence ----
-            x = torch.cat([lat, proj], dim=2)           # (B, T, S, D)
+
+            x = torch.cat([lat, proj], dim=2)
             x = self.drop(x)
- 
+
             for blk in self.blocks:
                 if blk.time_attn_enabled:
                     x = blk(x, mask=None)
                 else:
                     x = blk(x, mask=space_mask)
- 
-            x = self.ln_out(x[:, :, :self.latent_tokens])           # keep only latents
-            pre = self.readout(x)                                   # (B,T,L,Dz)
-            ztok = torch.tanh(pre)
-            return ztok
- 
-        # Process standard and topview latents
-        z = _forward(self.latent_tok, frames)
-        z_tilde = _forward(self.topview_latent_tok, frames)
-        
-        return z_tilde, z
- 
+
+            x = self.ln_out(x[:, :, :self.latent_tokens])
+            pre = self.readout(x)
+            z = torch.tanh(pre)
+            return z
+
+        return _forward(self.t_latent_tok, proj), _forward(self.latent_tok, proj)
+
+
 
 
 class Dynamics(nn.Module):
@@ -893,7 +909,7 @@ class Dreamer4(nn.Module):
                 self.state_buffer = self.state_buffer[:, -self.eval_ctx:]
 
             # 3. Encode State Context (Get BOTH latents)
-            z_tv, z_ego = self.encoder(self.state_buffer)
+            z_tv, _ = self.encoder(self.state_buffer)
             B, T, Nz, _ = z_tv.shape
 
             # --- VISUALIZATION BLOCK ---
@@ -967,9 +983,8 @@ class Dreamer4(nn.Module):
 
         with torch.no_grad():
             z_tv, z = self.encoder(s)
-            self.decode_and_save(z, 'reconst_orig')
 
-            self.decode_and_save(z_tv, 'reconst')
+            self.decode_and_save(z_tv,'reconst', z1=z)
 
             z = self.latent_imagination(z_tv[:,:].clone(), a[:,:], num_iter=a.size(1) - 1, eval_=False,random=False, forced=True)[0]
             self.decode_and_save(z, "single_frame")
@@ -978,8 +993,15 @@ class Dreamer4(nn.Module):
         return
     
 
-    def decode_and_save(self, z_in, name):
+    def decode_and_save(self, z_in, name, z1=None):
             view1 = self.decoder(z_in)
+            if z1 is not None:
+                view2 = self.decoder(z1)
+
+                view2 = view2.detach().cpu().numpy()
+                #view2 = view2.detach().cpu().numpy()
+                save_frames(view2, f"{name}_orig_view1")
+
             #view2 = self.canonical_decoder1(z_in)
 
             view1 = view1.detach().cpu().numpy()
@@ -1565,28 +1587,25 @@ class Dreamer4(nn.Module):
               #  self.canonical_decoder.train()
                # self.canonical_decoder1.train()
 
-                z_t, z   = self.encoder(states,mask=True)
-                reconst_1= self.decode(z)
+                z_t ,z  = self.encoder(states,mask=True)
+                reconst_1 = self.decoder(z)
 
-                reconst = self.decode(z_t)
-                reconst_1 = 2 * reconst_1 - 1
+                reconst = self.decoder(z_t)
                 targ_states = 2 * targ_states - 1
                 reconst = 2 * reconst - 1
                 states = 2 * states - 1
-
-                mse1 = F.mse_loss(reconst_1, states, reduction="mean")
-                lp1  = (self.lpips(reconst_1, states)).mean()
+                reconst_1 = reconst_1 * 2 - 1
                 mse_ = F.mse_loss(reconst, targ_states, reduction="mean")
                 lp_  = (self.lpips(reconst, targ_states)).mean()
                 psnr_tv = self.psnr(reconst, targ_states)
-                psnr = self.psnr(reconst_1, states)
-                loss_topview = mse_ + 0.2*lp_
 
-                if self.steps <= 20000:
-                    loss_orig =(mse1 + 0.2* lp1 ) #+ reconst_loss
-                else:
-                    loss_orig=0.
-                reconst_loss = loss_topview + loss_orig
+                loss_topview = mse_ + 0.2*lp_
+                mse = F.mse_loss(reconst_1, states, reduction="mean")
+                lp = (self.lpips(reconst_1, states)).mean()
+                loss_orig = mse + 0.2 * lp
+                psnr = self.psnr(reconst_1, states)
+
+                reconst_loss = loss_topview + 3 * loss_orig
                 (reconst_loss/self.grad_accum).backward()
 
               #  decoder1_gn = adaptive_grad_clip(self.canonical_decoder, 0.3)
@@ -1595,6 +1614,7 @@ class Dreamer4(nn.Module):
                 if i == self.grad_accum-1:
                     encoder_gn = adaptive_grad_clip(self.encoder, 0.3)
                     decoder_gn = adaptive_grad_clip(self.decoder, 0.3)
+                    decoder1_gn = adaptive_grad_clip(self.decoder, 0.3)
 
                     (self.rep_optim).step()
                     self.rep_optim.zero_grad()
@@ -1607,7 +1627,7 @@ class Dreamer4(nn.Module):
 
                         # Apply mask and encode once
                         # This ensures s_{t+1} has the same embedding whether it's looked at as "current" or "next"
-                z_t = self.encoder(full_sequence, )[0].detach()
+                z_t,_ = self.encoder(full_sequence, ).detach()
                         # Split into current and next steps
                 self.freeze_agent_token()
                 kl_loss, psnr = self.shortcut_forcing( z_t, actions)
@@ -1627,7 +1647,7 @@ class Dreamer4(nn.Module):
                     self.dyn_optim.zero_grad()
         
             if train_reward or policy:
-                clean_latents = self.encoder(states)[0].detach()
+                clean_latents,_ = self.encoder(states).detach()
                 B, T, Nz, _ = clean_latents.shape
                 
                 noised = self.mix_tau_ctx(clean_latents) 
@@ -1658,12 +1678,12 @@ class Dreamer4(nn.Module):
                     rollout_states = s[0]
                     rollout_states = torch.from_numpy(rollout_states).to(self.device).float()
 
-                    initial_latent = self.encoder(states[:, :])[0]
+                    initial_latent, _ = self.encoder(states[:, :])
                     B, T, Nz, _ = initial_latent.shape
 
                     H = torch.randint(low=self.batch_lengths[0],high=self.horizon_length, size=(1,))[0].item()
                     z_0 = initial_latent[:,:].detach()
-                    rollout_z = self.encoder(rollout_states)[0]
+                    rollout_z ,_= self.encoder(rollout_states)
                     imag_z, h_t, lp, imagined_actions = self.latent_imagination(
                                 rollout_z[:,:1], actions[:, :0], num_iter=self.imagination_steps) 
                     mixed_z = self.mix_tau_ctx(z_0)
@@ -1754,6 +1774,8 @@ class Dreamer4(nn.Module):
             logger["reconst"] = reconst_loss.detach().item()
             logger["encoder_gn"] = encoder_gn 
             logger["decoder_gn"] = decoder_gn 
+            logger["decoder1_gn"] = decoder1_gn 
+
             logger["psnr_tv"] = psnr_tv.item()
             logger["psnr"] = psnr.item()
 
