@@ -909,19 +909,19 @@ class Dreamer4(nn.Module):
                 self.state_buffer = self.state_buffer[:, -self.eval_ctx:]
 
             # 3. Encode State Context (Get BOTH latents)
-            _ = self.encoder(self.state_buffer)
-            B, T, Nz, _ = z_tv.shape
+            z_t = self.encoder(self.state_buffer)
+            B, T, Nz, _ = z_t.shape
 
             # --- VISUALIZATION BLOCK ---
             if show_recon:
                 # Isolate the current timestep latents: [B, 1, Nz, Dz]
-                curr_z = z_tv[:, :]
+                curr_z = z_t[:, :]
                # curr_z_ego = z_ego[:, -1:]
                 
                 # Decode topview (canonical decoder outputs 2 views concatenated in channel dim)
                 view1 = self.decoder(curr_z)[:,-1:
                 ]     # [B, 1, C*2, H, W]
-              #  view2 = self.canonical_decoder1(curr_z_tv)     # [B, 1, C*2, H, W]
+              #  view2 = self.canonical_decoder1(curr_z_t)     # [B, 1, C*2, H, W]
                 
                 # Decode ego view (standard decoder)
                 #ego_view = self.decoder(curr_z_ego)                 # [B, 1, C, H, W]
@@ -955,7 +955,7 @@ class Dreamer4(nn.Module):
             # 4. Initialize or Align Action Buffer
             A = int(getattr(self, "action_dim", 2))
             if self.action_buffer is None:
-                self.action_buffer = torch.zeros((B, 0, A), device=device, dtype=z_tv.dtype)
+                self.action_buffer = torch.zeros((B, 0, A), device=device, dtype=z_t.dtype)
             
             # Enforce Action Context Length (Ta == T - 1)
             target_action_len = max(0, T - 1)
@@ -965,8 +965,8 @@ class Dreamer4(nn.Module):
             # 5. Build Signals and Forward Transformer
             N = int(getattr(self, "shortcut_kmax", 64))
             sigs = self.make_signals_indices(B, T, Nz, tau_idx=N, k_idx=0)
-            z_tv=self.mix_tau_ctx(z_tv)
-            # NOTE: passing z_tv since your policy is currently trained strictly on topview latents
+            z_t=self.mix_tau_ctx(z_t)
+            # NOTE: passing z_t since your policy is currently trained strictly on topview latents
             z_pred, h = self.transformer(self.action_buffer, signals=sigs)
 
             # 6. Policy Prediction
@@ -984,11 +984,11 @@ class Dreamer4(nn.Module):
         with torch.no_grad():
             z = self.encoder(s)
 
-            self.decode_and_save(z_tv,'reconst', z1=z)
+            self.decode_and_save(z_t,'reconst', z1=z)
 
-            z = self.latent_imagination(z_tv[:,:].clone(), a[:,:], num_iter=a.size(1) - 1, eval_=False,random=False, forced=True)[0]
+            z = self.latent_imagination(z_t[:,:].clone(), a[:,:], num_iter=a.size(1) - 1, eval_=False,random=False, forced=True)[0]
             self.decode_and_save(z, "single_frame")
-            z_eval = self.latent_imagination(z_tv[:,:].clone(), a[:], num_iter=a.size(1) - 1, eval_=False,random=True, forced=False)[0]
+            z_eval = self.latent_imagination(z_t[:,:].clone(), a[:], num_iter=a.size(1) - 1, eval_=False,random=True, forced=False)[0]
             self.decode_and_save(z_eval, 'random')
         return
     
