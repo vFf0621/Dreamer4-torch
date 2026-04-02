@@ -909,7 +909,7 @@ class Dreamer4(nn.Module):
                 self.state_buffer = self.state_buffer[:, -self.eval_ctx:]
 
             # 3. Encode State Context (Get BOTH latents)
-            z_tv, _ = self.encoder(self.state_buffer)
+            _ = self.encoder(self.state_buffer)
             B, T, Nz, _ = z_tv.shape
 
             # --- VISUALIZATION BLOCK ---
@@ -967,7 +967,7 @@ class Dreamer4(nn.Module):
             sigs = self.make_signals_indices(B, T, Nz, tau_idx=N, k_idx=0)
             z_tv=self.mix_tau_ctx(z_tv)
             # NOTE: passing z_tv since your policy is currently trained strictly on topview latents
-            z_pred, h = self.transformer(z_tv, self.action_buffer, signals=sigs)
+            z_pred, h = self.transformer(self.action_buffer, signals=sigs)
 
             # 6. Policy Prediction
             a, *_ = self.policy(h[:, -1:], sample=False)
@@ -982,7 +982,7 @@ class Dreamer4(nn.Module):
         a = torch.from_numpy(a).to(self.device).float()
 
         with torch.no_grad():
-            z_tv, z = self.encoder(s)
+            z = self.encoder(s)
 
             self.decode_and_save(z_tv,'reconst', z1=z)
 
@@ -1587,8 +1587,7 @@ class Dreamer4(nn.Module):
               #  self.canonical_decoder.train()
                # self.canonical_decoder1.train()
 
-                z_t ,z  = self.encoder(states,mask=True)
-                reconst_1 = self.decoder(z)
+                z_t  = self.encoder(states,mask=True)
 
                 reconst = self.decoder(z_t)
                 targ_states = 2 * targ_states - 1
@@ -1599,13 +1598,9 @@ class Dreamer4(nn.Module):
                 lp_  = (self.lpips(reconst, targ_states)).mean()
                 psnr_tv = self.psnr(reconst, targ_states)
 
-                loss_topview = mse_ + 0.2*lp_
-                mse = F.mse_loss(reconst_1, states, reduction="mean")
-                lp = (self.lpips(reconst_1, states)).mean()
-                loss_orig = mse + 0.2 * lp
-                psnr = self.psnr(reconst_1, states)
-
-                reconst_loss = loss_topview + 3 * loss_orig
+            
+                reconst_loss = mse_ + 0.2*lp_
+                
                 (reconst_loss/self.grad_accum).backward()
 
               #  decoder1_gn = adaptive_grad_clip(self.canonical_decoder, 0.3)
@@ -1777,7 +1772,6 @@ class Dreamer4(nn.Module):
             logger["decoder1_gn"] = decoder1_gn 
 
             logger["psnr_tv"] = psnr_tv.item()
-            logger["psnr"] = psnr.item()
 
          #   logger["decoder1_gn"] = decoder1_gn 
           #  logger["decoder2_gn"] = decoder2_gn 
