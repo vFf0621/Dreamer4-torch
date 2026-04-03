@@ -938,7 +938,7 @@ class Dreamer4(nn.Module):
 
             # 5. Build Signals and Forward Transformer
             N = int(getattr(self, "shortcut_kmax", 64))
-            sigs = self.make_signals_indices(B, T, Nz, tau_idx=N, k_idx=0)
+            sigs = self.make_signals_indices(B, T, Nz, tau_idx=N-1, k_idx=0)
             z_tv=self.mix_tau_ctx(z_tv)
             # NOTE: passing z_tv since your policy is currently trained strictly on topview latents
             z_pred, h = self.transformer(z_tv, self.action_buffer, signals=sigs)
@@ -1034,7 +1034,7 @@ class Dreamer4(nn.Module):
         assert actions.size(1) == z_prev.size(1)
         tau_lut = torch.arange(N + 1, device=device, dtype=torch.float32) / float(N)
         tau_lut[-1] = tau_max
-        # context is "cleanest" (tau_idx=N)
+        # context is "cleanest" (tau_idx=N-1)
         tau_ctx = torch.full((B, T, 1), N, device=device, dtype=torch.long)
         k_ctx = torch.zeros_like(tau_ctx)
 
@@ -1251,7 +1251,7 @@ class Dreamer4(nn.Module):
                     z_last, policy_feat = self.transformer(
                             z_act, 
                             actions[:,:i], 
-                            signals=self.make_signals_indices(B,z_act.size(1), 1, N, 0), 
+                            signals=self.make_signals_indices(B,z_act.size(1), 1, N-1, 0), 
                             task_id=self.task_id,
                             detach_agent=False
                         )
@@ -1270,7 +1270,7 @@ class Dreamer4(nn.Module):
                         _, policy_feat = self.transformer(
                             z_act, 
                             a_exec[:,:], 
-                            signals=self.make_signals_indices(B,z_act.size(1), 1, N, 0), 
+                            signals=self.make_signals_indices(B,z_act.size(1), 1, N-1, 0), 
                             task_id=self.task_id,
                             detach_agent=True
                         )
@@ -1291,7 +1291,7 @@ class Dreamer4(nn.Module):
                     _, policy_feat = self.transformer(
                         z_inp, 
                         curr_actions, 
-                        signals=self.make_signals_indices(B, T_curr, 1, N, 0), 
+                        signals=self.make_signals_indices(B, T_curr, 1, N-1, 0), 
                         detach_agent=detach,
                         task_id=self.task_id
                     )
@@ -1618,7 +1618,7 @@ class Dreamer4(nn.Module):
                 
                 self.unfreeze_agent_token()
                 N = self.shortcut_kmax
-                h_with_grad = self.transformer(noised, actions[:,:-1], signals=self.make_signals_indices(B, noised.size(1), 1, N, 0),)[1]
+                h_with_grad = self.transformer(noised, actions[:,:-1], signals=self.make_signals_indices(B, noised.size(1), 1, N-1, 0),)[1]
             
                 action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:], termination.float(), policy)
                                                 
