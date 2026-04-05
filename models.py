@@ -929,7 +929,7 @@ class Dreamer4(nn.Module):
                 packed, actions[:,:], sigs, detach_agent=False, task_id=self.task_id
             )[0][:, -1:]
 
-            v = x1_hat
+            v = (x1_hat - z)/max(1e-5, 1.0 - tau)
             z = z + v * d_tau
         return z.clamp(-1, 1) if clamp else z
 
