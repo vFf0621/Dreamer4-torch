@@ -77,8 +77,35 @@ def init_weights(m):
         if m.bias is not None:
             init.zeros_(m.bias)
             
+class FiLM(nn.Module):
+    def __init__(self, cond_dim: int, feature_dim: int):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.SiLU(), # Standard practice to process the raw condition slightly
+            nn.Linear(cond_dim, 2 * feature_dim)
+        )
+        # CRITICAL: Initialize to identity (gamma=0, beta=0) 
+        # so it doesn't scramble your latent tokens at initialization.
+        nn.init.zeros_(self.proj[-1].weight)
+        nn.init.zeros_(self.proj[-1].bias)
 
-def build_network(input_size, hidden_size, num_layers, activation, output_size, rms=True):
+    def forward(self, features: torch.Tensor, context: torch.Tensor):
+        """
+        features: [B, T, L, D] (Your latent tokens)
+        context:  [B, T, C]    (Your conditioning vector, e.g., camera poses)
+        """
+        # 1. Project context to gamma and beta
+        film_params = self.proj(context)            # [B, T, 2D]
+        gamma, beta = film_params.chunk(2, dim=-1)  # [B, T, D] each
+        
+        # 2. Expand dimensions to broadcast over the L latent tokens
+        gamma = gamma.unsqueeze(-2)                 # [B, T, 1, D]
+        beta = beta.unsqueeze(-2)                   # [B, T, 1, D]
+        
+        # 3. Apply modulation (1 + gamma provides a stable residual connection)
+        return features * (1.0 + gamma) + beta
+        
+def build_network(input_size, hidden_size, num_layers, activation, output_size, dropout=0.0):
 
     layers = []
     in_dim = input_size

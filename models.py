@@ -8,7 +8,6 @@ from typing import Optional, Dict, Any
 import cv2
 from collections import deque
 import numpy as np
-from torch.cuda.amp import autocast, GradScaler
 from torchmetrics.image import PeakSignalNoiseRatio
 
 import math
@@ -72,7 +71,6 @@ class Policy(nn.Module):
         
         action = action.squeeze(-1)
         return action, logp, dist, dist_act, idx
-
 class GQA(nn.Module):
     def __init__(self, embed_dim=16, num_heads=8, dropout=0.1, causal=False,device="cuda"):
         super().__init__()
@@ -94,6 +92,7 @@ class GQA(nn.Module):
         self.k_norm = nn.RMSNorm(self.head_dim)
         self.device=device
         self.rope = RoPE1D(self.head_dim)
+        self.dropout = dropout
 
     def forward(self, x, x_k=None, attn_mask=None, key_padding_mask=None):
         B, Tq, D = x.shape
@@ -167,7 +166,7 @@ class GQA(nn.Module):
         out = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=final_bias,
-            dropout_p= 0.0,
+            dropout_p=self.dropout if self.training else 0.0,
             is_causal=False,   # IMPORTANT: we already applied causal bias
             enable_gqa=True,
         )
@@ -289,135 +288,80 @@ class CausalSTBlock(nn.Module):
         x = x + xs.reshape(B, T, N, D)
         x = x + self.mlp(x)
         return x.squeeze(2) if x.shape[2] == 1 else x
-
-class CNNStem(nn.Module):
-    """
-    Total stride == 16 (matches patch size).
-    On 96x96 inputs, this outputs a 6x6 spatial grid = 36 tokens.
-    """
-    def __init__(self, img_channels: int = 3, d_model: int = 256, patch: int = 16):
-        super().__init__()
-        # For patch=16, we use two stride-4 convolutions
-        self.stem = nn.Sequential(
-            # stride-4 -> 24x24 (assuming 96x96 input)
-            nn.Conv2d(img_channels, 64, kernel_size=4, stride=4, padding=0, bias=False),
-            nn.BatchNorm2d(64),
-            nn.GELU(),
-            # stride-4 -> 6x6 (total stride = 16)
-            nn.Conv2d(64, d_model, kernel_size=4, stride=4, padding=0, bias=False),
-            nn.BatchNorm2d(d_model),
-        )
-        self.norm = nn.RMSNorm(d_model)
-
-    def forward(self, x: torch.Tensor, B: int, T: int) -> torch.Tensor:
-        feat = self.stem(x)                          # (B*T, d_model, 6, 6)
-        BT, D, Hf, Wf = feat.shape
-        tokens = feat.flatten(2).transpose(1, 2)     # (B*T, 36, d_model)
-        tokens = self.norm(tokens)
-        return tokens.view(B, T, Hf * Wf, D)         # (B, T, 36, d_model)
-
-
 class Encoder(nn.Module):
     def __init__(
         self,
         img_channels: int = 3,
-        h: int = 96,
-        w: int = 96,
+        h:int = 96,
+        w:int = 96,
         patch: int = 16,
         d_model: int = 256,
         n_heads: int = 8,
-        pose_freqs: int = 10,
         depth: int = 6,
-        pose_dim: int = 7,
         latent_tokens: int = 64,
         time_every: int = 2,
-        cnn: bool = False,
         dropout: float = 0.05,
         out_dim: int = 16,     # Dz
         max_T: int = 256,
-        pool: str = "first",   # "mean" or "first"
+        num_reserved = 4,
+        pool: str = "first",      # "mean" or "first"
     ):
         super().__init__()
         assert (h % patch == 0) and (w % patch == 0)
         assert pool in ("mean", "first")
-
         self.pool = pool
         self.z_dim = out_dim
         self.patch = patch
         self.latent_tokens = latent_tokens
         self.d_model = d_model
-
-        # Calculate grid size (6x6 = 36 patches for 96x96 input)
-        grid = (h // patch, w // patch)
+        grid = (h // patch, w//patch)
         self.num_patches = grid[0] * grid[1]
-        self.cnn = cnn
-        patch_dim = patch**2 * img_channels
+        N = self.num_patches + latent_tokens
+        patch_dim = img_channels * patch * patch
         self.patch_proj = nn.Sequential(nn.RMSNorm(patch_dim), nn.Linear(patch_dim, d_model))
-
         self.latent_tok = nn.Parameter(torch.randn(1, 1, latent_tokens, d_model) * 0.02)
-        self.topview_latent_tok = nn.Parameter(torch.randn(1, 1, latent_tokens, d_model) * 0.02)
-
         self.drop = nn.Dropout(dropout)
-
+        self.reserved = nn.Parameter(torch.randn(1, 1, num_reserved, d_model) * 0.02)
+        self.num_reserved=num_reserved
         blocks = []
         for i in range(depth):
-            use_time = ((i + 1) % time_every == 0)
+            use_time = ((i+1) % time_every == 0)
             blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time))
         self.blocks = nn.ModuleList(blocks)
 
-        self.space_mask = None
         self.ln_out = nn.RMSNorm(d_model)
-        self.readout = nn.Sequential(nn.Linear(d_model, out_dim), nn.RMSNorm(out_dim))
+        self.readout = nn.Linear(d_model, out_dim)
 
-    def forward(self, frames: torch.Tensor, mask=False) -> torch.Tensor:
-    
-        def _forward(z, frames):
-            B, T, C, H, W = frames.shape
-            
-            # CNN stem outputs (B, T, 36, d_model) for 96x96
- 
-            if mask:
-                frames = apply_random_patch_mask(frames, max_mask_ratio=0.9*torch.rand(1)[0].item(), patch_size=self.patch)[0]
-            B, T, C, H, W = frames.shape
-            p = self.patch
-            assert H % p == 0 and W % p == 0, (H, W, p)
-            #if poses.ndim == 4:
-            x = frames.view(B * T, C, H, W)                         # (B*T,C,H,W)
-            patches = F.unfold(x, kernel_size=p, stride=p)          # (B*T, C*p*p, Np)
-            patches = patches.transpose(1, 2).contiguous()          # (B*T, Np, patch_dim)
-            patches = patches.view(B, T, self.num_patches, -1)      # (B,T,Np,patch_dim)
-            proj = self.patch_proj(patches)                         # (B,T,Np,D)
+    def forward(self, frames: torch.Tensor, return_tokens= True) -> torch.Tensor:
+        B, T, C, H, W = frames.shape
+        p = self.patch
+        assert H % p == 0 and W % p == 0, (H, W, p)
 
-            current_num_patches = proj.size(2)
-            # FIX: Check if cached mask matches CURRENT dimensions
-            if self.space_mask is None or self.space_mask.shape[0] != (self.latent_tokens + current_num_patches):
-                self.space_mask = modality_mask(
-                    L=self.latent_tokens,
-                    modality_sizes=[current_num_patches],
-                    device=frames.device
-                )
-            space_mask = self.space_mask
-            z = z.expand(B,T,-1,-1)
-            # ---- Token sequence ----
-            x = torch.cat([z, proj], dim=2)           # (B, T, S, D)
-            x = self.drop(x)
-
-            for blk in self.blocks:
-                if blk.time_attn_enabled:
-                    x = blk(x, mask=None)
-                else:
-                    x = blk(x, mask=space_mask)
-
-            x = self.ln_out(x[:, :, :self.latent_tokens])           # keep only latents
-            pre = self.readout(x)                                   # (B,T,L,Dz)
-            ztok = torch.tanh(pre)
-            return ztok
-
-        # Process standard and topview latents
-        z = _forward(self.latent_tok, frames)
-        z_tilde = _forward(self.topview_latent_tok, frames)
+        x = frames.reshape(B * T, C, H, W)                                   # (B*T,C,H,W)
+        patches = F.unfold(x, kernel_size=p, stride=p)                       # (B*T, C*p*p, Np)
+        patches = patches.transpose(1, 2).contiguous()                       # (B*T, Np, patch_dim)
+        patches = patches.view(B, T, self.num_patches, -1)                   # (B,T,Np,patch_dim)
+        space_mask = modality_mask(
+            L=self.latent_tokens,
+            modality_sizes=[self.num_patches, self.num_reserved],
+            device=frames.device
+        ) 
         
-        return z_tilde, z
+        proj = self.patch_proj(patches)                             # (B,T,Np,D)
+        lat = self.latent_tok.view(1, 1, self.latent_tokens, self.d_model).expand(B, T, -1, -1) 
+        x = torch.cat([lat, proj, self.reserved.expand(B,T,-1,self.d_model)], dim=2)                     # (B,T,S,D) with S=L+Np      
+
+        x = self.drop(x)
+        for blk in self.blocks:
+            if blk.time_attn_enabled:
+                x = blk(x, mask=None,)          # no space mask here
+            else:
+                x = blk(x, mask=space_mask)    # modality mask only here
+        x = self.ln_out(x[:,:,:self.latent_tokens])  
+
+        pre = (self.readout(x))
+        ztok = torch.tanh(pre)   # [B,T,Np,Dz]
+        return ztok
 
 class Dynamics(nn.Module):
     """
@@ -714,65 +658,60 @@ class Dynamics(nn.Module):
         return z_pred, policy_feat
 
 
+
 class Dreamer4(nn.Module):
-    def __init__(self,agent_id, action_low, action_high, ch=3, h=96, w=96, patch = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512, 
-                rep_temporal=True, cnn=False, rep_depth = 8, rep_d_model=256, dyn_d_model=256, num_heads=8, dropout=0.1, k_max=8, mtp=8, 
+    def __init__(self,agent_id, ch=3, h=96, w=96, patch = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512, 
+                 rep_depth = 8, rep_d_model=256, dyn_d_model=256, num_heads=8, dropout=0.1, k_max=8, mtp=8, action_low = -1, action_high = 1,
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
-                 dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=False, symlog_for_value=False, 
+                 dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=True, symlog_for_value=True,
                 kmax_prob=0.1):
         super(Dreamer4, self).__init__()
         self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patch, d_model=rep_d_model,
-                                n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=rep_depth +1 if not rep_temporal else rep_depth//2,
-                                out_dim=z_dim, dropout=dropout, max_T=max_imag_len, cnn=cnn)
+                                n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=2,
+                                out_dim=z_dim, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
         self.ema = 0.98
         self.device="cuda" if torch.cuda.is_available() else "cpu"
         self.pretrain = False
         self.agent_id = agent_id
         self.eval_ctx = eval_context_len
-        # --- Dynamics --      -
-        self.rl_warmups = 100
+        # --- TokenDynamics --      -
+        # level_vocab, step_vocab match
+        self.sym_rew = symlog_for_reward
+
         self.lambda_=lambda_
         self.decoder = Decoder(img_channels=ch, w = w, h=h, patch=patch, z_dim=z_dim, d_model=rep_d_model, n_heads=num_heads,
-                               depth=rep_depth, latent_tokens=latent_tokens, time_every=rep_depth +1 if not rep_temporal else rep_depth//2, dropout=dropout, max_T=max_imag_len)
-
+                               depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
         self.imagination_steps = max_imag_len - 1
         self.rminv = -reward_clamp
         self.rmaxv = reward_clamp
         self.reward_bins = reward_bins
         self.task_id = task_id
+        self.sym_val = symlog_for_value
         self.batch_lengths= batch_lens
         self.horizon_length = max_imag_len
         self.grad_accum = accum       
         self.batch_size = batch_size
-        self.action_dim=action_dim
         self.action_low = action_low
         self.action_high = action_high
+        self.action_dim=action_dim
         self.shortcut_kmax = k_max
-        self.sym_rew = symlog_for_reward
-        self.pi_hard_update = 100
-        self.sym_val = symlog_for_value
         self.z_buffer = None
         self.aux_horizon = mtp+1
         self.policy_num_bins = policy_bins
         self.bin_num = reward_bins
         self.steps = 0
         self.kmax_prob = kmax_prob
-        self.expanding_ratio = 2
         self.disc = 0.997
-        self.psnr = PeakSignalNoiseRatio((-1,1))
-       
+        self.expanding_ratio = 2
+    
         self.policy = Policy(action_low = action_low,action_high = action_high,action_dim=action_dim,hidden_dim = latent_dim,latent_dim=dyn_d_model, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
         self.t_policy = Policy(action_low = action_low,action_high = action_high, action_dim=action_dim, hidden_dim = latent_dim, latent_dim=dyn_d_model, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
         self.reward = Reward(bin_num=self.bin_num, latent_dim=dyn_d_model, mtp=self.aux_horizon, hidden_dim = latent_dim, r_max=reward_clamp, sym=self.sym_rew)
         self.train_policy = False
         self.value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp,sym= self.sym_val)
+        self.t_value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp)
 
-        
-
-        self.tau_ctx = 0.1
-        if ckpt:
-            self.load_state_dict(torch.load(ckpt), strict=False)
         self.transformer = Dynamics(
             device=self.device, 
             Dz = int(z_dim / self.expanding_ratio),
@@ -784,7 +723,7 @@ class Dreamer4(nn.Module):
             action_high = action_high,
             n_heads=num_heads,
             action_dim =action_dim,
-            d_model=dyn_d_model,
+            d_model=256,
             Sa = Sa, 
             Nr = Nr, 
             max_T = max_imag_len,
@@ -792,174 +731,146 @@ class Dreamer4(nn.Module):
             time_every=4,
             latent_tokens=latent_tokens * self.expanding_ratio
         )
+
+      #  self.encoder.load_state_dict(torch.load("enc.pt"))
+        self.psnr = PeakSignalNoiseRatio((-1,1))
+
+       # self.decoder.load_state_dict(torch.load("dec.pt"))
+        self.tau_ctx = 0.1
         self.lpips = LPIPSLoss(reduction="none",)
-        self.rep_optim = torch.optim.AdamW(
-            [{'params': self.encoder.parameters()}, 
-            {'params': self.decoder.parameters()},
+        if ckpt:
+            self.load_state_dict(torch.load(ckpt), strict=False)
 
-            ]
-        , lr=rep_lr, capturable=True, weight_decay=rep_decay)
-        self.reset()
-        with torch.no_grad():
-            self.t_value =Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp,sym= self.sym_val)
-            self.t_value.load_state_dict(self.value.state_dict()) 
 
-        self.dyn_optim = torch.optim.AdamW(            
-            [{'params': self.policy.parameters()}, 
-            {'params': self.t_policy.parameters()}, 
 
-            {'params': self.reward.parameters()}, 
-            {'params': self.transformer.parameters()}, ],
 
-            lr=dyn_lr, capturable=True,weight_decay=dyn_decay)
-        with torch.no_grad():
-            self.t_policy.load_state_dict(self.policy.state_dict(), )
+        self.t_policy.load_state_dict(self.policy.state_dict(), )
+        self.t_value.load_state_dict(self.value.state_dict(), )
 
+        self.reward_optim = torch.optim.AdamW(
+            [{'params': self.reward.parameters()}, 
+            {'params': self.t_policy.parameters()},], eps = 1e-5,
+         lr=policy_lr, capturable=True, weight_decay=dyn_decay)
         self.value_optim= torch.optim.AdamW([
             {'params': self.value.parameters()},
             ], lr=policy_lr, capturable=True,weight_decay=policy_decay)
    
+        self.rep_optim = torch.optim.AdamW(
+            [{'params': self.encoder.parameters()}, 
+            {'params': self.decoder.parameters()},]
+        , lr=rep_lr, capturable=True, weight_decay=rep_decay)
+        self.reset()
+        self.dyn_optim = torch.optim.AdamW(            
+            [{'params': self.policy.parameters()}, 
+            {'params': self.reward.parameters()}, 
+            {'params': self.transformer.parameters()}, ],
+
+            lr=dyn_lr, capturable=True,weight_decay=dyn_decay)
+
+
+        self.policy_optim= torch.optim.AdamW([
+            {'params': self.policy.parameters()}, 
+            {'params': self.value.parameters()},
+            ],eps = 1e-5, lr=policy_lr, capturable=True,weight_decay=policy_decay)
 
         self.to(self.device)
 
     def reset(self):
         self.state_buffer = None
         self.action_buffer = torch.zeros(1, 0, self.action_dim, device=self.device)
-    
-    
-    def hard_update(self, target_net: nn.Module, online_net: nn.Module):
-        """
-        Updates the target network parameters using hard update.
-        """
-        with torch.no_grad():
-            target_net.load_state_dict(online_net.state_dict())
-    def soft_update(self, target_net: nn.Module, online_net: nn.Module):
-        """
-        Updates the target network parameters using an exponential moving average.
-        tau: The soft update coefficient (usually between 0.001 and 0.05).
-        """
-        tau=1-self.ema
-        with torch.no_grad():
-            for target_param, online_param in zip(target_net.parameters(), online_net.parameters()):
-                # target = target + tau * (online - target)
-                # which is mathematically identical to: target = (1-tau)*target + tau*online
-                target_param.data.lerp_(online_param.data, tau)
+
     def mix_tau_ctx(self, src):
         return src*(1-self.tau_ctx) + self.tau_ctx*torch.randn_like(src)
-    def action_step(self, s, show_recon=True):
+    def action_step(self, s):
         """
         One environment step -> one action.
-        Visualizes the agent's internal reconstructions during inference.
+
+        Uses "clean-level" signals for the transformer context.
+        NOTE: whether "clean" is tau_idx=N or tau_idx=N-1 depends on your LUT convention.
+            In your earlier code, tau_lut has length N+1 and uses tau_idx==N as the special max/clean entry.
+            So we use tau_idx=N here.
         """
         with torch.no_grad():
             device = self.device
             s = s.to(device)
-            assert s.max() <= 1
-            # 1. Update State Buffer
+
+            # -----------------------------
+            # init buffers
+            # -----------------------------
             if self.state_buffer is None:
-                self.state_buffer = s.unsqueeze(0).unsqueeze(0) # [B=1, T=1, C, H, W]
+                # [B=1, T=1, ...]
+                self.state_buffer = s.unsqueeze(0).unsqueeze(0)
             else:
-                self.state_buffer = torch.cat([self.state_buffer, s.unsqueeze(0).unsqueeze(0)], dim=1)
-                
-            # 2. Enforce State Context Length (T <= eval_ctx)
-            if self.state_buffer.size(1) > self.eval_ctx:
-                self.state_buffer = self.state_buffer[:, -self.eval_ctx:]
+                self.state_buffer = torch.cat(
+                    [self.state_buffer, s.unsqueeze(0).unsqueeze(0)], dim=1
+                )
 
-            # 3. Encode State Context (Get BOTH latents)
-            z_tv, z_ego = self.encoder(self.state_buffer)
-            B, T, Nz, _ = z_tv.shape
+            # Encode full state context: [B, T, Nz, Dz]
+            z = self.encoder(self.state_buffer)
+            B, T, Nz, _ = z.shape
 
-            # --- VISUALIZATION BLOCK ---
-            if show_recon:
-                # Isolate the current timestep latents: [B, 1, Nz, Dz]
-                curr_z = z_tv[:, :]
-               # curr_z_ego = z_ego[:, -1:]
-                
-                # Decode topview (canonical decoder outputs 2 views concatenated in channel dim)
-                view1 = self.decoder(curr_z)[:,-1:
-                ]     # [B, 1, C*2, H, W]
-              #  view2 = self.canonical_decoder1(curr_z_tv)     # [B, 1, C*2, H, W]
-                
-                # Decode ego view (standard decoder)
-                #ego_view = self.decoder(curr_z_ego)                 # [B, 1, C, H, W]
-                
-                def format_tensor_to_cv2(tensor):
-                    """Converts [B, T, C, H, W] tensor in [0, 1] to cv2 BGR image."""
-                    img = tensor[0, 0].cpu().numpy().transpose(1, 2, 0) # [H, W, C]
-                    img = (img * 255).clip(0, 255).astype(np.uint8)
-                    if img.shape[-1] == 3: # Convert RGB to BGR for OpenCV
-                        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                    return img
-
-                # Format current observation and all reconstructions
-                img_orig = format_tensor_to_cv2(self.state_buffer[:, -1:])
-                #img_ego = format_tensor_to_cv2(ego_view)
-                img_tv1 = format_tensor_to_cv2(view1)
-                #img_tv2 = format_tensor_to_cv2(view2)
-                
-                # Concatenate horizontally: [Ground Truth | Ego Recon | TopView 1 | TopView 2]
-                combined = np.concatenate([img_orig, img_tv1], axis=1)
-                
-                # Scale up the image so it's easy to see on screen (96x96 is very small)
-                scale = 3
-                h, w = combined.shape[:2]
-                combined_large = cv2.resize(combined, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
-                
-                cv2.imshow(f"Agent {self.agent_id} Reconstructions", combined_large)
-                cv2.waitKey(1) # Renders the frame and immediately continues
-            # ---------------------------
-
-            # 4. Initialize or Align Action Buffer
-            A = int(getattr(self, "action_dim", 2))
+            # Make sure action_buffer exists and is correctly aligned:
+            # transformer typically expects actions of length T-1 (transitions) or T depending on your impl.
             if self.action_buffer is None:
-                self.action_buffer = torch.zeros((B, 0, A), device=device, dtype=z_tv.dtype)
-            
-            # Enforce Action Context Length (Ta == T - 1)
-            target_action_len = max(0, T - 1)
-            if self.action_buffer.size(1) > target_action_len:
-                self.action_buffer = self.action_buffer[:, -target_action_len:]
+                # We'll build actions as [B, 0, A] initially, then append one per step.
+                # You MUST know action_dim. If you have it stored, use it; otherwise infer from policy output later.
+                A = int(getattr(self, "action_dim", 2))
+                self.action_buffer = torch.zeros((B, 0, A), device=device, dtype=z.dtype)
 
-            # 5. Build Signals and Forward Transformer
+            # -----------------------------
+            # Signals: clean context
+            # -----------------------------
             N = int(getattr(self, "shortcut_kmax", 64))
+            # If your convention is tau_idx in [0..N] with tau_idx==N being the special "clean/max" entry:
             sigs = self.make_signals_indices(B, T, Nz, tau_idx=N, k_idx=N-1)
-            z_tv=self.mix_tau_ctx(z_tv)
-            # NOTE: passing z_tv since your policy is currently trained strictly on topview latents
-            z_pred, h = self.transformer(z_tv, self.action_buffer, signals=sigs)
 
-            # 6. Policy Prediction
-            a, *_ = self.policy(h[:, -1:], sample=False)
+            # -----------------------------
+            # Optional: small eval noise for robustness
+            # -----------------------------
+            z_in = self.mix_tau_ctx(z) 
+            # -----------------------------
+            # Align actions to context length
+            # -----------------------------
+            # If we have T states in buffer, we have (T-1) actions that lead between them.
+            # So feed at most T-1 actions.
+           # [B, T-1, A]
+            # Forward world model / transformer
+            # Expected signature (based on your earlier code):
+            if self.action_buffer.size(1) == z_in.size(1):
+                self.action_buffer = self.action_buffer[:, 1:]
+ 
+            actions_ctx = self.action_buffer
+            assert actions_ctx.size(1)  == z_in.size(1) -1 
+            z_pred, h = self.transformer(z_in, actions_ctx[:,:], signals=sigs)
 
-            # 7. Append new action for the NEXT step
+            a, *_ = self.policy(h[:, -1:])
+
+            # --- append then re-enforce invariant ---
             self.action_buffer = torch.cat([self.action_buffer, a], dim=1)
 
+            self.state_buffer = self.state_buffer[:,-self.eval_ctx:]
             return a[0, 0].detach().cpu().numpy()
+
+
     def evaluate(self, buffer, steps=4): 
-        s, s1, a , r, d, = buffer.sample_seq( 1, 64)
+        s, a = buffer.sample_seq( 1, 64)[:2]
         s = torch.from_numpy(s).to(self.device).float()
         a = torch.from_numpy(a).to(self.device).float()
-
+        
         with torch.no_grad():
-            z_tv, z = self.encoder(s)
-            self.decode_and_save(z, 'reconst_orig')
-
-            self.decode_and_save(z_tv, 'reconst')
-
-            z = self.latent_imagination(z_tv[:,:].clone(), a[:,:], num_iter=a.size(1) - 1, eval_=False,random=False, forced=True)[0]
-            self.decode_and_save(z, "single_frame")
-            z_eval = self.latent_imagination(z_tv[:,:].clone(), a[:], num_iter=a.size(1) - 1, eval_=False,random=True, forced=False)[0]
+            z = self.encoder(s)
+            z_eval = self.latent_imagination(z[:,:], a[:,:], num_iter=a.size(1) - 1, eval_=False,random=False, forced=True)[0]
+            self.decode_and_save(z_eval, "single_frame")
+            z_eval = self.latent_imagination(z[:,:], a[:], num_iter=a.size(1) - 1, eval_=False,random=True, forced=False)[0]
             self.decode_and_save(z_eval, 'random')
         return
     
 
     def decode_and_save(self, z_in, name):
-            view1 = self.decoder(z_in)
-            #view2 = self.canonical_decoder1(z_in)
-
-            view1 = view1.detach().cpu().numpy()
-            #view2 = view2.detach().cpu().numpy()
-            save_frames(view1, f"{name}_view1")
-            #save_frames(view2, f"{name}_view2")
-
+            decoded = self.decode(z_in).detach().cpu().numpy()
+            for i in range(decoded.shape[1]):
+                cv2.imwrite(f"./eval_imgs/{name}_{i}.png", 255 * decoded[0, i].transpose(1, 2, 0)[..., ::-1])
+                
             return
 
     def make_signals_indices(self, B, T, Nz, tau_idx=0, k_idx=0):
@@ -1018,7 +929,7 @@ class Dreamer4(nn.Module):
         tau_lut = torch.arange(N + 1, device=device, dtype=torch.float32) / float(N)
         tau_lut[-1] = tau_max
         # context is "cleanest" (tau_idx=N)
-        tau_ctx = torch.full((B, T, 1), N-1, device=device, dtype=torch.long)
+        tau_ctx = torch.full((B, T, 1), N, device=device, dtype=torch.long)
         k_ctx = torch.ones_like(tau_ctx) * stride
 
         z = torch.randn((B, 1, Nz, Dz), device=device, dtype=dtype)
@@ -1042,11 +953,11 @@ class Dreamer4(nn.Module):
 
             packed = torch.cat([z_prev, z], dim=1)
 
-            z1_hat = self.transformer(
+            x1_hat = self.transformer(
                 packed, actions[:,:], sigs, detach_agent=False, task_id=self.task_id
             )[0][:, -1:]
 
-            v = (z1_hat - z) / max(1e-5, 1.0 - tau)
+            v = (x1_hat - z) / max(1e-5, 1.0 - tau)
             z = z + v * d_tau
         return z.clamp(-1, 1) if clamp else z
 
@@ -1054,7 +965,7 @@ class Dreamer4(nn.Module):
 
 
         device = z_t.device
-        assert z_t.size(1) == actions.size(1)
+        assert z_t.size(1) == actions.size(1) or (z_t.size(1)-1) == actions.size(1)
 
         if z_t.dim() == 3:
             z_t = z_t.unsqueeze(2)
@@ -1117,7 +1028,7 @@ class Dreamer4(nn.Module):
         # ============================
         # student prediction
         # ============================
-        z1_hat = self.transformer(
+        x1_hat = self.transformer(
             z_targ,
             actions[:, :-1],
             signals=self.make_signals_indices(B, T, 1, tau_idx, k_pow),
@@ -1160,9 +1071,9 @@ class Dreamer4(nn.Module):
         # ============================
         # losses
         # ============================
-        loss_base = F.mse_loss(z1_hat, z1_clean.detach(), reduction="none")
+        loss_base = F.mse_loss(x1_hat, z1_clean.detach(), reduction="none")
 
-        v_student = (z1_hat - z_targ) / (1.0 - tau).clamp(min=1e-5)
+        v_student = (x1_hat - z_targ) / (1.0 - tau).clamp(min=1e-5)
         loss_boot = (1.0 - tau).pow(2) * F.mse_loss(v_student, avg_vel, reduction="none")
         loss_boot = loss_boot * valid_mid
 
@@ -1171,8 +1082,8 @@ class Dreamer4(nn.Module):
         w_tau = (0.9 * tau + 0.1)
 
         loss = (loss * w_tau ).mean()
-        psnr = self.psnr(z1_hat, z_t)
-        return loss, psnr
+
+        return loss, self.psnr(x1_hat, z1_clean.detach())
 
 
     def save_checkpoint(self, name):
@@ -1202,7 +1113,7 @@ class Dreamer4(nn.Module):
             # If actions are provided (Reward training), we use them. 
             # If None (Policy), we start empty.
             a_exec = None
-            h_list, lp_list, a_list = [], [], []
+            kl_list, h_list, lp_list, a_list = [], [], [], []
             z_list =[]
             N = int(getattr(self, "shortcut_kmax", 8)) 
             if not get_feat:
@@ -1211,7 +1122,7 @@ class Dreamer4(nn.Module):
                 z_inp = z_all
 
             a_exec = actions[:,:z_inp.size(1)-1]
-            if not eval_:
+            if not eval_ and not get_feat:
                 z_inp = z_all[:,:1]
                 a_exec = actions[:,:0]
         
@@ -1294,13 +1205,17 @@ class Dreamer4(nn.Module):
                     kl = torch.zeros((a.size(0), 1, 1), device=device)
                 else:
                     # Policy Sampling
-                    a, log_p, base_p, _, idx = self.policy(h_last, sample=True)
+                    a, log_p, _, base_p, idx = self.policy(h_last)
                     a_list.append(a)
-                    lp_list.append(log_p.unsqueeze(1))
+                    lp_list.append(log_p)
                     # Compute KL divergence for auxiliary loss
                     with torch.no_grad():
-                        _, log_q,base_q, _, _ = self.t_policy(h_last)
-            
+                        _, log_q, _, base_q, _ = self.t_policy(h_last)
+                    kl_step = kl_div(base_p.logits, base_q.logits).sum(-1)
+                    kl = kl_step
+
+                kl_list.append(kl)
+
                 # Accumulate actions
                 if a_exec is None: a_exec = a
                 else: a_exec = torch.cat([a_exec, a], dim=1)
@@ -1314,6 +1229,7 @@ class Dreamer4(nn.Module):
 
                 
             h = torch.cat(h_list, dim=1)
+            kl = torch.cat(kl_list, dim=1)
 
             if eval_ and not random:
                 lp = torch.cat(lp_list, dim=1)
@@ -1322,7 +1238,7 @@ class Dreamer4(nn.Module):
                 lp = torch.zeros_like(kl)
                 imagined_actions = actions # Return GT actions in train mode
             # Return relevant slice (exclude initial context from output if desired, or keep all)
-            return z_inp, h, lp, imagined_actions
+            return z_inp, h, lp, kl, imagined_actions
     def decode(self, latents):
         return self.decoder(latents)
     def multistep_aux_losses(self, feat, actions, rewards, termination, t_policy=False):
@@ -1520,8 +1436,7 @@ class Dreamer4(nn.Module):
         for i in tqdm(range(self.grad_accum)):
             s = buffer.sample_seq(self.batch_size, k)
 
-            states, targ_states, actions, reward, termination = s
-            targ_states = torch.from_numpy(targ_states).to(self.device).float()
+            states, actions, reward, termination = s
        
             states = torch.from_numpy(states).to(self.device).float()
             actions = torch.from_numpy(actions).to(self.device).float()
@@ -1534,25 +1449,22 @@ class Dreamer4(nn.Module):
               #  self.canonical_decoder.train()
                # self.canonical_decoder1.train()
 
-                z_t, z   = self.encoder(states,mask=True)
-                reconst_1= self.decode(z)
+                z_t  = self.encoder(states)
+
+                B,T = z_t.shape[:2]
+  
+
 
                 reconst = self.decode(z_t)
-                reconst_1 = 2 * reconst_1 - 1
-                targ_states = 2 * targ_states - 1
                 reconst = 2 * reconst - 1
                 states = 2 * states - 1
 
-                mse1 = F.mse_loss(reconst, targ_states, reduction="mean")
-                lp1  = (self.lpips(reconst, targ_states)).mean()
-                loss_topview = mse1 + 0.2*lp1
-                mse_ = F.mse_loss(reconst_1, states, reduction="mean")
-                lp_  = (self.lpips(reconst_1, states)).mean()
-                loss_orig =(mse_ + 0.2* lp_ ) #+ reconst_loss
-                reconst_loss = loss_topview + loss_orig
-                (reconst_loss/self.grad_accum).backward()
-                psnr=self.psnr(reconst_1,states)
-                psnr_tv= self.psnr(reconst,targ_states)
+                mse = F.mse_loss(reconst, states, reduction="mean")
+                lp = (self.lpips(reconst, states)).mean()
+                reconst_loss = mse+0.2 * lp 
+                total_loss = reconst_loss 
+                (total_loss/self.grad_accum).backward()
+                psnr=self.psnr(reconst,states)
               #  decoder1_gn = adaptive_grad_clip(self.canonical_decoder, 0.3)
              #   decoder2_gn = adaptive_grad_clip(self.canonical_decoder1, 0.3)
 
@@ -1571,13 +1483,13 @@ class Dreamer4(nn.Module):
 
                         # Apply mask and encode once
                         # This ensures s_{t+1} has the same embedding whether it's looked at as "current" or "next"
-                z_t = self.encoder(full_sequence, )[0].detach()
+                z_t = self.encoder(full_sequence, ).detach()
                         # Split into current and next steps
                 self.freeze_agent_token()
                 kl_loss, psnr = self.shortcut_forcing( z_t, actions)
                 kl = kl_loss.detach().item()
                 dyn_loss = kl_loss 
-
+                self.unfreeze_agent_token()
                 if train_reward or policy:
                     pass
                 else:                        # Scale the loss before backward
@@ -1591,7 +1503,7 @@ class Dreamer4(nn.Module):
                     self.dyn_optim.zero_grad()
         
             if train_reward or policy:
-                clean_latents = self.encoder(states)[0].detach()
+                clean_latents = self.encoder(states).detach()
                 B, T, Nz, _ = clean_latents.shape
                 
                 noised = self.mix_tau_ctx(clean_latents) 
@@ -1603,7 +1515,7 @@ class Dreamer4(nn.Module):
                 action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:], termination.float(), policy)
                                                 
              
-                ac_loss =  0.1*(action_loss+reward_loss+term_loss) + 5 *  dyn_loss
+                ac_loss =  0.1*(action_loss+reward_loss+term_loss) + 2 *  dyn_loss
                 if not policy:
                     (ac_loss.mean()/self.grad_accum).backward()
                 if i == self.grad_accum-1 and not policy:
@@ -1619,15 +1531,15 @@ class Dreamer4(nn.Module):
                                         ]): 
                     s = buffer.sample_seq(self.batch_size, 10)
 
-                    rollout_states = s[0]
+                    rollout_states = s[2]
                     rollout_states = torch.from_numpy(rollout_states).to(self.device).float()
 
-                    initial_latent = self.encoder(states[:, :])[0]
+                    initial_latent = self.encoder(states[:, :])
                     B, T, Nz, _ = initial_latent.shape
 
                     H = torch.randint(low=self.batch_lengths[0],high=self.horizon_length, size=(1,))[0].item()
                     z_0 = initial_latent[:,:].detach()
-                    rollout_z = self.encoder(rollout_states)[0]
+                    rollout_z = self.encoder(rollout_states)
                     imag_z, h_t, lp, imagined_actions = self.latent_imagination(
                                 rollout_z[:,:1], actions[:, :0], num_iter=self.imagination_steps) 
                     mixed_z = self.mix_tau_ctx(z_0)
@@ -1719,10 +1631,6 @@ class Dreamer4(nn.Module):
             logger["encoder_gn"] = encoder_gn 
             logger["decoder_gn"] = decoder_gn 
             logger["psnr"] = psnr.item()
-            logger["psnr_tv"] = psnr_tv.item()
-
-         #   logger["decoder1_gn"] = decoder1_gn 
-          #  logger["decoder2_gn"] = decoder2_gn 
 
         return logger
 
@@ -1788,6 +1696,7 @@ class Decoder(nn.Module):
         dropout: float = 0.05,
         max_T: int = 256,
         output_range: str = "0_1",
+        num_reserved = 4,
     ):
         super().__init__()
         assert (h % patch == 0) and (w % patch == 0)
@@ -1804,6 +1713,8 @@ class Decoder(nn.Module):
         g2 = h // patch
         self.grid = (g1, g2)
         self.num_patches = g1 * g2
+        self.reserved = nn.Parameter(torch.randn(1, 1, num_reserved, d_model) * 0.02)
+        self.num_reserved=num_reserved
 
         self.patch_queries = nn.Parameter(torch.randn(1, 1, self.num_patches, d_model) * 0.02)
 
@@ -1817,7 +1728,7 @@ class Decoder(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         self.ln_out = nn.RMSNorm(d_model)
         self.to_patch = nn.Linear(d_model, img_channels * patch * patch)
-        self.space_mask = None
+
     def unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
         BT, P, Dp = patches.shape
         C = self.img_channels
@@ -1841,33 +1752,27 @@ class Decoder(nn.Module):
             L = K
         else:
             raise ValueError(f"Expected z dim 3 or 4, got {tuple(z.shape)}")
-
-        def _forward(patch_queries):
-
         # ---- patch queries ----
-            pq = patch_queries.expand(B, T, self.num_patches, self.d_model)
-            # IMPORTANT: put latents FIRST, then patch queries
-            x = torch.cat([self.drop(zlat), pq], 2)
+        pq = self.patch_queries.expand(B, T, self.num_patches, self.d_model)
+        # IMPORTANT: put latents FIRST, then patch queries
+        x = torch.cat([zlat, pq, self.reserved.expand(B, T, -1, self.d_model)], dim=2)   # (B,T,L+Np,D)
+        x = self.drop(x)
+        space_mask = modality_mask(L, [self.num_patches, self.num_reserved], encoder=False, device=x.device)
 
-            if self.space_mask is None:
-                self.space_mask = modality_mask(L, [self.num_patches], encoder=False, device=x.device)
-            space_mask = self.space_mask
-            # ---- transformer ----
-            for blk in self.blocks:
-                if blk.time_attn_enabled:
-                    x = blk(x)          # no space mask here
-                else:
-                    x = blk(x,  mask=space_mask)    # modality mask only here
-            x = self.ln_out(x)
+        # ---- transformer ----
+        for blk in self.blocks:
+            if blk.time_attn_enabled:
+                x = blk(x)          # no space mask here
+            else:
+                x = blk(x,  mask=space_mask)    # modality mask only here
+        x = self.ln_out(x)
 
-            # ---- decode ONLY patch tokens ----
-            patch_tok = x[:, :, L:, :]           # (B,T,Np,D)
-            # sanity check
-            assert patch_tok.shape[2] == self.num_patches, (patch_tok.shape, self.num_patches)
+        # ---- decode ONLY patch tokens ----
+        patch_tok = x[:, :, L:-self.num_reserved, :]           # (B,T,Np,D)
+        # sanity check
+        assert patch_tok.shape[2] == self.num_patches, (patch_tok.shape, self.num_patches)
 
-            patches = self.to_patch(patch_tok).contiguous().view(B * T, self.num_patches, -1)
-            frames = self.unpatchify(patches).view(B, T, self.img_channels, self.h, self.w)
-            return frames
-        top = _forward(self.patch_queries)
-       # direct = _forward(self.direct_patch_queries)
-        return torch.sigmoid(top) if self.output_range == "0_1" else torch.tanh(top)
+        patches = self.to_patch(patch_tok).contiguous().view(B * T, self.num_patches, -1)
+        frames = self.unpatchify(patches).view(B, T, self.img_channels, self.h, self.w)
+
+        return torch.sigmoid(frames) if self.output_range == "0_1" else torch.tanh(frames)
