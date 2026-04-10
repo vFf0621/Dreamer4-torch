@@ -228,7 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pred_dim", type=int, default=512)
     p.add_argument("--rep_depth", type=int, default=6, help="Has to be a multiple of 2")
     p.add_argument("--rep_d_model", type=int, default=256)
-    p.add_argument("--dyn_d_model", type=int, default=256)
+    p.add_argument("--dyn_d_model", type=int, default=512)
     p.add_argument("--num_heads", type=int, default=8)
     p.add_argument("--dropout", type=float, default=0.01)
     p.add_argument("--k_max", type=int, default=128, help="Has to be a power of 2")

@@ -703,7 +703,17 @@ class Dreamer4(nn.Module):
         self.steps = 0
         self.kmax_prob = kmax_prob
         self.disc = 0.997
-        self.expanding_ratio = 2
+        self.expanding_ratio = 1
+
+      #  self.encoder.load_state_dict(torch.load("enc.pt"))
+        self.psnr = PeakSignalNoiseRatio((-1,1))
+
+       # self.decoder.load_state_dict(torch.load("dec.pt"))
+        self.tau_ctx = 0.1
+        self.lpips = LPIPSLoss(reduction="none",)
+        if ckpt:
+            self.load_state_dict(torch.load(ckpt), strict=False)
+
     
         self.policy = Policy(action_low = action_low,action_high = action_high,action_dim=action_dim,hidden_dim = latent_dim,latent_dim=dyn_d_model, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
         self.t_policy = Policy(action_low = action_low,action_high = action_high, action_dim=action_dim, hidden_dim = latent_dim, latent_dim=dyn_d_model, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
@@ -723,7 +733,7 @@ class Dreamer4(nn.Module):
             action_high = action_high,
             n_heads=num_heads,
             action_dim =action_dim,
-            d_model=256,
+            d_model=dyn_d_model,
             Sa = Sa, 
             Nr = Nr, 
             max_T = max_imag_len,
@@ -731,16 +741,6 @@ class Dreamer4(nn.Module):
             time_every=4,
             latent_tokens=latent_tokens * self.expanding_ratio
         )
-
-      #  self.encoder.load_state_dict(torch.load("enc.pt"))
-        self.psnr = PeakSignalNoiseRatio((-1,1))
-
-       # self.decoder.load_state_dict(torch.load("dec.pt"))
-        self.tau_ctx = 0.1
-        self.lpips = LPIPSLoss(reduction="none",)
-        if ckpt:
-            self.load_state_dict(torch.load(ckpt), strict=False)
-
 
 
 
