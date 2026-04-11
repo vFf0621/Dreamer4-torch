@@ -137,15 +137,11 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
                 act = [None for i in range(len(agents))] # Single agent
                 for i in range(len(agents)):
                 # Warmup: Random Action
-                    if not train_policy:
-                        act[i] = env.action_space.sample()
-                    # Training: Model Action
-                    else:
-                        agents[i].encoder.eval()
+                    agents[i].encoder.eval()
                         # Assuming single agent, extracting index 0
-                        state_tensor = torch.from_numpy(observation[0]).to(agents[0].device)
-                        act[i] = agents[i].action_step(state_tensor)
-                        env.render() 
+                    state_tensor = torch.from_numpy(observation[0]).to(agents[0].device)
+                    act[i] = agents[i].action_step(state_tensor)
+                    env.render() 
 
                     # Step Environment
                 # gym_multi_car_racing usually returns dicts or tuples depending on version
