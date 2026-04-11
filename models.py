@@ -711,8 +711,6 @@ class Dreamer4(nn.Module):
        # self.decoder.load_state_dict(torch.load("dec.pt"))
         self.tau_ctx = 0.1
         self.lpips = LPIPSLoss(reduction="none",)
-        if ckpt:
-            self.load_state_dict(torch.load(ckpt), strict=False)
 
     
         self.policy = Policy(action_low = action_low,action_high = action_high,action_dim=action_dim,hidden_dim = latent_dim,latent_dim=dyn_d_model, mtp=self.aux_horizon, num_bins=self.policy_num_bins)
@@ -743,6 +741,8 @@ class Dreamer4(nn.Module):
         )
 
 
+        if ckpt:
+            self.load_state_dict(torch.load(ckpt), strict=False)
 
         self.t_policy.load_state_dict(self.policy.state_dict(), )
         self.t_value.load_state_dict(self.value.state_dict(), )
@@ -1082,8 +1082,7 @@ class Dreamer4(nn.Module):
         w_tau = (0.9 * tau + 0.1)
 
         loss = (loss * w_tau ).mean()
-
-        return loss, self.psnr(x1_hat, z1_clean.detach())
+        return loss, self.psnr(x1_hat[is_base[...,None].expand_as(x1_hat)], z1_clean.detach()[is_base[...,None].expand_as(x1_hat)])
 
 
     def save_checkpoint(self, name):
@@ -1529,10 +1528,8 @@ class Dreamer4(nn.Module):
                                             self.decoder,
 
                                         ]): 
-                    s = buffer.sample_seq(self.batch_size, 10)
 
-                    rollout_states = s[2]
-                    rollout_states = torch.from_numpy(rollout_states).to(self.device).float()
+                    rollout_states = states
 
                     initial_latent = self.encoder(states[:, :])
                     B, T, Nz, _ = initial_latent.shape
