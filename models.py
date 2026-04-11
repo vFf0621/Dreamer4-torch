@@ -1238,6 +1238,17 @@ class Dreamer4(nn.Module):
                 imagined_actions = actions # Return GT actions in train mode
             # Return relevant slice (exclude initial context from output if desired, or keep all)
             return z_inp, h, lp, imagined_actions
+    def soft_update(self, target_net: nn.Module, online_net: nn.Module):
+        """
+        Updates the target network parameters using an exponential moving average.
+        tau: The soft update coefficient (usually between 0.001 and 0.05).
+        """
+        tau=1-self.ema
+        with torch.no_grad():
+            for target_param, online_param in zip(target_net.parameters(), online_net.parameters()):
+                # target = target + tau * (online - target)
+                # which is mathematically identical to: target = (1-tau)*target + tau*online
+                target_param.data.lerp_(online_param.data, tau)
     def decode(self, latents):
         return self.decoder(latents)
     def multistep_aux_losses(self, feat, actions, rewards, termination, t_policy=False):
