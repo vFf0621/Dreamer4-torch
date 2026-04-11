@@ -1210,7 +1210,7 @@ class Dreamer4(nn.Module):
                     # Compute KL divergence for auxiliary loss
                     with torch.no_grad():
                         _, log_q, _, base_q, _ = self.t_policy(h_last)
-                    kl_step = kl_div(base_p.logits, base_q.logits).sum(-1)
+                    kl_step = kl_div(base_p.base_dist.logits, base_q.base_dist.logits).sum(-1)
                     kl = kl_step
 
                 kl_list.append(kl)
