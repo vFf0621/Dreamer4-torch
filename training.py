@@ -131,7 +131,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
         step = 0
         # --- Collection Phase ---
 
-        if not buffer.full or (buffer.full and mode=="policy"):
+        if (mode=="inference"):
             while (not done.all()):
                 # Handle Actions
                 act = [None for i in range(len(agents))] # Single agent
@@ -179,7 +179,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
         writer["episodic_return_0"] = score
         
         # Train on the buffer
-        if train and (buffer.full or mode=="policy"): # Ensure min buffer size
+        if (buffer.full and mode!="inference"): # Ensure min buffer size
             for a in agents:
                 # Note: buffer is passed directly; train_one_epoch handles sampling internally
                 log_data = a.train_step(writer, buffer, model=train_model, policy=train_policy, train_reward=train_reward)
@@ -209,7 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # simulate kwargs
     p.add_argument("--num_agents", type=int, default=1)
-    p.add_argument("--buffer_limit", type=int, default=100000)
+    p.add_argument("--buffer_limit", type=int, default=1)
 
     # Observation / encoding
     p.add_argument("--ch", type=int, default=3, help="Image Channels")
