@@ -718,7 +718,7 @@ class Dreamer4(nn.Module):
         self.reward = Reward(bin_num=self.bin_num, latent_dim=dyn_d_model, mtp=self.aux_horizon, hidden_dim = latent_dim, r_max=reward_clamp, sym=self.sym_rew)
         self.train_policy = False
         self.value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp,sym= self.sym_val)
-        self.t_value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp)
+        self.t_value = Value(bin_num=self.bin_num, latent_dim=dyn_d_model, hidden_dim=latent_dim, r_max=reward_clamp, sym=self.sym_val)
 
         self.transformer = Dynamics(
             device=self.device, 
@@ -747,32 +747,29 @@ class Dreamer4(nn.Module):
         self.t_policy.load_state_dict(self.policy.state_dict(), )
         self.t_value.load_state_dict(self.value.state_dict(), )
 
-        self.reward_optim = torch.optim.AdamW(
-            [{'params': self.reward.parameters()}, 
-            {'params': self.t_policy.parameters()},], eps = 1e-5,
-         lr=policy_lr, capturable=True, weight_decay=dyn_decay)
-        self.value_optim= torch.optim.AdamW([
-            {'params': self.value.parameters()},
-            ], lr=policy_lr, capturable=True,weight_decay=policy_decay)
-   
+        self.lpips = LPIPSLoss(reduction="none",)
         self.rep_optim = torch.optim.AdamW(
             [{'params': self.encoder.parameters()}, 
-            {'params': self.decoder.parameters()},]
+
+            {'params': self.decoder.parameters()},
+
+            ]
         , lr=rep_lr, capturable=True, weight_decay=rep_decay)
         self.reset()
+
         self.dyn_optim = torch.optim.AdamW(            
             [{'params': self.policy.parameters()}, 
+            {'params': self.t_policy.parameters()}, 
+
             {'params': self.reward.parameters()}, 
             {'params': self.transformer.parameters()}, ],
 
             lr=dyn_lr, capturable=True,weight_decay=dyn_decay)
 
-
-        self.policy_optim= torch.optim.AdamW([
-            {'params': self.policy.parameters()}, 
+        self.value_optim= torch.optim.AdamW([
             {'params': self.value.parameters()},
-            ],eps = 1e-5, lr=policy_lr, capturable=True,weight_decay=policy_decay)
-
+            ], lr=policy_lr, capturable=True,weight_decay=policy_decay)
+   
         self.to(self.device)
 
     def reset(self):
@@ -1204,7 +1201,7 @@ class Dreamer4(nn.Module):
                     kl = torch.zeros((a.size(0), 1, 1), device=device)
                 else:
                     # Policy Sampling
-                    a, log_p, _, base_p, idx = self.policy(h_last)
+                    a, log_p, _, base_p, idx = self.policy(h_last, sample=True)
                     a_list.append(a)
                     lp_list.append(log_p.unsqueeze(-1))
                     # Compute KL divergence for auxiliary loss
@@ -1573,8 +1570,8 @@ class Dreamer4(nn.Module):
                         cont_rp = mask_after_done(cont_rp, cont_rp)
 
                         V_full = self.value(h_t[:,:])[0] 
-                        r_rp_seq = (r_rp) 
-
+                        r_rp_seq = r_rp * mask_after_done(r_rp, cont_rp) 
+                        r_seq = r_seq * mask_after_done(r_seq, cont_t) 
                         bs = lambda_returns(r_seq[:,:], cont_t[:,:],  lambda_=self.lambda_, discount=self.disc, boot=V_full[:, :]).squeeze(-1) 
                         rp_targ = lambda_returns(r_rp_seq, cont_rp,  lambda_=self.lambda_, discount=self.disc, boot=V_rp[:, :]).squeeze(-1) 
                         weight_rp = torch.cumprod(disc * (cont_rp[:,:-1] > 0.5), 1) /disc 
@@ -1678,7 +1675,7 @@ class Reward(nn.Module):
         return r_mean, r_logits_1, r_logits_all, term_dist
 
 class Value(nn.Module):
-    def __init__(self,latent_dim, hidden_dim,bin_num, num_layers=4, r_max=6,sym=False ):
+    def __init__(self,latent_dim, hidden_dim,bin_num, num_layers=4, r_max=6,sym=True ):
         super().__init__()
         self.network = build_network(latent_dim, hidden_dim, num_layers, "SwiGLU",bin_num)
         self.bin_num = bin_num
