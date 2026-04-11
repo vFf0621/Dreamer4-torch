@@ -1206,7 +1206,7 @@ class Dreamer4(nn.Module):
                     # Policy Sampling
                     a, log_p, _, base_p, idx = self.policy(h_last)
                     a_list.append(a)
-                    lp_list.append(log_p)
+                    lp_list.append(log_p.unsqueeze(-1))
                     # Compute KL divergence for auxiliary loss
                     with torch.no_grad():
                         _, log_q, _, base_q, _ = self.t_policy(h_last)
@@ -1237,7 +1237,7 @@ class Dreamer4(nn.Module):
                 lp = torch.zeros_like(kl)
                 imagined_actions = actions # Return GT actions in train mode
             # Return relevant slice (exclude initial context from output if desired, or keep all)
-            return z_inp, h, lp, kl, imagined_actions
+            return z_inp, h, lp, imagined_actions
     def decode(self, latents):
         return self.decoder(latents)
     def multistep_aux_losses(self, feat, actions, rewards, termination, t_policy=False):
