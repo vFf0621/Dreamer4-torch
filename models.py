@@ -506,15 +506,66 @@ class PerChannelTimeAttention(nn.Module):
         return torch.einsum("btnh,nhd->btnd", out, self.out_proj)
 
 
+class PerChannelMLP(nn.Module):
+    """
+    SwiGLU feed-forward with its own weights per spatial channel.
+
+    Same topology as build_network(D, 2D, 3, "SwiGLU", D) -- RMSNorm, Linear to
+    2*hidden, SwiGLU, twice, then RMSNorm and the output projection -- but every
+    weight, bias and norm gain is stacked over the channel axis and applied with
+    einsum, so channel n never shares a parameter with channel m.
+    """
+
+    def __init__(self, num_channels, d_model, hidden=None, eps=1e-6):
+        super().__init__()
+        h = hidden if hidden is not None else 2 * d_model
+        self.num_channels = num_channels
+        self.d_model = d_model
+        self.hidden = h
+        self.eps = eps
+
+        def weight(n_in, n_out):
+            bound = n_in ** -0.5
+            return nn.Parameter(torch.empty(num_channels, n_in, n_out).uniform_(-bound, bound))
+
+        def bias(n_in, n_out):
+            bound = n_in ** -0.5
+            return nn.Parameter(torch.empty(num_channels, n_out).uniform_(-bound, bound))
+
+        # layer 1: D -> 2h  (SwiGLU halves it back to h)
+        self.g1 = nn.Parameter(torch.ones(num_channels, d_model))
+        self.w1, self.b1 = weight(d_model, 2 * h), bias(d_model, 2 * h)
+        # layer 2: h -> 2h  (SwiGLU -> h)
+        self.g2 = nn.Parameter(torch.ones(num_channels, h))
+        self.w2, self.b2 = weight(h, 2 * h), bias(h, 2 * h)
+        # output: h -> D
+        self.g3 = nn.Parameter(torch.ones(num_channels, h))
+        self.w3, self.b3 = weight(h, d_model), bias(h, d_model)
+
+    def _rms(self, x, gain):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * gain
+
+    @staticmethod
+    def _swiglu(x):
+        a, b = x.chunk(2, dim=-1)
+        return a * F.silu(b)
+
+    def forward(self, x: torch.Tensor):
+        """x: [B, T, N, D] -> [B, T, N, D]"""
+        if x.shape[-2] != self.num_channels:
+            raise ValueError(f"expected {self.num_channels} channels, got {x.shape[-2]}")
+
+        h = self._swiglu(torch.einsum("btnd,ndh->btnh", self._rms(x, self.g1), self.w1) + self.b1)
+        h = self._swiglu(torch.einsum("btnd,ndh->btnh", self._rms(h, self.g2), self.w2) + self.b2)
+        return torch.einsum("btnd,ndh->btnh", self._rms(h, self.g3), self.w3) + self.b3
+
+
 class ModalityTimeBlock(nn.Module):
     """
     Causal temporal attention with one set of weights per channel: every spatial
     slot of every stream (each z token, each action token, the agent token) gets
-    its own temporal attention weights, so nothing is shared across channels or
-    across modalities.
-
-    The feed-forward stays per-modality -- per-channel MLPs would dominate the
-    parameter count without changing the attention structure being asked for.
+    its own temporal attention weights and its own feed-forward, so nothing is
+    shared across channels or across modalities.
     """
 
     def __init__(self, d_model, n_heads, n_z_channels, n_a_channels,
@@ -527,9 +578,9 @@ class ModalityTimeBlock(nn.Module):
         self.time_a = PerChannelTimeAttention(n_a_channels, d_model, n_heads, dropout, device=device)
         self.time_agent = PerChannelTimeAttention(n_agent_channels, d_model, n_heads, dropout, device=device)
 
-        self.mlp_z = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
-        self.mlp_a = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
-        self.mlp_agent = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
+        self.mlp_z = PerChannelMLP(n_z_channels, d_model)
+        self.mlp_a = PerChannelMLP(n_a_channels, d_model)
+        self.mlp_agent = PerChannelMLP(n_agent_channels, d_model)
 
         self.device = device
         self.to(self.device)
