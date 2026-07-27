@@ -49,7 +49,7 @@ def load_replay(path="buffer.npz", seed=None):
     return buf
 def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, patch , Nr, latent_tokens, z_dim, action_dim, latent_dim, 
                  rep_depth , rep_d_model, dyn_d_model, num_heads, dropout, k_max, mtp, task_id,  kmax_prob, lambda_, buffer,
-                 gqa_ratio, mlp_ratio,
+                 gqa_ratio, mlp_ratio, attn_mode,
                  policy_bins , reward_bins , pretrain, reward_clamp,level_vocab , level_embed_dim,mode,num_tasks, Sa,
                  batch_lens, batch_size, accum, max_imag_len, buffer_limit, train, ckpt, rep_lr=1e-4, rep_decay=1e-3,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3 , save_every=500):
@@ -68,6 +68,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
                 num_heads=num_heads, 
                 gqa_ratio=gqa_ratio,
                 mlp_ratio=mlp_ratio,
+                attn_mode=attn_mode,
                 dropout=dropout, 
                 k_max=k_max, 
                 lambda_= lambda_,
@@ -231,6 +232,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_heads", type=int, default=8)
     p.add_argument("--gqa_ratio", type=int, default=4,
                    help="Query heads per key/value head. 1 = full multi-head attention.")
+    p.add_argument("--attn_mode", type=str, default="per_channel",
+                   choices=["per_channel", "shared"],
+                   help="per_channel: every modality and spatial slot owns its attention weights. "
+                        "shared: one weight set with the same routing applied as an attention mask, "
+                        "as in the paper. Widths must be scaled up for shared to reach the same size.")
     p.add_argument("--mlp_ratio", type=float, default=1.25,
                    help="Feed-forward hidden width as a multiple of d_model. Dominates the "
                         "parameter count because the temporal MLPs are per channel.")
@@ -315,6 +321,7 @@ def main():
         num_heads=args.num_heads,
         gqa_ratio=args.gqa_ratio,
         mlp_ratio=args.mlp_ratio,
+        attn_mode=args.attn_mode,
         dropout=args.dropout,
         k_max=args.k_max,
         mtp=args.mtp,

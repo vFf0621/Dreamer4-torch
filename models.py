@@ -87,6 +87,13 @@ def gqa_kv_heads(num_heads: int, ratio: int) -> int:
     return 1
 
 
+def check_attn_mode(mode: str) -> bool:
+    """Returns True for per-channel weights, False for shared (paper-style) weights."""
+    if mode not in ("per_channel", "shared"):
+        raise ValueError(f"attn_mode must be 'per_channel' or 'shared', got {mode!r}")
+    return mode == "per_channel"
+
+
 def mlp_hidden(d_model: int, ratio: float) -> int:
     """Feed-forward hidden width as a multiple of d_model (SwiGLU gate excluded)."""
     return max(1, int(round(d_model * ratio)))
@@ -515,6 +522,162 @@ class ModalityTimeBlock(nn.Module):
         return z, a, agent
 
 
+class SharedSpaceBlock(nn.Module):
+    """
+    Dynamics spatial attention, paper-style: one set of weights and a single
+    softmax over the concatenated token sequence, with an additive mask giving
+    the same routing as ModalitySpaceBlock -- every stream sees z, the signal
+    token, the registers and the actions, and nothing attends to the agent,
+    which reads all of them.
+
+    Note this is not merely ModalitySpaceBlock with tied weights: attending in
+    one pass makes z and the actions compete inside a single softmax, whereas
+    the per-modality block normalises each path separately and sums.
+    """
+
+    def __init__(self, d_model, n_heads, dropout=0.1, device="cuda", gqa_ratio=4, mlp_ratio=2.0):
+        super().__init__()
+        self.d_model = d_model
+        self.time_attn_enabled = False
+        self.ln = nn.RMSNorm(d_model)
+        self.attn = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        self.mlp = build_network(d_model, mlp_hidden(d_model, mlp_ratio), 3, "SwiGLU", d_model, True)
+        self.device = device
+        if device is not None:
+            self.to(device)
+
+    def forward(self, z, a, agent=None, z_pad=None, a_pad=None):
+        B, T, Nz, D = z.shape
+        Sa = a.shape[2]
+        parts = [z, a] + ([agent] if agent is not None else [])
+        x = torch.cat(parts, dim=2)
+        S = x.size(2)
+        Na = S - Nz - Sa
+
+        xn = self.ln(x).reshape(B * T, S, D)
+
+        bias = None
+        if Na > 0:                                   # block the agent columns
+            bias = torch.zeros((S, S), dtype=xn.dtype, device=x.device)
+            bias[: Nz + Sa, Nz + Sa :] = float("-inf")
+
+        kpm = None
+        if z_pad is not None or a_pad is not None:
+            zk = z_pad if z_pad is not None else torch.zeros(B, T, Nz, dtype=torch.bool, device=x.device)
+            ak = a_pad if a_pad is not None else torch.zeros(B, T, Sa, dtype=torch.bool, device=x.device)
+            gk = torch.zeros(B, T, Na, dtype=torch.bool, device=x.device)
+            kpm = torch.cat([zk, ak, gk], dim=2).reshape(B * T, S)
+
+        out = self.attn(xn, attn_mask=bias, key_padding_mask=kpm).reshape(B, T, S, D)
+        x = x + out
+        x = x + self.mlp(x)
+        return x[:, :, :Nz], x[:, :, Nz : Nz + Sa], (x[:, :, Nz + Sa :] if Na > 0 else None)
+
+
+class SharedTimeBlock(nn.Module):
+    """
+    Dynamics temporal attention, paper-style: one causal weight set shared by
+    every channel and every stream, applied over the time axis.
+    """
+
+    def __init__(self, d_model, n_heads, dropout=0.1, device="cuda", gqa_ratio=4, mlp_ratio=2.0):
+        super().__init__()
+        self.d_model = d_model
+        self.time_attn_enabled = True
+        self.ln = nn.RMSNorm(d_model)
+        self.attn = GQA(d_model, n_heads, dropout, causal=True, device=device, gqa_ratio=gqa_ratio)
+        self.mlp = build_network(d_model, mlp_hidden(d_model, mlp_ratio), 3, "SwiGLU", d_model, True)
+        self.device = device
+        if device is not None:
+            self.to(device)
+
+    def forward(self, z, a, agent=None, z_pad=None, a_pad=None):
+        B, T, Nz, D = z.shape
+        Sa = a.shape[2]
+        parts = [z, a] + ([agent] if agent is not None else [])
+        x = torch.cat(parts, dim=2)
+        S = x.size(2)
+        Na = S - Nz - Sa
+
+        xt = self.ln(x).permute(0, 2, 1, 3).reshape(B * S, T, D)
+        kpm = None
+        if z_pad is not None or a_pad is not None:
+            zk = z_pad if z_pad is not None else torch.zeros(B, T, Nz, dtype=torch.bool, device=x.device)
+            ak = a_pad if a_pad is not None else torch.zeros(B, T, Sa, dtype=torch.bool, device=x.device)
+            gk = torch.zeros(B, T, Na, dtype=torch.bool, device=x.device)
+            kpm = torch.cat([zk, ak, gk], dim=2).permute(0, 2, 1).reshape(B * S, T)
+
+        out = self.attn(xt, key_padding_mask=kpm).reshape(B, S, T, D).permute(0, 2, 1, 3)
+        x = x + out
+        x = x + self.mlp(x)
+        return x[:, :, :Nz], x[:, :, Nz : Nz + Sa], (x[:, :, Nz + Sa :] if Na > 0 else None)
+
+
+class RepSharedSpaceBlock(nn.Module):
+    """
+    Encoder/decoder spatial attention, paper-style: one weight set and a single
+    softmax over [latents ; patches ; registers], routed by the additive
+    modality mask rather than by separate per-modality projections.
+    """
+
+    def __init__(self, d_model, n_heads, dropout=0.1, encoder=True, device=None,
+                 gqa_ratio=4, mlp_ratio=2.0):
+        super().__init__()
+        self.d_model = d_model
+        self.encoder = encoder
+        self.time_attn_enabled = False
+        self.ln = nn.RMSNorm(d_model)
+        self.attn = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        self.mlp = build_network(d_model, mlp_hidden(d_model, mlp_ratio), 3, "SwiGLU", d_model, True)
+        self.device = device
+        if device is not None:
+            self.to(device)
+
+    def forward(self, lat, patch, res=None):
+        B, T, L, D = lat.shape
+        Np = patch.shape[2]
+        parts = [lat, patch] + ([res] if res is not None else [])
+        x = torch.cat(parts, dim=2)
+        S = x.size(2)
+        Nr = S - L - Np
+
+        allow = modality_mask(L, [Np, Nr] if Nr > 0 else [Np],
+                              device=x.device, encoder=self.encoder)
+        xn = self.ln(x).reshape(B * T, S, D)
+        out = self.attn(xn, attn_mask=allow).reshape(B, T, S, D)
+        x = x + out
+        x = x + self.mlp(x)
+        return x[:, :, :L], x[:, :, L : L + Np], (x[:, :, L + Np :] if Nr > 0 else None)
+
+
+class RepSharedTimeBlock(nn.Module):
+    """Encoder/decoder temporal attention, paper-style: one causal weight set for all channels."""
+
+    def __init__(self, d_model, n_heads, dropout=0.1, device=None, gqa_ratio=4, mlp_ratio=2.0):
+        super().__init__()
+        self.d_model = d_model
+        self.time_attn_enabled = True
+        self.ln = nn.RMSNorm(d_model)
+        self.attn = GQA(d_model, n_heads, dropout, causal=True, device=device, gqa_ratio=gqa_ratio)
+        self.mlp = build_network(d_model, mlp_hidden(d_model, mlp_ratio), 3, "SwiGLU", d_model, True)
+        self.device = device
+        if device is not None:
+            self.to(device)
+
+    def forward(self, lat, patch, res=None):
+        B, T, L, D = lat.shape
+        Np = patch.shape[2]
+        parts = [lat, patch] + ([res] if res is not None else [])
+        x = torch.cat(parts, dim=2)
+        S = x.size(2)
+        Nr = S - L - Np
+        xt = self.ln(x).permute(0, 2, 1, 3).reshape(B * S, T, D)
+        out = self.attn(xt).reshape(B, S, T, D).permute(0, 2, 1, 3)
+        x = x + out
+        x = x + self.mlp(x)
+        return x[:, :, :L], x[:, :, L : L + Np], (x[:, :, L + Np :] if Nr > 0 else None)
+
+
 class RepModalitySpaceBlock(nn.Module):
     """
     Spatial attention for the representation stack (encoder / decoder) with one
@@ -659,6 +822,7 @@ class Encoder(nn.Module):
         gqa_ratio: int = 4,       # query heads per key/value head
         mlp_ratio: float = 2.0,   # feed-forward hidden width, as a multiple of d_model
         mae_max_ratio: float = 0.9,  # max patch dropout probability for masked autoencoding
+        attn_mode: str = "per_channel",  # "per_channel" or "shared" (paper-style masked attention)
         pool: str = "first",      # "mean" or "first"
     ):
         super().__init__()
@@ -681,6 +845,7 @@ class Encoder(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.reserved = nn.Parameter(torch.randn(1, 1, num_reserved, d_model) * 0.02)
         self.num_reserved=num_reserved
+        per_channel = check_attn_mode(attn_mode)
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == 0)
@@ -689,11 +854,12 @@ class Encoder(nn.Module):
                     d_model, n_heads,
                     n_latent=latent_tokens, n_patch=self.num_patches, n_reserved=num_reserved,
                     dropout=dropout, gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio,
-                ))
+                ) if per_channel else RepSharedTimeBlock(
+                    d_model, n_heads, dropout=dropout, gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio))
             else:
-                blocks.append(RepModalitySpaceBlock(d_model, n_heads, dropout=dropout,
-                                                    encoder=True, gqa_ratio=gqa_ratio,
-                                                    mlp_ratio=mlp_ratio))
+                cls = RepModalitySpaceBlock if per_channel else RepSharedSpaceBlock
+                blocks.append(cls(d_model, n_heads, dropout=dropout, encoder=True,
+                                  gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio))
         self.blocks = nn.ModuleList(blocks)
 
         self.ln_out = nn.RMSNorm(d_model)
@@ -786,6 +952,7 @@ class Dynamics(nn.Module):
         Nr: int = 4,
         gqa_ratio: int = 4,                 # query heads per key/value head
         mlp_ratio: float = 2.0,             # feed-forward hidden width, as a multiple of d_model
+        attn_mode: str = "per_channel",     # "per_channel" or "shared" (paper-style masked attention)
         # behavior toggles
         mask_last_action: bool = True,      # usually correct for "predict next"
         clamp_signal_indices: bool = False, # set True if you’d rather clamp than crash
@@ -828,6 +995,7 @@ class Dynamics(nn.Module):
         # Blocks: modality-specific attention weights.
         #   space -> z/z, z/actions, actions/actions, actions/z, agent/[z;actions]
         #   time  -> one causal attention per channel (per spatial slot of each stream)
+        per_channel = check_attn_mode(attn_mode)
         n_z_channels = self.Nz + 1 + self.Nr      # latents + signal token + reserved
         blocks = []
         for i in range(depth):
@@ -839,11 +1007,13 @@ class Dynamics(nn.Module):
                     n_a_channels=self.Sa,
                     n_agent_channels=1,
                     dropout=dropout, device=device, gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio,
-                ))
+                ) if per_channel else SharedTimeBlock(
+                    d_model, n_heads, dropout=dropout, device=device,
+                    gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio))
             else:
-                blocks.append(ModalitySpaceBlock(d_model, n_heads, dropout=dropout,
-                                                 device=device, gqa_ratio=gqa_ratio,
-                                                 mlp_ratio=mlp_ratio))
+                cls = ModalitySpaceBlock if per_channel else SharedSpaceBlock
+                blocks.append(cls(d_model, n_heads, dropout=dropout, device=device,
+                                  gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio))
         self.blocks = nn.ModuleList(blocks)
 
         # Output head: model dim -> Dz
@@ -976,12 +1146,12 @@ class Dreamer4(nn.Module):
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=True, symlog_for_value=True,
-                kmax_prob=0.1, gqa_ratio=4, mlp_ratio=2.0):
+                kmax_prob=0.1, gqa_ratio=4, mlp_ratio=2.0, attn_mode='per_channel'):
         super(Dreamer4, self).__init__()
         self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patch, d_model=rep_d_model,
                                 n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=2,
                                 out_dim=z_dim, dropout=dropout, max_T=max_imag_len, num_reserved=Nr,
-                                gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio)
+                                gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio, attn_mode=attn_mode)
         self.ema = 0.98
         self.device="cuda" if torch.cuda.is_available() else "cpu"
         self.pretrain = False
@@ -995,7 +1165,7 @@ class Dreamer4(nn.Module):
         self.decoder = Decoder(img_channels=ch, w = w, h=h, patch=patch, z_dim=z_dim, d_model=rep_d_model, n_heads=num_heads,
                                depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout,
                                max_T=max_imag_len, num_reserved=Nr, gqa_ratio=gqa_ratio,
-                               mlp_ratio=mlp_ratio)
+                               mlp_ratio=mlp_ratio, attn_mode=attn_mode)
         self.imagination_steps = max_imag_len - 1
         self.rminv = -reward_clamp
         self.rmaxv = reward_clamp
@@ -1053,6 +1223,7 @@ class Dreamer4(nn.Module):
             time_every=4,
             gqa_ratio=gqa_ratio,
             mlp_ratio=mlp_ratio,
+            attn_mode=attn_mode,
             latent_tokens=latent_tokens * self.expanding_ratio
         )
 
@@ -2022,6 +2193,7 @@ class Decoder(nn.Module):
         num_reserved = 4,
         gqa_ratio: int = 4,       # query heads per key/value head
         mlp_ratio: float = 2.0,   # feed-forward hidden width, as a multiple of d_model
+        attn_mode: str = "per_channel",  # "per_channel" or "shared" (paper-style masked attention)
     ):
         super().__init__()
         assert (h % patch == 0) and (w % patch == 0)
@@ -2046,6 +2218,7 @@ class Decoder(nn.Module):
         self.z_to_latents = nn.Linear(z_dim, latent_tokens * d_model)
         self.z_tok_proj   = nn.Linear(z_dim, d_model)
         self.drop = nn.Dropout(dropout)
+        per_channel = check_attn_mode(attn_mode)
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == 0)
@@ -2054,11 +2227,12 @@ class Decoder(nn.Module):
                     d_model, n_heads,
                     n_latent=latent_tokens, n_patch=self.num_patches, n_reserved=num_reserved,
                     dropout=dropout, gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio,
-                ))
+                ) if per_channel else RepSharedTimeBlock(
+                    d_model, n_heads, dropout=dropout, gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio))
             else:
-                blocks.append(RepModalitySpaceBlock(d_model, n_heads, dropout=dropout,
-                                                    encoder=False, gqa_ratio=gqa_ratio,
-                                                    mlp_ratio=mlp_ratio))
+                cls = RepModalitySpaceBlock if per_channel else RepSharedSpaceBlock
+                blocks.append(cls(d_model, n_heads, dropout=dropout, encoder=False,
+                                  gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio))
         self.blocks = nn.ModuleList(blocks)
         self.ln_out = nn.RMSNorm(d_model)
         self.to_patch = nn.Linear(d_model, img_channels * patch * patch)
