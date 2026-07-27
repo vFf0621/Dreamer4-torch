@@ -398,25 +398,134 @@ class ModalitySpaceBlock(nn.Module):
         return z, a, agent
 
 
-class ModalityTimeBlock(nn.Module):
+class PerChannelTimeAttention(nn.Module):
     """
-    Causal temporal attention with one set of weights per spatial stream
-    (z / actions / agent). Each stream attends over time independently, so the
-    temporal weights are never shared across modalities.
+    Causal attention over time with one set of weights per spatial channel.
+
+    Input is [B, T, N, D]; channel n is the length-T sequence living at spatial
+    slot n. Every channel owns its q/k/v/out projections and its RMSNorm gains,
+    so no temporal weight is shared between channels. The per-channel projections
+    are stored as stacked [N, in, out] tensors and applied with einsum, which
+    keeps the FLOP count identical to a shared projection.
+
+    Grouped-query attention and RoPE follow GQA; RoPE is positional, not learned,
+    so its cache is shared across channels.
     """
 
-    def __init__(self, d_model, n_heads, dropout=0.1, device="cuda"):
+    def __init__(self, num_channels, embed_dim, num_heads, dropout=0.0, device="cuda", eps=1e-6):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+
+        self.num_channels = num_channels
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.num_kv_heads = max(1, num_heads // 2)
+        self.head_dim = embed_dim // num_heads
+        self.dropout = dropout
+        self.eps = eps
+
+        q_dim = num_heads * self.head_dim
+        kv_dim = self.num_kv_heads * self.head_dim
+        std = embed_dim ** -0.5
+
+        self.q_proj = nn.Parameter(torch.randn(num_channels, embed_dim, q_dim) * std)
+        self.k_proj = nn.Parameter(torch.randn(num_channels, embed_dim, kv_dim) * std)
+        self.v_proj = nn.Parameter(torch.randn(num_channels, embed_dim, kv_dim) * std)
+        self.out_proj = nn.Parameter(torch.randn(num_channels, q_dim, embed_dim) * std)
+
+        # per-channel RMSNorm gains
+        self.norm_w = nn.Parameter(torch.ones(num_channels, embed_dim))
+        self.q_norm_w = nn.Parameter(torch.ones(num_channels, self.head_dim))
+        self.k_norm_w = nn.Parameter(torch.ones(num_channels, self.head_dim))
+
+        self.rope = RoPE1D(self.head_dim)
+        self.device = device
+        self.to(self.device)
+
+    def _rms(self, x, weight):
+        # x: [..., N, ..., d]; weight: [N, d] already broadcast by caller
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * weight
+
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None):
+        """
+        x:                [B, T, N, D]
+        key_padding_mask: [B, T, N] True = PAD (masked as a key at that timestep)
+        """
+        B, T, N, D = x.shape
+        if N != self.num_channels:
+            raise ValueError(f"expected {self.num_channels} channels, got {N}")
+        H, Hkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
+
+        xn = self._rms(x, self.norm_w)                                  # [B,T,N,D]
+
+        q = torch.einsum("btnd,ndh->btnh", xn, self.q_proj)
+        k = torch.einsum("btnd,ndh->btnh", xn, self.k_proj)
+        v = torch.einsum("btnd,ndh->btnh", xn, self.v_proj)
+
+        # [B,T,N,H*hd] -> [B,N,H,T,hd]
+        q = q.view(B, T, N, H, hd).permute(0, 2, 3, 1, 4)
+        k = k.view(B, T, N, Hkv, hd).permute(0, 2, 3, 1, 4)
+        v = v.view(B, T, N, Hkv, hd).permute(0, 2, 3, 1, 4)
+
+        q = self._rms(q, self.q_norm_w.view(1, N, 1, 1, hd))
+        k = self._rms(k, self.k_norm_w.view(1, N, 1, 1, hd))
+
+        q = q.reshape(B * N, H, T, hd)
+        k = k.reshape(B * N, Hkv, T, hd)
+        v = v.reshape(B * N, Hkv, T, hd)
+
+        cos, sin = self.rope(q, seq_len=T)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # ---- causal bias (+ padded keys) ----
+        causal_bool = torch.ones((T, T), dtype=torch.bool, device=x.device).tril(diagonal=0)
+        bias = torch.zeros((T, T), dtype=q.dtype, device=x.device)
+        bias.masked_fill_(~causal_bool, float("-inf"))
+        bias = bias[None, None, :, :]                                   # [1,1,T,T]
+
+        if key_padding_mask is not None:
+            kpm = key_padding_mask.permute(0, 2, 1).reshape(B * N, T)   # [B*N,T]
+            kpm_bias = torch.zeros((B * N, 1, 1, T), dtype=q.dtype, device=x.device)
+            kpm_bias.masked_fill_(kpm[:, None, None, :], float("-inf"))
+            bias = bias + kpm_bias
+
+        # a query whose keys are all padded would give an all -inf softmax row
+        all_blocked = torch.isneginf(bias).all(dim=-1, keepdim=True)
+        bias = bias.masked_fill(all_blocked, 0.0)
+
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=bias,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,
+            enable_gqa=True,
+        )
+        out = out * (~all_blocked).to(out.dtype)
+
+        out = out.view(B, N, H, T, hd).permute(0, 3, 1, 2, 4).reshape(B, T, N, H * hd)
+        return torch.einsum("btnh,nhd->btnd", out, self.out_proj)
+
+
+class ModalityTimeBlock(nn.Module):
+    """
+    Causal temporal attention with one set of weights per channel: every spatial
+    slot of every stream (each z token, each action token, the agent token) gets
+    its own temporal attention weights, so nothing is shared across channels or
+    across modalities.
+
+    The feed-forward stays per-modality -- per-channel MLPs would dominate the
+    parameter count without changing the attention structure being asked for.
+    """
+
+    def __init__(self, d_model, n_heads, n_z_channels, n_a_channels,
+                 n_agent_channels=1, dropout=0.1, device="cuda"):
         super().__init__()
         self.d_model = d_model
         self.time_attn_enabled = True
 
-        self.ln_z = nn.RMSNorm(d_model)
-        self.ln_a = nn.RMSNorm(d_model)
-        self.ln_agent = nn.RMSNorm(d_model)
-
-        self.time_z = GQA(d_model, n_heads, dropout, causal=True, device=device)
-        self.time_a = GQA(d_model, n_heads, dropout, causal=True, device=device)
-        self.time_agent = GQA(d_model, n_heads, dropout, causal=True, device=device)
+        self.time_z = PerChannelTimeAttention(n_z_channels, d_model, n_heads, dropout, device=device)
+        self.time_a = PerChannelTimeAttention(n_a_channels, d_model, n_heads, dropout, device=device)
+        self.time_agent = PerChannelTimeAttention(n_agent_channels, d_model, n_heads, dropout, device=device)
 
         self.mlp_z = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
         self.mlp_a = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
@@ -426,12 +535,8 @@ class ModalityTimeBlock(nn.Module):
         self.to(self.device)
 
     @staticmethod
-    def _attend(attn, ln, mlp, x, pad):
-        B, T, N, D = x.shape
-        xt = ln(x).permute(0, 2, 1, 3).reshape(B * N, T, D)
-        kpm = pad.permute(0, 2, 1).reshape(B * N, T) if pad is not None else None
-        out = attn(xt, key_padding_mask=kpm)
-        x = x + out.reshape(B, N, T, D).permute(0, 2, 1, 3)
+    def _attend(attn, mlp, x, pad):
+        x = x + attn(x, key_padding_mask=pad)
         return x + mlp(x)
 
     def forward(
@@ -442,10 +547,10 @@ class ModalityTimeBlock(nn.Module):
         z_pad: torch.Tensor | None = None,
         a_pad: torch.Tensor | None = None,
     ):
-        z = self._attend(self.time_z, self.ln_z, self.mlp_z, z, z_pad)
-        a = self._attend(self.time_a, self.ln_a, self.mlp_a, a, a_pad)
+        z = self._attend(self.time_z, self.mlp_z, z, z_pad)
+        a = self._attend(self.time_a, self.mlp_a, a, a_pad)
         if agent is not None:
-            agent = self._attend(self.time_agent, self.ln_agent, self.mlp_agent, agent, None)
+            agent = self._attend(self.time_agent, self.mlp_agent, agent, None)
         return z, a, agent
 
 
@@ -605,12 +710,19 @@ class Dynamics(nn.Module):
 
         # Blocks: modality-specific attention weights.
         #   space -> z/z, z/actions, actions/actions, actions/z, agent/[z;actions]
-        #   time  -> one causal attention per spatial stream (z, actions, agent)
+        #   time  -> one causal attention per channel (per spatial slot of each stream)
+        n_z_channels = self.Nz + 1 + self.Nr      # latents + signal token + reserved
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == (0))
             if use_time:
-                blocks.append(ModalityTimeBlock(d_model, n_heads, dropout=dropout, device=device))
+                blocks.append(ModalityTimeBlock(
+                    d_model, n_heads,
+                    n_z_channels=n_z_channels,
+                    n_a_channels=self.Sa,
+                    n_agent_channels=1,
+                    dropout=dropout, device=device,
+                ))
             else:
                 blocks.append(ModalitySpaceBlock(d_model, n_heads, dropout=dropout, device=device))
         self.blocks = nn.ModuleList(blocks)
