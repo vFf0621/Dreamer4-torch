@@ -49,7 +49,7 @@ def load_replay(path="buffer.npz", seed=None):
     return buf
 def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, patch , Nr, latent_tokens, z_dim, action_dim, latent_dim, 
                  rep_depth , rep_d_model, dyn_d_model, num_heads, dropout, k_max, mtp, task_id,  kmax_prob, lambda_, buffer,
-                 gqa_ratio, mlp_ratio,
+                 gqa_ratio, mlp_ratio, dyn_num_heads,
                  policy_bins , reward_bins , pretrain, reward_clamp,level_vocab , level_embed_dim,mode,num_tasks, Sa,
                  batch_lens, batch_size, accum, max_imag_len, buffer_limit, train, ckpt, rep_lr=1e-4, rep_decay=1e-3,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3 , save_every=500):
@@ -66,6 +66,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
                 rep_d_model=rep_d_model, 
                 dyn_d_model=dyn_d_model, 
                 num_heads=num_heads, 
+                dyn_num_heads=dyn_num_heads,
                 gqa_ratio=gqa_ratio,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout, 
@@ -229,6 +230,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rep_d_model", type=int, default=128)
     p.add_argument("--dyn_d_model", type=int, default=256)
     p.add_argument("--num_heads", type=int, default=8)
+    p.add_argument("--dyn_heads", type=int, default=None,
+                   help="Attention heads in the dynamics. Defaults to 2x --num_heads, which "
+                        "halves the dynamics head dim at the same width.")
     p.add_argument("--gqa_ratio", type=int, default=4,
                    help="Query heads per key/value head. 1 = full multi-head attention.")
     p.add_argument("--mlp_ratio", type=float, default=2.0,
@@ -313,6 +317,7 @@ def main():
         rep_d_model=args.rep_d_model,
         dyn_d_model=args.dyn_d_model,
         num_heads=args.num_heads,
+        dyn_num_heads=args.dyn_heads,
         gqa_ratio=args.gqa_ratio,
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
