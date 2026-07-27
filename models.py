@@ -71,14 +71,30 @@ class Policy(nn.Module):
         
         action = action.squeeze(-1)
         return action, logp, dist, dist_act, idx
+def gqa_kv_heads(num_heads: int, ratio: int) -> int:
+    """
+    Number of key/value heads for a target query-per-kv-head `ratio`.
+
+    SDPA's enable_gqa needs num_heads % num_kv_heads == 0, which a bare
+    num_heads // ratio does not guarantee (14 heads at ratio 4 -> 3, and 14 % 3
+    != 0). Take the largest divisor of num_heads that is no larger than the
+    target instead, so any head count stays valid.
+    """
+    target = max(1, num_heads // max(1, ratio))
+    for d in range(target, 0, -1):
+        if num_heads % d == 0:
+            return d
+    return 1
+
+
 class GQA(nn.Module):
-    def __init__(self, embed_dim=16, num_heads=8, dropout=0.1, causal=False,device="cuda"):
+    def __init__(self, embed_dim=16, num_heads=8, dropout=0.1, causal=False, device="cuda", gqa_ratio=4):
         super().__init__()
         assert embed_dim % num_heads == 0
 
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.num_kv_heads = num_heads//2
+        self.num_kv_heads = gqa_kv_heads(num_heads, gqa_ratio)
         self.head_dim = embed_dim // num_heads
         self.causal = causal
 
@@ -214,7 +230,7 @@ class ModalitySpaceBlock(nn.Module):
         actions gets attn_a_a + attn_a_z
     """
 
-    def __init__(self, d_model, n_heads, dropout=0.1, device="cuda"):
+    def __init__(self, d_model, n_heads, dropout=0.1, device="cuda", gqa_ratio=4):
         super().__init__()
         self.d_model = d_model
         self.time_attn_enabled = False
@@ -223,11 +239,11 @@ class ModalitySpaceBlock(nn.Module):
         self.ln_a = nn.RMSNorm(d_model)
         self.ln_agent = nn.RMSNorm(d_model)
 
-        self.attn_z_z = GQA(d_model, n_heads, dropout, device=device)
-        self.attn_z_a = GQA(d_model, n_heads, dropout, device=device)
-        self.attn_a_a = GQA(d_model, n_heads, dropout, device=device)
-        self.attn_a_z = GQA(d_model, n_heads, dropout, device=device)
-        self.attn_agent_za = GQA(d_model, n_heads, dropout, device=device)
+        self.attn_z_z = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        self.attn_z_a = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        self.attn_a_a = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        self.attn_a_z = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        self.attn_agent_za = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
 
         self.mlp_z = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
         self.mlp_a = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
@@ -297,14 +313,15 @@ class PerChannelTimeAttention(nn.Module):
     so its cache is shared across channels.
     """
 
-    def __init__(self, num_channels, embed_dim, num_heads, dropout=0.0, device="cuda", eps=1e-6):
+    def __init__(self, num_channels, embed_dim, num_heads, dropout=0.0, device="cuda",
+                 eps=1e-6, gqa_ratio=4):
         super().__init__()
         assert embed_dim % num_heads == 0
 
         self.num_channels = num_channels
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.num_kv_heads = max(1, num_heads // 2)
+        self.num_kv_heads = gqa_kv_heads(num_heads, gqa_ratio)
         self.head_dim = embed_dim // num_heads
         self.dropout = dropout
         self.eps = eps
@@ -455,14 +472,14 @@ class ModalityTimeBlock(nn.Module):
     """
 
     def __init__(self, d_model, n_heads, n_z_channels, n_a_channels,
-                 n_agent_channels=1, dropout=0.1, device="cuda"):
+                 n_agent_channels=1, dropout=0.1, device="cuda", gqa_ratio=4):
         super().__init__()
         self.d_model = d_model
         self.time_attn_enabled = True
 
-        self.time_z = PerChannelTimeAttention(n_z_channels, d_model, n_heads, dropout, device=device)
-        self.time_a = PerChannelTimeAttention(n_a_channels, d_model, n_heads, dropout, device=device)
-        self.time_agent = PerChannelTimeAttention(n_agent_channels, d_model, n_heads, dropout, device=device)
+        self.time_z = PerChannelTimeAttention(n_z_channels, d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        self.time_a = PerChannelTimeAttention(n_a_channels, d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        self.time_agent = PerChannelTimeAttention(n_agent_channels, d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
 
         self.mlp_z = PerChannelMLP(n_z_channels, d_model)
         self.mlp_a = PerChannelMLP(n_a_channels, d_model)
@@ -511,7 +528,7 @@ class RepModalitySpaceBlock(nn.Module):
     no modality can even form keys it is not allowed to read.
     """
 
-    def __init__(self, d_model, n_heads, dropout=0.1, encoder=True, device=None):
+    def __init__(self, d_model, n_heads, dropout=0.1, encoder=True, device=None, gqa_ratio=4):
         super().__init__()
         self.d_model = d_model
         self.encoder = encoder
@@ -522,17 +539,17 @@ class RepModalitySpaceBlock(nn.Module):
         self.ln_res = nn.RMSNorm(d_model)
 
         # self-attention, one set per modality
-        self.attn_lat_lat = GQA(d_model, n_heads, dropout, device=device)
-        self.attn_patch_patch = GQA(d_model, n_heads, dropout, device=device)
-        self.attn_res_res = GQA(d_model, n_heads, dropout, device=device)
+        self.attn_lat_lat = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        self.attn_patch_patch = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        self.attn_res_res = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
 
         # cross-attention, direction depends on encoder/decoder
         if encoder:
-            self.attn_lat_patch = GQA(d_model, n_heads, dropout, device=device)
-            self.attn_lat_res = GQA(d_model, n_heads, dropout, device=device)
+            self.attn_lat_patch = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+            self.attn_lat_res = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
         else:
-            self.attn_patch_lat = GQA(d_model, n_heads, dropout, device=device)
-            self.attn_res_lat = GQA(d_model, n_heads, dropout, device=device)
+            self.attn_patch_lat = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+            self.attn_res_lat = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
 
         self.mlp_lat = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
         self.mlp_patch = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
@@ -581,19 +598,19 @@ class RepModalityTimeBlock(nn.Module):
     """
 
     def __init__(self, d_model, n_heads, n_latent, n_patch, n_reserved,
-                 dropout=0.1, device=None):
+                 dropout=0.1, device=None, gqa_ratio=4):
         super().__init__()
         self.d_model = d_model
         self.time_attn_enabled = True
 
-        self.time_lat = PerChannelTimeAttention(n_latent, d_model, n_heads, dropout, device=device)
-        self.time_patch = PerChannelTimeAttention(n_patch, d_model, n_heads, dropout, device=device)
+        self.time_lat = PerChannelTimeAttention(n_latent, d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        self.time_patch = PerChannelTimeAttention(n_patch, d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
         self.mlp_lat = PerChannelMLP(n_latent, d_model)
         self.mlp_patch = PerChannelMLP(n_patch, d_model)
 
         self.has_reserved = n_reserved > 0
         if self.has_reserved:
-            self.time_res = PerChannelTimeAttention(n_reserved, d_model, n_heads, dropout, device=device)
+            self.time_res = PerChannelTimeAttention(n_reserved, d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
             self.mlp_res = PerChannelMLP(n_reserved, d_model)
 
         self.device = device
@@ -629,6 +646,7 @@ class Encoder(nn.Module):
         out_dim: int = 16,     # Dz
         max_T: int = 256,
         num_reserved = 4,
+        gqa_ratio: int = 4,       # query heads per key/value head
         pool: str = "first",      # "mean" or "first"
     ):
         super().__init__()
@@ -655,10 +673,11 @@ class Encoder(nn.Module):
                 blocks.append(RepModalityTimeBlock(
                     d_model, n_heads,
                     n_latent=latent_tokens, n_patch=self.num_patches, n_reserved=num_reserved,
-                    dropout=dropout,
+                    dropout=dropout, gqa_ratio=gqa_ratio,
                 ))
             else:
-                blocks.append(RepModalitySpaceBlock(d_model, n_heads, dropout=dropout, encoder=True))
+                blocks.append(RepModalitySpaceBlock(d_model, n_heads, dropout=dropout,
+                                                    encoder=True, gqa_ratio=gqa_ratio))
         self.blocks = nn.ModuleList(blocks)
 
         self.ln_out = nn.RMSNorm(d_model)
@@ -728,6 +747,7 @@ class Dynamics(nn.Module):
         action_high: int= 1,
         action_lookup: bool = True,
         Nr: int = 4,
+        gqa_ratio: int = 4,                 # query heads per key/value head
         # behavior toggles
         mask_last_action: bool = True,      # usually correct for "predict next"
         clamp_signal_indices: bool = False, # set True if you’d rather clamp than crash
@@ -780,10 +800,11 @@ class Dynamics(nn.Module):
                     n_z_channels=n_z_channels,
                     n_a_channels=self.Sa,
                     n_agent_channels=1,
-                    dropout=dropout, device=device,
+                    dropout=dropout, device=device, gqa_ratio=gqa_ratio,
                 ))
             else:
-                blocks.append(ModalitySpaceBlock(d_model, n_heads, dropout=dropout, device=device))
+                blocks.append(ModalitySpaceBlock(d_model, n_heads, dropout=dropout,
+                                                 device=device, gqa_ratio=gqa_ratio))
         self.blocks = nn.ModuleList(blocks)
 
         # Output head: model dim -> Dz
@@ -916,11 +937,12 @@ class Dreamer4(nn.Module):
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=True, symlog_for_value=True,
-                kmax_prob=0.1):
+                kmax_prob=0.1, gqa_ratio=4):
         super(Dreamer4, self).__init__()
         self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patch, d_model=rep_d_model,
                                 n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=2,
-                                out_dim=z_dim, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
+                                out_dim=z_dim, dropout=dropout, max_T=max_imag_len, num_reserved=Nr,
+                                gqa_ratio=gqa_ratio)
         self.ema = 0.98
         self.device="cuda" if torch.cuda.is_available() else "cpu"
         self.pretrain = False
@@ -932,7 +954,8 @@ class Dreamer4(nn.Module):
 
         self.lambda_=lambda_
         self.decoder = Decoder(img_channels=ch, w = w, h=h, patch=patch, z_dim=z_dim, d_model=rep_d_model, n_heads=num_heads,
-                               depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
+                               depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout,
+                               max_T=max_imag_len, num_reserved=Nr, gqa_ratio=gqa_ratio)
         self.imagination_steps = max_imag_len - 1
         self.rminv = -reward_clamp
         self.rmaxv = reward_clamp
@@ -988,6 +1011,7 @@ class Dreamer4(nn.Module):
             max_T = max_imag_len,
             num_tasks=num_tasks,
             time_every=4,
+            gqa_ratio=gqa_ratio,
             latent_tokens=latent_tokens * self.expanding_ratio
         )
 
@@ -1953,6 +1977,7 @@ class Decoder(nn.Module):
         max_T: int = 256,
         output_range: str = "0_1",
         num_reserved = 4,
+        gqa_ratio: int = 4,       # query heads per key/value head
     ):
         super().__init__()
         assert (h % patch == 0) and (w % patch == 0)
@@ -1984,10 +2009,11 @@ class Decoder(nn.Module):
                 blocks.append(RepModalityTimeBlock(
                     d_model, n_heads,
                     n_latent=latent_tokens, n_patch=self.num_patches, n_reserved=num_reserved,
-                    dropout=dropout,
+                    dropout=dropout, gqa_ratio=gqa_ratio,
                 ))
             else:
-                blocks.append(RepModalitySpaceBlock(d_model, n_heads, dropout=dropout, encoder=False))
+                blocks.append(RepModalitySpaceBlock(d_model, n_heads, dropout=dropout,
+                                                    encoder=False, gqa_ratio=gqa_ratio))
         self.blocks = nn.ModuleList(blocks)
         self.ln_out = nn.RMSNorm(d_model)
         self.to_patch = nn.Linear(d_model, img_channels * patch * patch)
