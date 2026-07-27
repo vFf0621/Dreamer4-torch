@@ -440,7 +440,8 @@ class PerChannelTimeAttention(nn.Module):
 
         self.rope = RoPE1D(self.head_dim)
         self.device = device
-        self.to(self.device)
+        if device is not None:
+            self.to(device)
 
     def _rms(self, x, weight):
         # x: [..., N, ..., d]; weight: [N, d] already broadcast by caller
@@ -605,6 +606,128 @@ class ModalityTimeBlock(nn.Module):
         return z, a, agent
 
 
+class RepModalitySpaceBlock(nn.Module):
+    """
+    Spatial attention for the representation stack (encoder / decoder) with one
+    set of weights per modality: latent tokens, patch tokens, reserved registers.
+
+    encoder=True -- only the latents may read patches:
+        latents  <- latents + patches + reserved      (same shape -> summed)
+        patches  <- patches
+        reserved <- reserved
+
+    encoder=False -- the decoder direction, only patches (and registers) read
+    the latents, which keeps the latent source pure:
+        latents  <- latents
+        patches  <- patches + latents                 (summed)
+        reserved <- reserved + latents                (summed)
+
+    This replaces the additive `modality_mask`: the routing is now structural, so
+    no modality can even form keys it is not allowed to read.
+    """
+
+    def __init__(self, d_model, n_heads, dropout=0.1, encoder=True, device=None):
+        super().__init__()
+        self.d_model = d_model
+        self.encoder = encoder
+        self.time_attn_enabled = False
+
+        self.ln_lat = nn.RMSNorm(d_model)
+        self.ln_patch = nn.RMSNorm(d_model)
+        self.ln_res = nn.RMSNorm(d_model)
+
+        # self-attention, one set per modality
+        self.attn_lat_lat = GQA(d_model, n_heads, dropout, device=device)
+        self.attn_patch_patch = GQA(d_model, n_heads, dropout, device=device)
+        self.attn_res_res = GQA(d_model, n_heads, dropout, device=device)
+
+        # cross-attention, direction depends on encoder/decoder
+        if encoder:
+            self.attn_lat_patch = GQA(d_model, n_heads, dropout, device=device)
+            self.attn_lat_res = GQA(d_model, n_heads, dropout, device=device)
+        else:
+            self.attn_patch_lat = GQA(d_model, n_heads, dropout, device=device)
+            self.attn_res_lat = GQA(d_model, n_heads, dropout, device=device)
+
+        self.mlp_lat = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
+        self.mlp_patch = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
+        self.mlp_res = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
+
+        self.device = device
+        if device is not None:
+            self.to(device)
+
+    def forward(self, lat, patch, res=None):
+        """lat: [B,T,L,D]  patch: [B,T,Np,D]  res: [B,T,Nr,D] or None"""
+        B, T, L, D = lat.shape
+        Np = patch.shape[2]
+
+        ln = self.ln_lat(lat).reshape(B * T, L, D)
+        pn = self.ln_patch(patch).reshape(B * T, Np, D)
+        rn = None if res is None else self.ln_res(res).reshape(B * T, res.shape[2], D)
+
+        if self.encoder:
+            lat_out = self.attn_lat_lat(ln) + self.attn_lat_patch(ln, x_k=pn)
+            if rn is not None:
+                lat_out = lat_out + self.attn_lat_res(ln, x_k=rn)
+            patch_out = self.attn_patch_patch(pn)
+            res_out = None if rn is None else self.attn_res_res(rn)
+        else:
+            lat_out = self.attn_lat_lat(ln)
+            patch_out = self.attn_patch_patch(pn) + self.attn_patch_lat(pn, x_k=ln)
+            res_out = None if rn is None else (self.attn_res_res(rn) + self.attn_res_lat(rn, x_k=ln))
+
+        lat = lat + lat_out.reshape(B, T, L, D)
+        patch = patch + patch_out.reshape(B, T, Np, D)
+        lat = lat + self.mlp_lat(lat)
+        patch = patch + self.mlp_patch(patch)
+        if res is not None:
+            res = res + res_out.reshape(B, T, res.shape[2], D)
+            res = res + self.mlp_res(res)
+        return lat, patch, res
+
+
+class RepModalityTimeBlock(nn.Module):
+    """
+    Causal temporal attention for the representation stack with one set of
+    weights per channel: every latent slot, every patch position and every
+    reserved register attends over time with its own attention and its own
+    feed-forward.
+    """
+
+    def __init__(self, d_model, n_heads, n_latent, n_patch, n_reserved,
+                 dropout=0.1, device=None):
+        super().__init__()
+        self.d_model = d_model
+        self.time_attn_enabled = True
+
+        self.time_lat = PerChannelTimeAttention(n_latent, d_model, n_heads, dropout, device=device)
+        self.time_patch = PerChannelTimeAttention(n_patch, d_model, n_heads, dropout, device=device)
+        self.mlp_lat = PerChannelMLP(n_latent, d_model)
+        self.mlp_patch = PerChannelMLP(n_patch, d_model)
+
+        self.has_reserved = n_reserved > 0
+        if self.has_reserved:
+            self.time_res = PerChannelTimeAttention(n_reserved, d_model, n_heads, dropout, device=device)
+            self.mlp_res = PerChannelMLP(n_reserved, d_model)
+
+        self.device = device
+        if device is not None:
+            self.to(device)
+
+    @staticmethod
+    def _attend(attn, mlp, x):
+        x = x + attn(x)
+        return x + mlp(x)
+
+    def forward(self, lat, patch, res=None):
+        lat = self._attend(self.time_lat, self.mlp_lat, lat)
+        patch = self._attend(self.time_patch, self.mlp_patch, patch)
+        if res is not None and self.has_reserved:
+            res = self._attend(self.time_res, self.mlp_res, res)
+        return lat, patch, res
+
+
 class Encoder(nn.Module):
     def __init__(
         self,
@@ -643,7 +766,14 @@ class Encoder(nn.Module):
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == 0)
-            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time))
+            if use_time:
+                blocks.append(RepModalityTimeBlock(
+                    d_model, n_heads,
+                    n_latent=latent_tokens, n_patch=self.num_patches, n_reserved=num_reserved,
+                    dropout=dropout,
+                ))
+            else:
+                blocks.append(RepModalitySpaceBlock(d_model, n_heads, dropout=dropout, encoder=True))
         self.blocks = nn.ModuleList(blocks)
 
         self.ln_out = nn.RMSNorm(d_model)
@@ -658,23 +788,16 @@ class Encoder(nn.Module):
         patches = F.unfold(x, kernel_size=p, stride=p)                       # (B*T, C*p*p, Np)
         patches = patches.transpose(1, 2).contiguous()                       # (B*T, Np, patch_dim)
         patches = patches.view(B, T, self.num_patches, -1)                   # (B,T,Np,patch_dim)
-        space_mask = modality_mask(
-            L=self.latent_tokens,
-            modality_sizes=[self.num_patches, self.num_reserved],
-            device=frames.device
-        ) 
-        
-        proj = self.patch_proj(patches)                             # (B,T,Np,D)
-        lat = self.latent_tok.view(1, 1, self.latent_tokens, self.d_model).expand(B, T, -1, -1) 
-        x = torch.cat([lat, proj, self.reserved.expand(B,T,-1,self.d_model)], dim=2)                     # (B,T,S,D) with S=L+Np      
 
-        x = self.drop(x)
+        proj = self.patch_proj(patches)                             # (B,T,Np,D)
+        lat = self.latent_tok.view(1, 1, self.latent_tokens, self.d_model).expand(B, T, -1, -1)
+        res = self.reserved.expand(B, T, -1, self.d_model)
+
+        # modalities stay separate: routing is structural, no space mask needed
+        lat, proj, res = self.drop(lat), self.drop(proj), self.drop(res)
         for blk in self.blocks:
-            if blk.time_attn_enabled:
-                x = blk(x, mask=None,)          # no space mask here
-            else:
-                x = blk(x, mask=space_mask)    # modality mask only here
-        x = self.ln_out(x[:,:,:self.latent_tokens])  
+            lat, proj, res = blk(lat, proj, res)
+        x = self.ln_out(lat)
 
         pre = (self.readout(x))
         ztok = torch.tanh(pre)   # [B,T,Np,Dz]
@@ -1972,7 +2095,14 @@ class Decoder(nn.Module):
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == 0)
-            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time))
+            if use_time:
+                blocks.append(RepModalityTimeBlock(
+                    d_model, n_heads,
+                    n_latent=latent_tokens, n_patch=self.num_patches, n_reserved=num_reserved,
+                    dropout=dropout,
+                ))
+            else:
+                blocks.append(RepModalitySpaceBlock(d_model, n_heads, dropout=dropout, encoder=False))
         self.blocks = nn.ModuleList(blocks)
         self.ln_out = nn.RMSNorm(d_model)
         self.to_patch = nn.Linear(d_model, img_channels * patch * patch)
@@ -2002,21 +2132,17 @@ class Decoder(nn.Module):
             raise ValueError(f"Expected z dim 3 or 4, got {tuple(z.shape)}")
         # ---- patch queries ----
         pq = self.patch_queries.expand(B, T, self.num_patches, self.d_model)
-        # IMPORTANT: put latents FIRST, then patch queries
-        x = torch.cat([zlat, pq, self.reserved.expand(B, T, -1, self.d_model)], dim=2)   # (B,T,L+Np,D)
-        x = self.drop(x)
-        space_mask = modality_mask(L, [self.num_patches, self.num_reserved], encoder=False, device=x.device)
+        res = self.reserved.expand(B, T, -1, self.d_model)
+
+        # modalities stay separate: routing is structural, no space mask needed
+        zlat, pq, res = self.drop(zlat), self.drop(pq), self.drop(res)
 
         # ---- transformer ----
         for blk in self.blocks:
-            if blk.time_attn_enabled:
-                x = blk(x)          # no space mask here
-            else:
-                x = blk(x,  mask=space_mask)    # modality mask only here
-        x = self.ln_out(x)
+            zlat, pq, res = blk(zlat, pq, res)
 
         # ---- decode ONLY patch tokens ----
-        patch_tok = x[:, :, L:-self.num_reserved, :]           # (B,T,Np,D)
+        patch_tok = self.ln_out(pq)                            # (B,T,Np,D)
         # sanity check
         assert patch_tok.shape[2] == self.num_patches, (patch_tok.shape, self.num_patches)
 
