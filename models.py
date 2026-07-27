@@ -658,6 +658,7 @@ class Encoder(nn.Module):
         num_reserved = 4,
         gqa_ratio: int = 4,       # query heads per key/value head
         mlp_ratio: float = 2.0,   # feed-forward hidden width, as a multiple of d_model
+        mae_max_ratio: float = 0.9,  # max patch dropout probability for masked autoencoding
         pool: str = "first",      # "mean" or "first"
     ):
         super().__init__()
@@ -674,6 +675,9 @@ class Encoder(nn.Module):
         patch_dim = img_channels * patch * patch
         self.patch_proj = nn.Sequential(nn.RMSNorm(patch_dim), nn.Linear(patch_dim, d_model))
         self.latent_tok = nn.Parameter(torch.randn(1, 1, latent_tokens, d_model) * 0.02)
+        # masked autoencoding: dropped patches are replaced by this learned embedding
+        self.mask_token = nn.Parameter(torch.randn(1, 1, 1, d_model) * 0.02)
+        self.mae_max_ratio = mae_max_ratio
         self.drop = nn.Dropout(dropout)
         self.reserved = nn.Parameter(torch.randn(1, 1, num_reserved, d_model) * 0.02)
         self.num_reserved=num_reserved
@@ -695,7 +699,26 @@ class Encoder(nn.Module):
         self.ln_out = nn.RMSNorm(d_model)
         self.readout = nn.Linear(d_model, out_dim)
 
-    def forward(self, frames: torch.Tensor, return_tokens= True) -> torch.Tensor:
+    def mask_patches(self, proj: torch.Tensor, mask_ratio: float | None = None) -> torch.Tensor:
+        """
+        Masked autoencoding over patch tokens.
+
+        proj: [B,T,Np,D] projected patches.
+        Each image draws its own dropout probability p ~ U(0, mae_max_ratio) and
+        replaces patches with the learned mask embedding at that rate, so low
+        rates -- including the p=0 case used at inference -- are seen in training.
+        Pass mask_ratio to pin p instead of sampling it.
+        """
+        B, T, Np, D = proj.shape
+        if mask_ratio is None:
+            p = torch.rand(B, T, 1, device=proj.device) * self.mae_max_ratio
+        else:
+            p = torch.full((B, T, 1), float(mask_ratio), device=proj.device)
+        drop = torch.rand(B, T, Np, device=proj.device) < p          # [B,T,Np]
+        return torch.where(drop.unsqueeze(-1), self.mask_token.to(proj.dtype), proj)
+
+    def forward(self, frames: torch.Tensor, return_tokens= True,
+                mae: bool = False, mask_ratio: float | None = None) -> torch.Tensor:
         B, T, C, H, W = frames.shape
         p = self.patch
         assert H % p == 0 and W % p == 0, (H, W, p)
@@ -706,6 +729,8 @@ class Encoder(nn.Module):
         patches = patches.view(B, T, self.num_patches, -1)                   # (B,T,Np,patch_dim)
 
         proj = self.patch_proj(patches)                             # (B,T,Np,D)
+        if mae or mask_ratio is not None:
+            proj = self.mask_patches(proj, mask_ratio)
         lat = self.latent_tok.view(1, 1, self.latent_tokens, self.d_model).expand(B, T, -1, -1)
         res = self.reserved.expand(B, T, -1, self.d_model)
 
@@ -1747,7 +1772,9 @@ class Dreamer4(nn.Module):
               #  self.canonical_decoder.train()
                # self.canonical_decoder1.train()
 
-                z_t  = self.encoder(states)
+                # masked autoencoding: patches are dropped only while training the
+                # tokenizer, and the target stays the unmasked frame
+                z_t  = self.encoder(states, mae=True)
 
                 B,T = z_t.shape[:2]
   
