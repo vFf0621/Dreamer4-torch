@@ -195,121 +195,6 @@ class GQA(nn.Module):
         return self.out_proj(out)
 
 
-class CausalSTBlock(nn.Module):
-    def __init__(self, d_model, n_heads, dropout=0.1, time_attn=True, cap_value=50,  device="cuda"):
-        super().__init__()
-        self.time_attn_enabled = time_attn
-        self.d_model = d_model
-        self.ln_space = nn.RMSNorm(d_model)
-
-        if not self.time_attn_enabled:
-            self.space_attn = GQA(d_model, n_heads,  dropout, device=device)
-        else:
-            self.time_attn = GQA(d_model, n_heads,  dropout, causal=True, device=device)
-
-        self.ln_time = nn.RMSNorm(d_model)
-        self.mlp = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
-        self.device = device
-        self.to(self.device)
-
-    def forward(
-            self,
-            x: torch.Tensor,
-            token_pad_mask: torch.Tensor | None = None,   # [B,T,N] True = PAD
-            *,
-            agent_idx: int | None = None,
-            mask=None,                                    # either None, or [N,N] or [N+R, N+R] additive float (-inf)
-            ) -> torch.Tensor:
-        if x.dim() == 3:
-            x = x.unsqueeze(2)  # [B,T,1,D]
-
-        B, T, N, D = x.shape
-        Ncat = N
-
-        # ---- normalize token_pad_mask to [B,T,N] ----
-        if token_pad_mask is not None:
-            assert token_pad_mask.shape[:2] == (B, T), (token_pad_mask.shape, (B, T))
-            if token_pad_mask.size(2) >= N:
-                token_pad_mask = token_pad_mask[:, :, :N]
-            else:
-                pad = torch.zeros(B, T, N - token_pad_mask.size(2),
-                                dtype=torch.bool, device=x.device)
-                token_pad_mask = torch.cat([token_pad_mask.to(x.device), pad], dim=2)
-
-        if agent_idx is not None and not (0 <= agent_idx < N):
-            raise ValueError(f"agent_idx={agent_idx} out of range for N={N}")
-
-        # =========================
-        # TIME ATTENTION
-        # =========================
-        if self.time_attn_enabled:
-            x_time = self.ln_time(x).permute(0, 2, 1, 3).reshape(B * N, T, D)
-
-            time_kpm = None
-            if token_pad_mask is not None:
-                # token_pad_mask: [B,T,N] -> [B,N,T] -> [B*N, T]
-                time_kpm = token_pad_mask.permute(0, 2, 1).reshape(B * N, T)
-
-            # Prefer is_causal=True inside your GQA/attn module if possible; otherwise pass a causal float mask.
-            xt_out = self.time_attn(
-                x_time,
-                attn_mask=None,              # or causal_mask(T) if your impl needs it
-                key_padding_mask=time_kpm,
-            )
-
-            xt_out = xt_out.reshape(B, N, T, D).permute(0, 2, 1, 3)
-            x = x + xt_out
-            x = x + self.mlp(x)
-            return x.squeeze(2) if x.shape[2] == 1 else x
-
-        # =========================
-        # SPACE ATTENTION
-        # =========================
-        x_space = self.ln_space(x)
-        x_space = x_space.reshape(B * T, N, D)  # [B*T, N, D]
-
-        # ---- build key_padding_mask for space attn: [B*T, N+R] ----
-        space_kpm = None
-        if token_pad_mask is not None:
-            space_kpm = token_pad_mask.reshape(B * T, N)  # [B*T, N]
-            # reserved tokens are never PAD
-          
-
-        # ---- build final additive attn mask over [N+R, N+R] ----
-        final_mask = None
-        if mask is not None:
-            if mask.shape[-2:] == (N, N):
-                # Expand (N,N) -> (Ncat,Ncat) with "reserved are keys-only":
-                # - Everyone may attend to reserved keys (cols N:)
-                # - Reserved queries (rows N:) may NOT attend to non-reserved keys (:N)
-                # - Optionally: reserved queries only attend to themselves (recommended)
-
-               
-                    # additive mask: 0 = keep, -inf = block
-                m = torch.zeros((Ncat, Ncat), dtype=mask.dtype, device=x.device)
-
-                    # normal->normal from provided mask (should contain 0/-inf or similar)
-                m[:N, :N] = mask
-
-                 
-                final_mask = m
-
-            elif mask.shape[-2:] == (Ncat, Ncat):
-                final_mask = mask
-            else:
-                raise ValueError(f"mask has shape {mask.shape}, expected ({N},{N}) or ({Ncat},{Ncat})")
-           
-        xs = self.space_attn(
-            x_space,
-            attn_mask=final_mask,          # additive float mask (0 / -inf)
-            key_padding_mask=space_kpm,    # True = PAD keys
-        )[:, :N]  # drop reserved outputs
-
-        x = x + xs.reshape(B, T, N, D)
-        x = x + self.mlp(x)
-        return x.squeeze(2) if x.shape[2] == 1 else x
-
-
 class ModalitySpaceBlock(nn.Module):
     """
     Spatial attention where every modality owns its attention weights.
@@ -321,8 +206,8 @@ class ModalitySpaceBlock(nn.Module):
         actions <- z        (attn_a_z)
         agent <- [z ; actions]   (attn_agent_za)   -- only the agent sees the concatenation
 
-    Nothing attends to the agent, so the agent stays read-only by construction
-    (this replaces the additive `agent_mask` used by CausalSTBlock).
+    Nothing attends to the agent, so the agent stays read-only by construction,
+    which is what the additive agent mask used to enforce.
 
     Cross-attention outputs that share a shape are summed before the residual:
         z     gets attn_z_z + attn_z_a
