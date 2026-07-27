@@ -108,8 +108,15 @@ class GQA(nn.Module):
         k = k.view(B, Tk, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, Tk, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = self.rope(q, seq_len=Tq)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        # RoPE is applied independently to q and k so that cross-attention between
+        # modalities of different lengths (Tq != Tk) stays well defined.
+        cos_q, sin_q = self.rope(q, seq_len=Tq)
+        if Tk == Tq:
+            q, k = apply_rotary_pos_emb(q, k, cos_q, sin_q)
+        else:
+            cos_k, sin_k = self.rope(k, seq_len=Tk)
+            q = (q * cos_q) + (rotate_half(q) * sin_q)
+            k = (k * cos_k) + (rotate_half(k) * sin_k)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -160,6 +167,16 @@ class GQA(nn.Module):
 
             final_bias = causal_bias if final_bias is None else (final_bias + causal_bias)
 
+        # ---- guard fully-blocked query rows ----
+        # With per-modality attention a whole key set can be padded away (e.g. the
+        # action stream at t=0), which would make softmax see an all -inf row -> NaN.
+        # Unblock those rows for the kernel and zero their output afterwards.
+        row_valid = None
+        if final_bias is not None:
+            all_blocked = torch.isneginf(final_bias).all(dim=-1, keepdim=True)  # [*,Tq,1]
+            final_bias = final_bias.masked_fill(all_blocked, 0.0)
+            row_valid = (~all_blocked).to(q.dtype)
+
         # =====================================================
         # SDPA
         # =====================================================
@@ -170,6 +187,9 @@ class GQA(nn.Module):
             is_causal=False,   # IMPORTANT: we already applied causal bias
             enable_gqa=True,
         )
+
+        if row_valid is not None:
+            out = out * row_valid
 
         out = out.transpose(1, 2).contiguous().view(B, Tq, D)
         return self.out_proj(out)
@@ -288,6 +308,147 @@ class CausalSTBlock(nn.Module):
         x = x + xs.reshape(B, T, N, D)
         x = x + self.mlp(x)
         return x.squeeze(2) if x.shape[2] == 1 else x
+
+
+class ModalitySpaceBlock(nn.Module):
+    """
+    Spatial attention where every modality owns its attention weights.
+
+    Routing (queries <- keys):
+        z     <- z          (attn_z_z)
+        z     <- actions    (attn_z_a)
+        actions <- actions  (attn_a_a)
+        actions <- z        (attn_a_z)
+        agent <- [z ; actions]   (attn_agent_za)   -- only the agent sees the concatenation
+
+    Nothing attends to the agent, so the agent stays read-only by construction
+    (this replaces the additive `agent_mask` used by CausalSTBlock).
+
+    Cross-attention outputs that share a shape are summed before the residual:
+        z     gets attn_z_z + attn_z_a
+        actions gets attn_a_a + attn_a_z
+    """
+
+    def __init__(self, d_model, n_heads, dropout=0.1, device="cuda"):
+        super().__init__()
+        self.d_model = d_model
+        self.time_attn_enabled = False
+
+        self.ln_z = nn.RMSNorm(d_model)
+        self.ln_a = nn.RMSNorm(d_model)
+        self.ln_agent = nn.RMSNorm(d_model)
+
+        self.attn_z_z = GQA(d_model, n_heads, dropout, device=device)
+        self.attn_z_a = GQA(d_model, n_heads, dropout, device=device)
+        self.attn_a_a = GQA(d_model, n_heads, dropout, device=device)
+        self.attn_a_z = GQA(d_model, n_heads, dropout, device=device)
+        self.attn_agent_za = GQA(d_model, n_heads, dropout, device=device)
+
+        self.mlp_z = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
+        self.mlp_a = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
+        self.mlp_agent = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
+
+        self.device = device
+        self.to(self.device)
+
+    def forward(
+        self,
+        z: torch.Tensor,                            # [B,T,Nz,D]
+        a: torch.Tensor,                            # [B,T,Sa,D]
+        agent: torch.Tensor | None = None,          # [B,T,1,D]
+        z_pad: torch.Tensor | None = None,          # [B,T,Nz] True = PAD
+        a_pad: torch.Tensor | None = None,          # [B,T,Sa] True = PAD
+    ):
+        B, T, Nz, D = z.shape
+        Sa = a.shape[2]
+
+        zn = self.ln_z(z).reshape(B * T, Nz, D)
+        an = self.ln_a(a).reshape(B * T, Sa, D)
+
+        z_kpm = z_pad.reshape(B * T, Nz) if z_pad is not None else None
+        a_kpm = a_pad.reshape(B * T, Sa) if a_pad is not None else None
+
+        # ---- z: self + cross(actions), same shape -> summed ----
+        z_out = self.attn_z_z(zn, key_padding_mask=z_kpm) \
+              + self.attn_z_a(zn, x_k=an, key_padding_mask=a_kpm)
+
+        # ---- actions: self + cross(z), same shape -> summed ----
+        a_out = self.attn_a_a(an, key_padding_mask=a_kpm) \
+              + self.attn_a_z(an, x_k=zn, key_padding_mask=z_kpm)
+
+        z = z + z_out.reshape(B, T, Nz, D)
+        a = a + a_out.reshape(B, T, Sa, D)
+        z = z + self.mlp_z(z)
+        a = a + self.mlp_a(a)
+
+        # ---- agent: reads the concatenation of z and actions ----
+        if agent is not None:
+            Na = agent.shape[2]
+            agn = self.ln_agent(agent).reshape(B * T, Na, D)
+            za = torch.cat([zn, an], dim=1)                       # [B*T, Nz+Sa, D]
+            za_kpm = None
+            if z_kpm is not None or a_kpm is not None:
+                zk = z_kpm if z_kpm is not None else torch.zeros(B * T, Nz, dtype=torch.bool, device=z.device)
+                ak = a_kpm if a_kpm is not None else torch.zeros(B * T, Sa, dtype=torch.bool, device=a.device)
+                za_kpm = torch.cat([zk, ak], dim=1)
+            ag_out = self.attn_agent_za(agn, x_k=za, key_padding_mask=za_kpm)
+            agent = agent + ag_out.reshape(B, T, Na, D)
+            agent = agent + self.mlp_agent(agent)
+
+        return z, a, agent
+
+
+class ModalityTimeBlock(nn.Module):
+    """
+    Causal temporal attention with one set of weights per spatial stream
+    (z / actions / agent). Each stream attends over time independently, so the
+    temporal weights are never shared across modalities.
+    """
+
+    def __init__(self, d_model, n_heads, dropout=0.1, device="cuda"):
+        super().__init__()
+        self.d_model = d_model
+        self.time_attn_enabled = True
+
+        self.ln_z = nn.RMSNorm(d_model)
+        self.ln_a = nn.RMSNorm(d_model)
+        self.ln_agent = nn.RMSNorm(d_model)
+
+        self.time_z = GQA(d_model, n_heads, dropout, causal=True, device=device)
+        self.time_a = GQA(d_model, n_heads, dropout, causal=True, device=device)
+        self.time_agent = GQA(d_model, n_heads, dropout, causal=True, device=device)
+
+        self.mlp_z = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
+        self.mlp_a = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
+        self.mlp_agent = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
+
+        self.device = device
+        self.to(self.device)
+
+    @staticmethod
+    def _attend(attn, ln, mlp, x, pad):
+        B, T, N, D = x.shape
+        xt = ln(x).permute(0, 2, 1, 3).reshape(B * N, T, D)
+        kpm = pad.permute(0, 2, 1).reshape(B * N, T) if pad is not None else None
+        out = attn(xt, key_padding_mask=kpm)
+        x = x + out.reshape(B, N, T, D).permute(0, 2, 1, 3)
+        return x + mlp(x)
+
+    def forward(
+        self,
+        z: torch.Tensor,                            # [B,T,Nz,D]
+        a: torch.Tensor,                            # [B,T,Sa,D]
+        agent: torch.Tensor | None = None,          # [B,T,1,D]
+        z_pad: torch.Tensor | None = None,
+        a_pad: torch.Tensor | None = None,
+    ):
+        z = self._attend(self.time_z, self.ln_z, self.mlp_z, z, z_pad)
+        a = self._attend(self.time_a, self.ln_a, self.mlp_a, a, a_pad)
+        if agent is not None:
+            agent = self._attend(self.time_agent, self.ln_agent, self.mlp_agent, agent, None)
+        return z, a, agent
+
+
 class Encoder(nn.Module):
     def __init__(
         self,
@@ -442,65 +603,22 @@ class Dynamics(nn.Module):
         # Agent token (learned)
         self.agent_token = nn.Parameter(0.02 * torch.randn(1, 1, num_tasks, d_model))
 
-        # Blocks
+        # Blocks: modality-specific attention weights.
+        #   space -> z/z, z/actions, actions/actions, actions/z, agent/[z;actions]
+        #   time  -> one causal attention per spatial stream (z, actions, agent)
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == (0))
-            blocks.append(
-                CausalSTBlock(
-                    d_model, n_heads,
-                    dropout=dropout,
-                    time_attn=use_time,
-                    device=device,
-                )
-            )
+            if use_time:
+                blocks.append(ModalityTimeBlock(d_model, n_heads, dropout=dropout, device=device))
+            else:
+                blocks.append(ModalitySpaceBlock(d_model, n_heads, dropout=dropout, device=device))
         self.blocks = nn.ModuleList(blocks)
 
         # Output head: model dim -> Dz
         self.out = build_network(d_model, 2*d_model, 3, "SwiGLU", Dz)
 
         self.to(device)
-
-    def recover_z(self, out: torch.Tensor):
-        """
-        out: [B,T,Nz+Sa,D] created by interleave_gb_1a
-        returns:
-        a_rec: [B,T,Sa,D]
-        b_rec: [B,T,Nz,D]
-        """
-        Sa = self.Sa
-        B, T, L, D = out.shape
-        assert L % Sa == 0, "Token length must be divisible by Sa"
-        block = L // Sa                 # block = g+1
-        g = block - 1
-        assert g >= 1
-
-        blocks = out.reshape(B, T, Sa, g+1, D)   # [B,T,Sa,g+1,D]
-        z_rec = blocks[:, :, :, :g, :].reshape(B, T, Sa*g, D)  # [B,T,Nz,D]
-       # a_rec = blocks[:, :, :,  g, :]                          # [B,T,Sa,D]
-        return z_rec
-    
-    def interleave_z_a(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
-        """
-        1 action token per (Nz/Sa) latent tokens
-        z: [B,T,Nz,D]
-        a: [B,T,Sa,D]
-        returns: [B,T,Nz+Sa,D]
-        """
-        B, T, Nz, D = z.shape
-        assert a.shape[0] == B and a.shape[1] == T and a.shape[3] == D
-
-        Sa = a.shape[2]
-        assert Nz % Sa == 0, f"Nz={Nz} must be divisible by Sa={Sa}"
-        g = Nz // Sa
-
-        z_grp = z.reshape(B, T, Sa, g, D)     # [B,T,Sa,g,D]
-        a_grp = a.unsqueeze(3)               # [B,T,Sa,1,D]
-
-        out = torch.cat([z_grp, a_grp], dim=3)  # [B,T,Sa,g+1,D]
-        return out.reshape(B, T, Nz + Sa, D)
-
-
 
     def align_actions(self, actions, T, B):
         if actions.dim() != 3:
@@ -516,47 +634,16 @@ class Dynamics(nn.Module):
         else:
             raise ValueError("Incorrect action shape")
 
-    def make_kpm_for_actions(self, B, T, S, Nz, *, pad_action_t: int | None, device):
-        kpm = torch.zeros((B, T, S), dtype=torch.bool, device=device)
-        if pad_action_t is None:
-            return kpm
-        Sa = self.Sa
-        assert Nz % Sa == 0
-        
-        
-        g = Nz // Sa
-        action_pos = torch.arange(Sa, device=device) * (g + 1) + g  # [Sa]
-        #action_pos lives in the first (Nz+Sa) tokens; do NOT include the signal/agent/reserved tail
-        kpm[:, pad_action_t, action_pos] = True
+    def make_action_pad_mask(self, B, T, *, pad_action_t: int | None, device):
+        """
+        Key-padding mask for the action stream: [B, T, Sa], True = PAD.
+        The action tokens at `pad_action_t` are placeholders (no action led into the
+        first frame), so they are blocked as keys for every attention path.
+        """
+        kpm = torch.zeros((B, T, self.Sa), dtype=torch.bool, device=device)
+        if pad_action_t is not None:
+            kpm[:, pad_action_t, :] = True
         return kpm
-
-    def agent_mask(self, S: int, agent_idx: int, device=None, Nr: int = 0, *, dtype=torch.float32):
-        if not (0 <= agent_idx < S):
-            raise ValueError(f"agent_idx={agent_idx} out of range for S={S}")
-        if Nr < 0 or Nr > S:
-            raise ValueError(f"Nr={Nr} must satisfy 0 <= Nr <= S={S}")
-
-        allow = torch.ones((S, S), dtype=torch.bool, device=device)
-
-        # Agent rule: others cannot read agent; agent reads everyone
-        allow[:, agent_idx] = False
-        allow[agent_idx, :] = True
-        allow[agent_idx, agent_idx] = True
-
-        # Reserved rule: reserved can read everyone EXCEPT agent
-        if Nr > 0:
-            rs = S - Nr  # start index of reserved tokens
-            allow[rs:, agent_idx] = False  # reserved queries can't read agent
-
-        # Convert allow-mask -> additive bias (0 keep, -inf block)
-        attn_bias = torch.zeros((S, S), dtype=dtype, device=device)
-        attn_bias.masked_fill_(~allow, float("-inf"))
-
-        # Optional sanity checks (safe ones)
-        assert attn_bias.shape == (S, S)
-        assert torch.isfinite(attn_bias[allow]).all()
-
-        return attn_bias
 
                                 # Forwar
     # -----------------------------
@@ -608,14 +695,18 @@ class Dynamics(nn.Module):
 
         z_inp = self.z_proj(z_tokens)
 
-        # Interleave z + a, then append signal token
-        x = self.interleave_z_a(z_inp, a_tokens )                 # x: [B,T,?,D]
-        Nmain = x.size(2)
-        x = torch.cat([x, self.sig_proj(lev_feat + step_feat).unsqueeze(-2)], dim=2)
-        token_pad_mask = self.make_kpm_for_actions(B, T, S=x.size(2), Nz=Nz_in, pad_action_t=0, device=device)
-        pad_extra = torch.zeros(B, T, 1 + self.Nr, dtype=torch.bool, device=device)
-        token_pad_mask_aug = torch.cat([token_pad_mask, pad_extra], dim=2)  # [B,T,Nmain+1+Nr]
+        # ---- modality streams (kept separate, one attention weight set each) ----
+        # Z stream: latent tokens + the (level, step) signal token + reserved registers.
+        sig_tok  = self.sig_proj(lev_feat + step_feat).unsqueeze(-2)   # [B,T,1,D]
+        reserved = self.reserved.expand(B, T, self.Nr, -1)             # [B,T,Nr,D]
+        z_stream = torch.cat([z_inp, sig_tok, reserved], dim=2)        # [B,T,Nz+1+Nr,D]
+        a_stream = a_tokens                                            # [B,T,Sa,D]
+
+        # Only the action tokens can be padded (t=0 placeholder action).
+        a_pad = self.make_action_pad_mask(B, T, pad_action_t=0, device=device)
+
         agent = None
+        agent_in = None
         if policy_tok_in is not None:
             ag = policy_tok_in
             if ag.size(0) == 1 and B > 1: ag = ag.expand(B, -1, -1, -1)
@@ -629,27 +720,16 @@ class Dynamics(nn.Module):
             agent = self.agent_token[:, :, task_id].expand(B, T, 1, self.d_model)
             agent_in = agent.detach() if detach_agent else agent
 
-        agent_idx = x.size(2)
-        reserved  = self.reserved.expand(B, T, self.Nr, -1)
-
-        x_aug = torch.cat([x, agent_in, reserved], dim=2)
-
         for blk in self.blocks:
-            S = x_aug.size(2)
-            tok_mask = self.agent_mask(S, agent_idx, device=device, Nr=self.Nr)  # keep agent mask
+            z_stream, a_stream, agent_in = blk(
+                z_stream, a_stream, agent_in,
+                z_pad=None,          # z / signal / reserved tokens are never padded
+                a_pad=a_pad,
+            )
 
-            if blk.time_attn_enabled:
-                x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, agent_idx=agent_idx)
-            else:
-                x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, mask=tok_mask, agent_idx=agent_idx)
+        agent_out_bt = agent_in[:, :, 0, :] if agent_in is not None else None
 
-        agent = x_aug[:, :, agent_idx:agent_idx+1, :]
-        x     = x_aug[:, :, :agent_idx, :]
-        agent_out_bt = agent[:, :, 0, :]
-
-
-        hist = self.recover_z(x[:,:,:Nmain])     
-
+        hist = z_stream[:, :, :self.Nz]                     # drop signal + reserved
         hist = hist.reshape(B, T*self.Nz, self.d_model)     # [B,T*Nz,D]
         z = self.out(hist)                              # [B,T*Nz,Dz]
         z_pred = z.view(B, T, Nz_in, Dz)            # [B,T,Nz,Dz]                        # [B,T,Nz,D]
