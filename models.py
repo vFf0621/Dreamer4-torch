@@ -951,11 +951,8 @@ class Dreamer4(nn.Module):
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=True, symlog_for_value=True,
-                kmax_prob=0.1, gqa_ratio=4, mlp_ratio=2.0, dyn_num_heads=None):
+                kmax_prob=0.1, gqa_ratio=4, mlp_ratio=2.0):
         super(Dreamer4, self).__init__()
-        # The dynamics runs twice the heads of the representation stack by default,
-        # halving its head dim at the same width.
-        dyn_num_heads = 2 * num_heads if dyn_num_heads is None else dyn_num_heads
         self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patch, d_model=rep_d_model,
                                 n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=2,
                                 out_dim=z_dim, dropout=dropout, max_T=max_imag_len, num_reserved=Nr,
@@ -1021,7 +1018,7 @@ class Dreamer4(nn.Module):
             dropout=dropout,
             action_low = action_low,
             action_high = action_high,
-            n_heads=dyn_num_heads,
+            n_heads=num_heads,
             action_dim =action_dim,
             d_model=dyn_d_model,
             Sa = Sa, 
