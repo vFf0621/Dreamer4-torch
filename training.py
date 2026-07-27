@@ -215,7 +215,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--h", type=int, default=96, help="Image Height")
     p.add_argument("--w", type=int, default=96, help="Image Width")
     p.add_argument("--patch", type=int, default=8, help="Patch Size")
-    p.add_argument("--latent_tokens", type=int, default=64, help="Nz")
+    p.add_argument("--latent_tokens", type=int, default=128, help="Nz")
     p.add_argument("--reserved_tokens", type=int, default=4, help="Nr")
 
     p.add_argument("--z_dim", type=int, default=16, help="Bottleneck")
@@ -231,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_heads", type=int, default=8)
     p.add_argument("--gqa_ratio", type=int, default=4,
                    help="Query heads per key/value head. 1 = full multi-head attention.")
-    p.add_argument("--mlp_ratio", type=float, default=1.5,
+    p.add_argument("--mlp_ratio", type=float, default=1.0,
                    help="Feed-forward hidden width as a multiple of d_model. Dominates the "
                         "parameter count because the temporal MLPs are per channel.")
     p.add_argument("--dropout", type=float, default=0.01)
