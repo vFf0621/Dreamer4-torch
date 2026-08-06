@@ -516,20 +516,6 @@ class Dynamics(nn.Module):
         else:
             raise ValueError("Incorrect action shape")
 
-    def make_kpm_for_actions(self, B, T, S, Nz, *, query_action_t: int | None, device):
-        kpm = torch.zeros((B, T, S), dtype=torch.bool, device=device)
-        if query_action_t is None:
-            return kpm
-        Sa = self.Sa
-        assert Nz % Sa == 0
-
-
-        g = Nz // Sa
-        action_pos = torch.arange(Sa, device=device) * (g + 1) + g  # [Sa]
-        #action_pos lives in the first (Nz+Sa) tokens; do NOT include the signal/agent/reserved tail
-        kpm[:, query_action_t, action_pos] = True
-        return kpm
-
     def agent_mask(self, S: int, agent_idx: int, device=None, Nr: int = 0, *, dtype=torch.float32):
         if not (0 <= agent_idx < S):
             raise ValueError(f"agent_idx={agent_idx} out of range for S={S}")
@@ -614,10 +600,6 @@ class Dynamics(nn.Module):
         x = self.interleave_z_a(z_inp, a_tokens )                 # x: [B,T,?,D]
         Nmain = x.size(2)
         x = torch.cat([x, self.sig_proj(lev_feat + step_feat).unsqueeze(-2)], dim=2)
-        # the query reads context but is masked as a key so no token attends to it
-        token_pad_mask = self.make_kpm_for_actions(B, T, S=x.size(2), Nz=Nz_in, query_action_t=T-1, device=device)
-        pad_extra = torch.zeros(B, T, 1 + self.Nr, dtype=torch.bool, device=device)
-        token_pad_mask_aug = torch.cat([token_pad_mask, pad_extra], dim=2)  # [B,T,Nmain+1+Nr]
         agent = None
         if policy_tok_in is not None:
             ag = policy_tok_in
@@ -641,10 +623,11 @@ class Dynamics(nn.Module):
             S = x_aug.size(2)
             tok_mask = self.agent_mask(S, agent_idx, device=device, Nr=self.Nr)  # keep agent mask
 
+            # no token_pad_mask: the t=T-1 action query is a readable, learned token
             if blk.time_attn_enabled:
-                x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, agent_idx=agent_idx)
+                x_aug = blk(x_aug, agent_idx=agent_idx)
             else:
-                x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, mask=tok_mask, agent_idx=agent_idx)
+                x_aug = blk(x_aug, mask=tok_mask, agent_idx=agent_idx)
 
         agent = x_aug[:, :, agent_idx:agent_idx+1, :]
         x     = x_aug[:, :, :agent_idx, :]
