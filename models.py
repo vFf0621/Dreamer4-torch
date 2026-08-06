@@ -983,7 +983,7 @@ class Dynamics(nn.Module):
         self.action_conditioner = nn.Parameter(0.02 * torch.randn(1, 1, self.Sa, d_model))
         self.reserved = nn.Parameter(0.02 * torch.randn(1, 1, self.Nr, d_model))
 
-        self.action_pad = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
+        self.action_query = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
         self.action_lookup = action_lookup
         act_embed_dim = self.action_bins*self.action_dim
         # --- Action embedding (true lookup, no one-hot materialization) ---
@@ -1035,15 +1035,16 @@ class Dynamics(nn.Module):
         else:
             raise ValueError("Incorrect action shape")
 
-    def make_action_pad_mask(self, B, T, *, pad_action_t: int | None, device):
+    def make_action_query_mask(self, B, T, *, query_action_t: int | None, device):
         """
-        Key-padding mask for the action stream: [B, T, Sa], True = PAD.
-        The action tokens at `pad_action_t` are placeholders (no action led into the
-        first frame), so they are blocked as keys for every attention path.
+        Key-padding mask for the action stream: [B, T, Sa], True = masked.
+        The action tokens at `query_action_t` hold the learned query (no action has
+        been taken at the last frame yet), so they are blocked as keys for every
+        attention path while still attending to the causal context themselves.
         """
         kpm = torch.zeros((B, T, self.Sa), dtype=torch.bool, device=device)
-        if pad_action_t is not None:
-            kpm[:, pad_action_t, :] = True
+        if query_action_t is not None:
+            kpm[:, query_action_t, :] = True
         return kpm
 
                                 # Forwar
@@ -1078,8 +1079,10 @@ class Dynamics(nn.Module):
                                                     # [B, T-1, D]
         a_emb = self.action_embs(act_two_hot[:, :, :])                                                     # [B, T-1, 1, D]
         if a_emb.size(1) == z_tokens.size(1)-1:
-            pad = self.action_pad.expand(B, 1, 1, -1)                                     # [B, 1, 1, D]
-            a_emb = torch.cat([pad, a_emb ], dim=1)                                        # [B, T, 1, D]
+            # actions stay at their own timesteps; a learned query fills the last
+            # timestep, where no action has been taken yet
+            query = self.action_query.expand(B, 1, 1, -1)                                  # [B, 1, 1, D]
+            a_emb = torch.cat([a_emb, query], dim=1)                                       # [B, T, 1, D]
         a_tokens = a_emb.expand(-1, -1, self.Sa, -1) + self.action_conditioner  # [B,T,Sa,D]
         signals = signals.long()
         if signals.dim() == 4 and signals.size(-1) == 2:
@@ -1103,8 +1106,8 @@ class Dynamics(nn.Module):
         z_stream = torch.cat([z_inp, sig_tok, reserved], dim=2)        # [B,T,Nz+1+Nr,D]
         a_stream = a_tokens                                            # [B,T,Sa,D]
 
-        # Only the action tokens can be padded (t=0 placeholder action).
-        a_pad = self.make_action_pad_mask(B, T, pad_action_t=0, device=device)
+        # Only the action tokens can be masked (the t=T-1 action query).
+        a_pad = self.make_action_query_mask(B, T, query_action_t=T-1, device=device)
 
         agent = None
         agent_in = None
