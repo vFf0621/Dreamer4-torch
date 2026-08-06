@@ -1035,18 +1035,6 @@ class Dynamics(nn.Module):
         else:
             raise ValueError("Incorrect action shape")
 
-    def make_action_query_mask(self, B, T, *, query_action_t: int | None, device):
-        """
-        Key-padding mask for the action stream: [B, T, Sa], True = masked.
-        The action tokens at `query_action_t` hold the learned query (no action has
-        been taken at the last frame yet), so they are blocked as keys for every
-        attention path while still attending to the causal context themselves.
-        """
-        kpm = torch.zeros((B, T, self.Sa), dtype=torch.bool, device=device)
-        if query_action_t is not None:
-            kpm[:, query_action_t, :] = True
-        return kpm
-
                                 # Forwar
     # -----------------------------
 # -----------------------------
@@ -1106,9 +1094,6 @@ class Dynamics(nn.Module):
         z_stream = torch.cat([z_inp, sig_tok, reserved], dim=2)        # [B,T,Nz+1+Nr,D]
         a_stream = a_tokens                                            # [B,T,Sa,D]
 
-        # Only the action tokens can be masked (the t=T-1 action query).
-        a_pad = self.make_action_query_mask(B, T, query_action_t=T-1, device=device)
-
         agent = None
         agent_in = None
         if policy_tok_in is not None:
@@ -1127,8 +1112,8 @@ class Dynamics(nn.Module):
         for blk in self.blocks:
             z_stream, a_stream, agent_in = blk(
                 z_stream, a_stream, agent_in,
-                z_pad=None,          # z / signal / reserved tokens are never padded
-                a_pad=a_pad,
+                z_pad=None,
+                a_pad=None,          # the t=T-1 action query is a readable, learned token
             )
 
         agent_out_bt = agent_in[:, :, 0, :] if agent_in is not None else None
