@@ -314,24 +314,31 @@ class ModalitySpaceBlock(nn.Module):
 
 class PerChannelTimeAttention(nn.Module):
     """
-    Causal attention over time with one set of weights per spatial channel.
+    Causal attention over time with one set of weights for every `group_size`
+    spatial channels.
 
     Input is [B, T, N, D]; channel n is the length-T sequence living at spatial
-    slot n. Every channel owns its q/k/v/out projections and its RMSNorm gains,
-    so no temporal weight is shared between channels. The per-channel projections
-    are stored as stacked [N, in, out] tensors and applied with einsum, which
-    keeps the FLOP count identical to a shared projection.
+    slot n. Channels are split into N/group_size consecutive groups and every
+    group owns its q/k/v/out projections and RMSNorm gains: group_size=1 (the
+    default) gives fully per-channel weights, larger values share one temporal
+    weight set among each run of group_size channels. Attention itself always
+    stays per-channel over time; only the weights are shared. The grouped
+    projections are stored as stacked [G, in, out] tensors and applied with
+    einsum, which keeps the FLOP count identical to a shared projection.
 
     Grouped-query attention and RoPE follow GQA; RoPE is positional, not learned,
     so its cache is shared across channels.
     """
 
     def __init__(self, num_channels, embed_dim, num_heads, dropout=0.0, device="cuda",
-                 eps=1e-6, gqa_ratio=4):
+                 eps=1e-6, gqa_ratio=4, group_size=1):
         super().__init__()
         assert embed_dim % num_heads == 0
+        assert num_channels % group_size == 0, (num_channels, group_size)
 
         self.num_channels = num_channels
+        self.group_size = group_size
+        self.num_groups = num_channels // group_size
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.num_kv_heads = gqa_kv_heads(num_heads, gqa_ratio)
@@ -339,19 +346,20 @@ class PerChannelTimeAttention(nn.Module):
         self.dropout = dropout
         self.eps = eps
 
+        G = self.num_groups
         q_dim = num_heads * self.head_dim
         kv_dim = self.num_kv_heads * self.head_dim
         std = embed_dim ** -0.5
 
-        self.q_proj = nn.Parameter(torch.randn(num_channels, embed_dim, q_dim) * std)
-        self.k_proj = nn.Parameter(torch.randn(num_channels, embed_dim, kv_dim) * std)
-        self.v_proj = nn.Parameter(torch.randn(num_channels, embed_dim, kv_dim) * std)
-        self.out_proj = nn.Parameter(torch.randn(num_channels, q_dim, embed_dim) * std)
+        self.q_proj = nn.Parameter(torch.randn(G, embed_dim, q_dim) * std)
+        self.k_proj = nn.Parameter(torch.randn(G, embed_dim, kv_dim) * std)
+        self.v_proj = nn.Parameter(torch.randn(G, embed_dim, kv_dim) * std)
+        self.out_proj = nn.Parameter(torch.randn(G, q_dim, embed_dim) * std)
 
-        # per-channel RMSNorm gains
-        self.norm_w = nn.Parameter(torch.ones(num_channels, embed_dim))
-        self.q_norm_w = nn.Parameter(torch.ones(num_channels, self.head_dim))
-        self.k_norm_w = nn.Parameter(torch.ones(num_channels, self.head_dim))
+        # per-group RMSNorm gains
+        self.norm_w = nn.Parameter(torch.ones(G, embed_dim))
+        self.q_norm_w = nn.Parameter(torch.ones(G, self.head_dim))
+        self.k_norm_w = nn.Parameter(torch.ones(G, self.head_dim))
 
         self.rope = RoPE1D(self.head_dim)
         self.device = device
@@ -371,20 +379,22 @@ class PerChannelTimeAttention(nn.Module):
         if N != self.num_channels:
             raise ValueError(f"expected {self.num_channels} channels, got {N}")
         H, Hkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
+        G, M = self.num_groups, self.group_size
 
-        xn = self._rms(x, self.norm_w)                                  # [B,T,N,D]
+        xg = x.view(B, T, G, M, D)
+        xn = self._rms(xg, self.norm_w.view(1, 1, G, 1, D))             # [B,T,G,M,D]
 
-        q = torch.einsum("btnd,ndh->btnh", xn, self.q_proj)
-        k = torch.einsum("btnd,ndh->btnh", xn, self.k_proj)
-        v = torch.einsum("btnd,ndh->btnh", xn, self.v_proj)
+        q = torch.einsum("btgmd,gdh->btgmh", xn, self.q_proj).reshape(B, T, N, -1)
+        k = torch.einsum("btgmd,gdh->btgmh", xn, self.k_proj).reshape(B, T, N, -1)
+        v = torch.einsum("btgmd,gdh->btgmh", xn, self.v_proj).reshape(B, T, N, -1)
 
         # [B,T,N,H*hd] -> [B,N,H,T,hd]
         q = q.view(B, T, N, H, hd).permute(0, 2, 3, 1, 4)
         k = k.view(B, T, N, Hkv, hd).permute(0, 2, 3, 1, 4)
         v = v.view(B, T, N, Hkv, hd).permute(0, 2, 3, 1, 4)
 
-        q = self._rms(q, self.q_norm_w.view(1, N, 1, 1, hd))
-        k = self._rms(k, self.k_norm_w.view(1, N, 1, 1, hd))
+        q = self._rms(q.view(B, G, M, H, T, hd), self.q_norm_w.view(1, G, 1, 1, 1, hd)).view(B, N, H, T, hd)
+        k = self._rms(k.view(B, G, M, Hkv, T, hd), self.k_norm_w.view(1, G, 1, 1, 1, hd)).view(B, N, Hkv, T, hd)
 
         q = q.reshape(B * N, H, T, hd)
         k = k.reshape(B * N, Hkv, T, hd)
@@ -419,7 +429,8 @@ class PerChannelTimeAttention(nn.Module):
         out = out * (~all_blocked).to(out.dtype)
 
         out = out.view(B, N, H, T, hd).permute(0, 3, 1, 2, 4).reshape(B, T, N, H * hd)
-        return torch.einsum("btnh,nhd->btnd", out, self.out_proj)
+        out = out.view(B, T, G, M, H * hd)
+        return torch.einsum("btgmh,ghd->btgmd", out, self.out_proj).reshape(B, T, N, D)
 
 
 class PerChannelMLP(nn.Module):
@@ -478,24 +489,41 @@ class PerChannelMLP(nn.Module):
 
 class ModalityTimeBlock(nn.Module):
     """
-    Causal temporal attention with one set of weights per channel: every spatial
-    slot of every stream (each z token, each action token, the agent token) gets
-    its own temporal attention weights and its own feed-forward, so nothing is
-    shared across channels or across modalities.
+    Causal temporal attention over the dynamics streams with one weight set for
+    every `time_group_size`-th channel: each run of `time_group_size`
+    consecutive latent slots, reserved registers or action slots shares one
+    temporal attention weight set (the agent token keeps its own), instead of
+    every channel owning one. Streams never share weights with each other. The
+    signal (noise level / step size) token is skipped: it carries per-frame
+    conditioning only, so it passes through time blocks untouched. The temporal
+    feed-forwards stay fully per-channel.
+
+    A stream whose channel count is not divisible by `time_group_size` falls
+    back to the largest group size that divides it (gcd).
     """
 
-    def __init__(self, d_model, n_heads, n_z_channels, n_a_channels,
-                 n_agent_channels=1, dropout=0.1, device="cuda", gqa_ratio=4, mlp_ratio=2.0):
+    def __init__(self, d_model, n_heads, n_latent, n_reserved, n_a_channels,
+                 n_agent_channels=1, dropout=0.1, device="cuda", gqa_ratio=4,
+                 mlp_ratio=2.0, time_group_size=1):
         super().__init__()
         self.d_model = d_model
         self.time_attn_enabled = True
+        self.n_latent = n_latent
+        self.n_reserved = n_reserved
 
-        self.time_z = PerChannelTimeAttention(n_z_channels, d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
-        self.time_a = PerChannelTimeAttention(n_a_channels, d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
-        self.time_agent = PerChannelTimeAttention(n_agent_channels, d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        def grouped_attn(n_channels):
+            g = math.gcd(n_channels, time_group_size)
+            return PerChannelTimeAttention(n_channels, d_model, n_heads, dropout,
+                                           device=device, gqa_ratio=gqa_ratio, group_size=g)
+
+        self.time_lat = grouped_attn(n_latent)
+        self.time_res = grouped_attn(n_reserved) if n_reserved > 0 else None
+        self.time_a = grouped_attn(n_a_channels)
+        self.time_agent = grouped_attn(n_agent_channels)
 
         hidden = mlp_hidden(d_model, mlp_ratio)
-        self.mlp_z = PerChannelMLP(n_z_channels, d_model, hidden)
+        self.mlp_lat = PerChannelMLP(n_latent, d_model, hidden)
+        self.mlp_res = PerChannelMLP(n_reserved, d_model, hidden) if n_reserved > 0 else None
         self.mlp_a = PerChannelMLP(n_a_channels, d_model, hidden)
         self.mlp_agent = PerChannelMLP(n_agent_channels, d_model, hidden)
 
@@ -509,13 +537,22 @@ class ModalityTimeBlock(nn.Module):
 
     def forward(
         self,
-        z: torch.Tensor,                            # [B,T,Nz,D]
+        z: torch.Tensor,                            # [B,T,Nz+1+Nr,D] (latents, signal, reserved)
         a: torch.Tensor,                            # [B,T,Sa,D]
         agent: torch.Tensor | None = None,          # [B,T,1,D]
         z_pad: torch.Tensor | None = None,
         a_pad: torch.Tensor | None = None,
     ):
-        z = self._attend(self.time_z, self.mlp_z, z, z_pad)
+        Nl = self.n_latent
+        lat, sig, res = z[:, :, :Nl], z[:, :, Nl:Nl + 1], z[:, :, Nl + 1:]
+        lat_pad = z_pad[:, :, :Nl] if z_pad is not None else None
+        res_pad = z_pad[:, :, Nl + 1:] if z_pad is not None else None
+
+        lat = self._attend(self.time_lat, self.mlp_lat, lat, lat_pad)
+        if self.time_res is not None:
+            res = self._attend(self.time_res, self.mlp_res, res, res_pad)
+        z = torch.cat([lat, sig, res], dim=2)       # signal token skips time attention
+
         a = self._attend(self.time_a, self.mlp_a, a, a_pad)
         if agent is not None:
             agent = self._attend(self.time_agent, self.mlp_agent, agent, None)
@@ -953,6 +990,7 @@ class Dynamics(nn.Module):
         gqa_ratio: int = 4,                 # query heads per key/value head
         mlp_ratio: float = 2.0,             # feed-forward hidden width, as a multiple of d_model
         attn_mode: str = "per_channel",     # "per_channel" or "shared" (paper-style masked attention)
+        time_group_size: int = 4,           # channels per temporal attention weight set (per_channel mode)
         # behavior toggles
         mask_last_action: bool = True,      # usually correct for "predict next"
         clamp_signal_indices: bool = False, # set True if you’d rather clamp than crash
@@ -994,19 +1032,21 @@ class Dynamics(nn.Module):
 
         # Blocks: modality-specific attention weights.
         #   space -> z/z, z/actions, actions/actions, actions/z, agent/[z;actions]
-        #   time  -> one causal attention per channel (per spatial slot of each stream)
+        #   time  -> one causal attention per group of time_group_size channels of
+        #            each stream; the signal (step size) token skips time attention
         per_channel = check_attn_mode(attn_mode)
-        n_z_channels = self.Nz + 1 + self.Nr      # latents + signal token + reserved
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == (0))
             if use_time:
                 blocks.append(ModalityTimeBlock(
                     d_model, n_heads,
-                    n_z_channels=n_z_channels,
+                    n_latent=self.Nz,
+                    n_reserved=self.Nr,
                     n_a_channels=self.Sa,
                     n_agent_channels=1,
                     dropout=dropout, device=device, gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio,
+                    time_group_size=time_group_size,
                 ) if per_channel else SharedTimeBlock(
                     d_model, n_heads, dropout=dropout, device=device,
                     gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio))
@@ -1134,7 +1174,7 @@ class Dreamer4(nn.Module):
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=True, symlog_for_value=True,
-                kmax_prob=0.1, gqa_ratio=4, mlp_ratio=2.0, attn_mode='per_channel'):
+                kmax_prob=0.1, gqa_ratio=4, mlp_ratio=2.0, attn_mode='per_channel', time_group_size=4):
         super(Dreamer4, self).__init__()
         self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patch, d_model=rep_d_model,
                                 n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=2,
@@ -1212,6 +1252,7 @@ class Dreamer4(nn.Module):
             gqa_ratio=gqa_ratio,
             mlp_ratio=mlp_ratio,
             attn_mode=attn_mode,
+            time_group_size=time_group_size,
             latent_tokens=latent_tokens * self.expanding_ratio
         )
 
