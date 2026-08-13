@@ -623,7 +623,7 @@ class Dynamics(nn.Module):
             S = x_aug.size(2)
             tok_mask = self.agent_mask(S, agent_idx, device=device, Nr=self.Nr)  # keep agent mask
 
-            # no token_pad_mask: the t=T-1 action query is a readable, learned token
+            # no token_pad_mask: the t=0 action pad is a readable, learned embedding
             if blk.time_attn_enabled:
                 x_aug = blk(x_aug, agent_idx=agent_idx)
             else:
