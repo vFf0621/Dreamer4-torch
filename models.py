@@ -1153,7 +1153,7 @@ class Dynamics(nn.Module):
             z_stream, a_stream, agent_in = blk(
                 z_stream, a_stream, agent_in,
                 z_pad=None,
-                a_pad=None,          # the t=T-1 action query is a readable, learned token
+                a_pad=None,          # the t=0 action pad is a readable, learned embedding
             )
 
         agent_out_bt = agent_in[:, :, 0, :] if agent_in is not None else None
