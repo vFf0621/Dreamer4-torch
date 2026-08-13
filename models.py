@@ -433,7 +433,7 @@ class Dynamics(nn.Module):
         self.action_conditioner = nn.Parameter(0.02 * torch.randn(1, 1, self.Sa, d_model))
         self.reserved = nn.Parameter(0.02 * torch.randn(1, 1, self.Nr, d_model))
 
-        self.action_query = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
+        self.action_pad = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
         self.action_lookup = action_lookup
         act_embed_dim = self.action_bins*self.action_dim
         # --- Action embedding (true lookup, no one-hot materialization) ---
@@ -576,10 +576,10 @@ class Dynamics(nn.Module):
                                                     # [B, T-1, D]
         a_emb = self.action_embs(act_two_hot[:, :, :])                                                     # [B, T-1, 1, D]
         if a_emb.size(1) == z_tokens.size(1)-1:
-            # actions stay at their own timesteps; a learned query fills the last
-            # timestep, where no action has been taken yet
-            query = self.action_query.expand(B, 1, 1, -1)                                  # [B, 1, 1, D]
-            a_emb = torch.cat([a_emb, query], dim=1)                                       # [B, T, 1, D]
+            # no action led into the first frame: a learned embedding pads t=0 and
+            # the actions shift right, so position t carries a_{t-1}
+            pad = self.action_pad.expand(B, 1, 1, -1)                                      # [B, 1, 1, D]
+            a_emb = torch.cat([pad, a_emb], dim=1)                                         # [B, T, 1, D]
         a_tokens = a_emb.expand(-1, -1, self.Sa, -1) + self.action_conditioner  # [B,T,Sa,D]
         signals = signals.long()
         if signals.dim() == 4 and signals.size(-1) == 2:
