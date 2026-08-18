@@ -1,7 +1,7 @@
 # Unofficial Dreamer4
 Compact implementation of Dreamer 4.
 
-Please note that Attention Soft Capping is not implemented as no training instability is found. Instead, Scaled Dot-Product Attention is used
+Attention logit soft capping is applied as in the paper, with a cap of 50: the scores are capped as `cap * tanh(score / cap)` before any mask is added. Attention is therefore computed explicitly rather than through Scaled Dot-Product Attention, which cannot cap its logits — note this materializes the score matrix, so it uses more memory than the fused kernels did
 
 This default implementation uses RoPE1D(as stated in the paper), as well as the one directional masking for latent tokens in the encoder and decoder. Also, 
 embedding lookup is implemented for continuous action inputs.

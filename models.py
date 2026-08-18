@@ -94,13 +94,43 @@ def check_attn_mode(mode: str) -> bool:
     return mode == "per_channel"
 
 
+def soft_capped_attention(q, k, v, *, num_heads, num_kv_heads, head_dim,
+                          bias=None, soft_cap=None, dropout=0.0, training=False):
+    """
+    Explicit attention with soft-capped logits.
+
+    q: [B,H,Tq,hd], k/v: [B,Hkv,Tk,hd]. Grouped-query heads are expanded here
+    because the logits have to be materialised to cap them, which is also why
+    this cannot go through F.scaled_dot_product_attention.
+
+    The cap is applied to the raw scores and before any additive mask: capping
+    afterwards would pull -inf entries back to -soft_cap and unmask them.
+    """
+    if num_kv_heads != num_heads:
+        rep = num_heads // num_kv_heads
+        k = k.repeat_interleave(rep, dim=1)
+        v = v.repeat_interleave(rep, dim=1)
+
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+    if soft_cap is not None:
+        scores = soft_cap * torch.tanh(scores / soft_cap)
+    if bias is not None:
+        scores = scores + bias
+
+    attn = torch.softmax(scores, dim=-1)
+    if dropout and training:
+        attn = F.dropout(attn, p=dropout)
+    return torch.matmul(attn, v)
+
+
 def mlp_hidden(d_model: int, ratio: float) -> int:
     """Feed-forward hidden width as a multiple of d_model (SwiGLU gate excluded)."""
     return max(1, int(round(d_model * ratio)))
 
 
 class GQA(nn.Module):
-    def __init__(self, embed_dim=16, num_heads=8, dropout=0.1, causal=False, device="cuda", gqa_ratio=4):
+    def __init__(self, embed_dim=16, num_heads=8, dropout=0.1, causal=False, device="cuda",
+                 gqa_ratio=4, soft_cap=50.0):
         super().__init__()
         assert embed_dim % num_heads == 0
 
@@ -121,6 +151,7 @@ class GQA(nn.Module):
         self.device=device
         self.rope = RoPE1D(self.head_dim)
         self.dropout = dropout
+        self.soft_cap = soft_cap
 
     def forward(self, x, x_k=None, attn_mask=None, key_padding_mask=None):
         B, Tq, D = x.shape
@@ -206,14 +237,13 @@ class GQA(nn.Module):
             row_valid = (~all_blocked).to(q.dtype)
 
         # =====================================================
-        # SDPA
+        # ATTENTION (explicit, so the logits can be soft capped)
         # =====================================================
-        out = F.scaled_dot_product_attention(
+        out = soft_capped_attention(
             q, k, v,
-            attn_mask=final_bias,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,   # IMPORTANT: we already applied causal bias
-            enable_gqa=True,
+            num_heads=self.num_heads, num_kv_heads=self.num_kv_heads, head_dim=self.head_dim,
+            bias=final_bias, soft_cap=self.soft_cap,
+            dropout=self.dropout, training=self.training,
         )
 
         if row_valid is not None:
@@ -335,7 +365,7 @@ class PerChannelTimeAttention(nn.Module):
     """
 
     def __init__(self, num_channels, embed_dim, num_heads, dropout=0.0, device="cuda",
-                 eps=1e-6, gqa_ratio=4, group_size=1):
+                 eps=1e-6, gqa_ratio=4, group_size=1, soft_cap=50.0):
         super().__init__()
         assert embed_dim % num_heads == 0
         assert num_channels % group_size == 0, (num_channels, group_size)
@@ -366,6 +396,7 @@ class PerChannelTimeAttention(nn.Module):
         self.k_norm_w = nn.Parameter(torch.ones(G, self.head_dim))
 
         self.rope = RoPE1D(self.head_dim)
+        self.soft_cap = soft_cap
         self.device = device
         if device is not None:
             self.to(device)
@@ -423,12 +454,11 @@ class PerChannelTimeAttention(nn.Module):
         all_blocked = torch.isneginf(bias).all(dim=-1, keepdim=True)
         bias = bias.masked_fill(all_blocked, 0.0)
 
-        out = F.scaled_dot_product_attention(
+        out = soft_capped_attention(
             q, k, v,
-            attn_mask=bias,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,
-            enable_gqa=True,
+            num_heads=H, num_kv_heads=Hkv, head_dim=hd,
+            bias=bias, soft_cap=self.soft_cap,
+            dropout=self.dropout, training=self.training,
         )
         out = out * (~all_blocked).to(out.dtype)
 
