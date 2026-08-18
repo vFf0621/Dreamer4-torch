@@ -228,18 +228,22 @@ class ModalitySpaceBlock(nn.Module):
     Spatial attention where every modality owns its attention weights.
 
     Routing (queries <- keys):
-        z     <- z          (attn_z_z)
-        z     <- actions    (attn_z_a)
-        actions <- actions  (attn_a_a)
-        actions <- z        (attn_a_z)
-        agent <- [z ; actions]   (attn_agent_za)   -- only the agent sees the concatenation
+        z     <- [z ; actions]   (attn_z_za)
+        actions <- actions       (attn_a_a)
+        actions <- z             (attn_a_z)
+        agent <- [z ; actions]   (attn_agent_za)
+
+    Action conditioning reaches z through a single attention: the queries come
+    from z while the keys and values are projected from the concatenation, so
+    latents and actions compete inside one softmax and share the key/value
+    projections. That differs from normalising a z-to-z and a z-to-action
+    attention separately and adding them.
+
+    The action stream still runs two paths whose outputs share a shape and are
+    summed: actions gets attn_a_a + attn_a_z.
 
     Nothing attends to the agent, so the agent stays read-only by construction,
     which is what the additive agent mask used to enforce.
-
-    Cross-attention outputs that share a shape are summed before the residual:
-        z     gets attn_z_z + attn_z_a
-        actions gets attn_a_a + attn_a_z
     """
 
     def __init__(self, d_model, n_heads, dropout=0.1, device="cuda", gqa_ratio=4, mlp_ratio=2.0):
@@ -252,8 +256,7 @@ class ModalitySpaceBlock(nn.Module):
         self.ln_a = nn.RMSNorm(d_model)
         self.ln_agent = nn.RMSNorm(d_model)
 
-        self.attn_z_z = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
-        self.attn_z_a = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        self.attn_z_za = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
         self.attn_a_a = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
         self.attn_a_z = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
         self.attn_agent_za = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
@@ -282,9 +285,16 @@ class ModalitySpaceBlock(nn.Module):
         z_kpm = z_pad.reshape(B * T, Nz) if z_pad is not None else None
         a_kpm = a_pad.reshape(B * T, Sa) if a_pad is not None else None
 
-        # ---- z: self + cross(actions), same shape -> summed ----
-        z_out = self.attn_z_z(zn, key_padding_mask=z_kpm) \
-              + self.attn_z_a(zn, x_k=an, key_padding_mask=a_kpm)
+        # ---- keys/values shared by the z and agent paths ----
+        za = torch.cat([zn, an], dim=1)                           # [B*T, Nz+Sa, D]
+        za_kpm = None
+        if z_kpm is not None or a_kpm is not None:
+            zk = z_kpm if z_kpm is not None else torch.zeros(B * T, Nz, dtype=torch.bool, device=z.device)
+            ak = a_kpm if a_kpm is not None else torch.zeros(B * T, Sa, dtype=torch.bool, device=a.device)
+            za_kpm = torch.cat([zk, ak], dim=1)
+
+        # ---- z: one attention over [z ; actions] (action conditioning) ----
+        z_out = self.attn_z_za(zn, x_k=za, key_padding_mask=za_kpm)
 
         # ---- actions: self + cross(z), same shape -> summed ----
         a_out = self.attn_a_a(an, key_padding_mask=a_kpm) \
@@ -299,12 +309,6 @@ class ModalitySpaceBlock(nn.Module):
         if agent is not None:
             Na = agent.shape[2]
             agn = self.ln_agent(agent).reshape(B * T, Na, D)
-            za = torch.cat([zn, an], dim=1)                       # [B*T, Nz+Sa, D]
-            za_kpm = None
-            if z_kpm is not None or a_kpm is not None:
-                zk = z_kpm if z_kpm is not None else torch.zeros(B * T, Nz, dtype=torch.bool, device=z.device)
-                ak = a_kpm if a_kpm is not None else torch.zeros(B * T, Sa, dtype=torch.bool, device=a.device)
-                za_kpm = torch.cat([zk, ak], dim=1)
             ag_out = self.attn_agent_za(agn, x_k=za, key_padding_mask=za_kpm)
             agent = agent + ag_out.reshape(B, T, Na, D)
             agent = agent + self.mlp_agent(agent)
