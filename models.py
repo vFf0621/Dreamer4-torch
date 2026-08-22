@@ -1811,48 +1811,67 @@ class Dreamer4(nn.Module):
     def decode(self, latents):
         return self.decoder(latents)
 
-    def bc_act_now_aux(self, latents, actions, termination, num_steps=8):
+    def bc_act_now_aux(self, latents, actions, rewards, termination, num_steps=8):
         """
-        Extra supervision for the act-now head, on the context it meets when acting.
+        Extra supervision on the context the agent meets when acting: act-now action,
+        reward and termination. Returns the three losses, k=0 only.
 
-        The single BC pass can only train the k=0 head at the last timestep, because
+        The single BC pass can only train the k=0 heads at the last timestep, because
         that is the one slot whose action is the query rather than a_t. This samples
         `num_steps` other timesteps and rebuilds each one the way action_step does: a
         window of at most eval_ctx+1 frames ending at t, the executed actions inside
-        it, and the query at t. The readout there is blind the same way.
+        it, and the query at t. The readout there is blind the same way, and it is the
+        same kind of feature latent_imagination reads, since a rollout step also puts
+        the query at the position it reads.
 
-        The passes run under no_grad and the features are detached, so this trains the
-        policy head only. It costs forward passes, not activation memory, and the
-        window cap keeps those passes short.
+        Gradient flows: through the blocks into the agent token, and into the policy
+        and reward heads. Activation memory is num_steps windows of at most eval_ctx+1
+        frames, so it scales with the acting context, not with the sequence length.
         """
         B, T = latents.shape[:2]
         N = self.shortcut_kmax
         k = min(int(num_steps), T)
+        zero = latents.new_zeros(())
         if k <= 0:
-            return latents.new_zeros(())
+            return zero, zero, zero
+
+        if rewards.dim() == 3 and rewards.size(-1) == 1:
+            rewards = rewards[..., 0]
 
         idx = torch.randperm(T, device=latents.device)[:k].sort().values
         feats = []
-        with torch.no_grad():
-            for t in idx.tolist():
-                lo = max(0, t - self.eval_ctx)                  # same window action_step keeps
-                z_ctx = self.mix_tau_ctx(latents[:, lo:t + 1])
-                _, feat = self.transformer(
-                    z_ctx,
-                    actions[:, lo:t],
-                    signals=self.make_signals_indices(B, t + 1 - lo, 1, N, N - 1),
-                )
-                feats.append(feat[:, -1:])
-        feats = torch.cat(feats, dim=1).detach()                # [B,k,D]
-
-        logits = self.policy(feats)[2].base_dist.logits[:, :, :1]        # [B,k,1,Da,bins]
-        tgt = actions[:, idx].unsqueeze(2)                               # [B,k,1,Da]
-        loss = soft_ce(logits, tgt, self.policy_num_bins,
-                       self.policy.action_low, self.policy.action_high).mean([-2, -1])
+        for t in idx.tolist():
+            lo = max(0, t - self.eval_ctx)                      # same window action_step keeps
+            z_ctx = self.mix_tau_ctx(latents[:, lo:t + 1])
+            _, feat = self.transformer(
+                z_ctx,
+                actions[:, lo:t],
+                signals=self.make_signals_indices(B, t + 1 - lo, 1, N, N - 1),
+            )
+            feats.append(feat[:, -1:])
+        feats = torch.cat(feats, dim=1)                         # [B,k,D]
 
         alive = (torch.cumsum(termination, 1) - termination) <= 0        # up to the first done
-        m = alive[:, idx].unsqueeze(-1).to(loss.dtype)
-        return (loss * m).sum() / (m.sum() + 1e-6)
+        m = alive[:, idx].unsqueeze(-1).to(feats.dtype)                  # [B,k,1]
+        denom = m.sum() + 1e-6
+
+        a_logits = self.policy(feats)[2].base_dist.logits[:, :, :1]      # [B,k,1,Da,bins]
+        a_loss = soft_ce(a_logits, actions[:, idx].unsqueeze(2), self.policy_num_bins,
+                         self.policy.action_low, self.policy.action_high).mean([-2, -1])
+
+        _, _, r_logits, term_dist = self.reward(feats)
+        # soft_ce squeezes dim -2 of the two-hot target, so keep the k=0 slice flat here
+        # and let the trailing singleton on the target be the one it removes
+        r_loss = soft_ce(r_logits[:, :, 0], rewards[:, idx].unsqueeze(-1), self.reward_bins,
+                         self.rminv, self.rmaxv, self.sym_rew)                   # [B,k,1]
+        t_loss = F.binary_cross_entropy_with_logits(
+            term_dist.logits[:, :, :1], termination[:, idx].unsqueeze(-1).to(feats.dtype),
+            reduction="none",
+        )
+
+        return ((a_loss * m).sum() / denom,
+                (r_loss * m).sum() / denom,
+                (t_loss * m).sum() / denom)
 
     def multistep_aux_losses(self, feat, actions, rewards, termination, t_policy=False):
         """
@@ -2141,12 +2160,14 @@ class Dreamer4(nn.Module):
             
                 action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:], termination.float(), policy)
 
-                # head-only: the act-now head is otherwise trained at one timestep per
-                # sequence, so sample a few more blind windows for it
-                act_now_loss = self.bc_act_now_aux(clean_latents, actions, termination.float(),
-                                                   self.bc_aux_steps)
+                # the act-now heads are otherwise trained at one timestep per sequence,
+                # so sample a few more acting windows; gradient reaches the agent token
+                # and the policy and reward heads
+                aux_act, aux_rew, aux_term = self.bc_act_now_aux(
+                    clean_latents, actions, reward, termination.float(), self.bc_aux_steps)
+                act_now_loss = aux_act + aux_rew + aux_term
 
-                ac_loss =  0.1*(action_loss+act_now_loss+reward_loss+term_loss) + 2 *  dyn_loss
+                ac_loss =  0.1*(action_loss+aux_act+reward_loss+aux_rew+term_loss+aux_term) + 2 *  dyn_loss
                 if not policy:
                     (ac_loss.mean()/self.grad_accum).backward()
                 if i == self.grad_accum-1 and not policy:
