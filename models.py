@@ -997,11 +997,12 @@ class Dynamics(nn.Module):
 
     Outputs:
       z_pred:      [B, T, Nz, Dz]
-      policy_feat: [B, T, D]  (agent token per timestep, if injected). Only the last
-                   timestep is a usable policy feature: it is the one holding the action
-                   query, so it is the only readout that cannot see the action it would
-                   be asked to predict. Callers that need a feature per timestep run one
-                   pass per prefix (see Dreamer4.bc_features).
+      policy_feat: [B, T, D]  (agent token per timestep, if injected). feat_t is action
+                   conditioned: it sees a_t, which is what a reward or termination head
+                   wants. The exception is the last timestep, whose action slot holds the
+                   query -- that one is blind to the action it is asked to produce, and is
+                   the readout the agent acts on and the only place the act-now head of
+                   the policy is trained.
     """
 
     def __init__(
@@ -1808,31 +1809,6 @@ class Dreamer4(nn.Module):
     def decode(self, latents):
         return self.decoder(latents)
 
-    def bc_features(self, latents, actions, detach_agent=False):
-        """
-        Policy features for behaviour cloning: [B, T, D], one transformer pass per step.
-
-        Step t is fed exactly the context the agent has when it acts at t: the prefix
-        z_{0:t}, the executed actions a_{0:t-1} at their own timesteps, and the action
-        query at t. Only the readout at the last position is kept, so h[:, t] is
-        produced the same way action_step produces the feature it acts on -- the policy
-        never sees a_t, and it never trains on a context it will not meet at evaluation.
-
-        Costs T passes over growing prefixes instead of one pass over the sequence.
-        """
-        B, T = latents.shape[:2]
-        N = self.shortcut_kmax
-        h_list = []
-        for t in range(T):
-            z_ctx = self.mix_tau_ctx(latents[:, :t+1])
-            _, feat = self.transformer(
-                z_ctx,
-                actions[:, :t],
-                signals=self.make_signals_indices(B, t+1, 1, N, N-1),
-                detach_agent=detach_agent,
-            )
-            h_list.append(feat[:, -1:])
-        return torch.cat(h_list, dim=1)                       # [B, T, D]
     def multistep_aux_losses(self, feat, actions, rewards, termination, t_policy=False):
         """
         Auxiliary Loss:
@@ -1940,6 +1916,14 @@ class Dreamer4(nn.Module):
         
         # FIX: Strict less-than T_a prevents the off-by-one padding leak
         a_mask = (t_idx + k_idx) < T_a                                # [1, L, K_use]
+
+        # a_t sits at position t, so the readout at t has already seen it: supervising
+        # the k=0 head there would train it to copy the action out of its own context.
+        # The last timestep is the one blind slot -- it holds the action query -- and it
+        # is also the readout the agent acts on, so k=0 is supervised there and nowhere
+        # else. k>=1 targets are future actions, which no readout can see, so they stay
+        # dense over the whole sequence.
+        a_mask = a_mask & ((k_idx > 0) | (t_idx == L_use - 1))        # [1, L, K_use]
         a_mask = a_mask & done_mask                                   # [B, L, K_use]
 
         raw_act_loss = soft_ce(
@@ -2100,11 +2084,15 @@ class Dreamer4(nn.Module):
                 clean_latents = self.encoder(states).detach()
                 B, T, Nz, _ = clean_latents.shape
 
+                noised = self.mix_tau_ctx(clean_latents)
+
                 self.unfreeze_agent_token()
-                # One pass per timestep, each one the context the agent acts in: the
-                # executed actions behind it and the action query at the step being
-                # predicted. Nothing here is a context evaluation will not produce.
-                h_with_grad = self.bc_features(clean_latents, actions)
+                N = self.shortcut_kmax
+                # One pass. feat_t is action conditioned (a_t sits with z_t), which is what
+                # the reward and termination heads want; the action head is masked so its
+                # act-now output is only trained at the blind last timestep.
+                h_with_grad = self.transformer(noised, actions[:,:-1],
+                                               signals=self.make_signals_indices(B, noised.size(1), 1, N, N-1))[1]
             
                 action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:], termination.float(), policy)
                                                 
