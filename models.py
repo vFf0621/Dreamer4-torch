@@ -1216,7 +1216,8 @@ class Dreamer4(nn.Module):
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=True, symlog_for_value=True,
-                kmax_prob=0.1, gqa_ratio=4, mlp_ratio=2.0, attn_mode='per_channel', time_group_size=4):
+                kmax_prob=0.1, gqa_ratio=4, mlp_ratio=2.0, attn_mode='per_channel', time_group_size=4,
+                bc_aux_steps=8):
         super(Dreamer4, self).__init__()
         self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patch, d_model=rep_d_model,
                                 n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=2,
@@ -1227,6 +1228,7 @@ class Dreamer4(nn.Module):
         self.pretrain = False
         self.agent_id = agent_id
         self.eval_ctx = eval_context_len
+        self.bc_aux_steps = bc_aux_steps
         # --- TokenDynamics --      -
         # level_vocab, step_vocab match
         self.sym_rew = symlog_for_reward
@@ -1809,6 +1811,49 @@ class Dreamer4(nn.Module):
     def decode(self, latents):
         return self.decoder(latents)
 
+    def bc_act_now_aux(self, latents, actions, termination, num_steps=8):
+        """
+        Extra supervision for the act-now head, on the context it meets when acting.
+
+        The single BC pass can only train the k=0 head at the last timestep, because
+        that is the one slot whose action is the query rather than a_t. This samples
+        `num_steps` other timesteps and rebuilds each one the way action_step does: a
+        window of at most eval_ctx+1 frames ending at t, the executed actions inside
+        it, and the query at t. The readout there is blind the same way.
+
+        The passes run under no_grad and the features are detached, so this trains the
+        policy head only. It costs forward passes, not activation memory, and the
+        window cap keeps those passes short.
+        """
+        B, T = latents.shape[:2]
+        N = self.shortcut_kmax
+        k = min(int(num_steps), T)
+        if k <= 0:
+            return latents.new_zeros(())
+
+        idx = torch.randperm(T, device=latents.device)[:k].sort().values
+        feats = []
+        with torch.no_grad():
+            for t in idx.tolist():
+                lo = max(0, t - self.eval_ctx)                  # same window action_step keeps
+                z_ctx = self.mix_tau_ctx(latents[:, lo:t + 1])
+                _, feat = self.transformer(
+                    z_ctx,
+                    actions[:, lo:t],
+                    signals=self.make_signals_indices(B, t + 1 - lo, 1, N, N - 1),
+                )
+                feats.append(feat[:, -1:])
+        feats = torch.cat(feats, dim=1).detach()                # [B,k,D]
+
+        logits = self.policy(feats)[2].base_dist.logits[:, :, :1]        # [B,k,1,Da,bins]
+        tgt = actions[:, idx].unsqueeze(2)                               # [B,k,1,Da]
+        loss = soft_ce(logits, tgt, self.policy_num_bins,
+                       self.policy.action_low, self.policy.action_high).mean([-2, -1])
+
+        alive = (torch.cumsum(termination, 1) - termination) <= 0        # up to the first done
+        m = alive[:, idx].unsqueeze(-1).to(loss.dtype)
+        return (loss * m).sum() / (m.sum() + 1e-6)
+
     def multistep_aux_losses(self, feat, actions, rewards, termination, t_policy=False):
         """
         Auxiliary Loss:
@@ -2095,9 +2140,13 @@ class Dreamer4(nn.Module):
                                                signals=self.make_signals_indices(B, noised.size(1), 1, N, N-1))[1]
             
                 action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:], termination.float(), policy)
-                                                
-             
-                ac_loss =  0.1*(action_loss+reward_loss+term_loss) + 2 *  dyn_loss
+
+                # head-only: the act-now head is otherwise trained at one timestep per
+                # sequence, so sample a few more blind windows for it
+                act_now_loss = self.bc_act_now_aux(clean_latents, actions, termination.float(),
+                                                   self.bc_aux_steps)
+
+                ac_loss =  0.1*(action_loss+act_now_loss+reward_loss+term_loss) + 2 *  dyn_loss
                 if not policy:
                     (ac_loss.mean()/self.grad_accum).backward()
                 if i == self.grad_accum-1 and not policy:
@@ -2190,6 +2239,7 @@ class Dreamer4(nn.Module):
             logger["psnr"] = psnr.item()
         if train_reward:
             logger["finetune_bc_loss"] = action_loss.mean().detach().item()
+            logger["act_now_bc_loss"] = act_now_loss.detach().item()
             logger["reward_loss"] = reward_loss.detach().item()
             logger["termination_loss"] = term_loss.mean().detach().item()
             logger["model_gn"] = model_gn
