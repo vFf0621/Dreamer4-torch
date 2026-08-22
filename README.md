@@ -15,14 +15,6 @@ This will NOT be any more data efficient than other implementations; it just con
 
 Action embeddings are interleaved with the latent, not added, as in previous implementations.
 
-Actions are aligned with the latents they were taken at, so position `t` of the action stream carries `a_t` rather than `a_{t-1}`. The action at the last timestep has not been taken yet, so a learned action query fills that slot; it stays readable as an attention key, so it receives gradient and is learned. The policy is always read out from the timestep holding the query, which is the only readout that cannot see the action it is being asked to predict.
-
-Behaviour cloning still runs in a single pass. Because `a_t` sits with `z_t`, the feature at `t` is action conditioned, which is what the reward and termination heads want, and only the act-now output of the policy could cheat by reading `a_t` out of its own context. So the `k=0` head is supervised at the last timestep alone — the slot holding the query, and the same readout the agent acts on — while the `k>=1` heads stay dense over the sequence, since no readout can see future actions. Running one pass per timestep instead would keep every graph alive at once: at roughly 0.064 GB of retained activations per timestep per batch element, batch 16 over length 60 needs about 1863 GB against 61 GB for the single pass.
-
-That leaves the act-now heads trained at one timestep per sequence, so `Dreamer4.bc_act_now_aux` samples `bc_aux_steps` further timesteps and rebuilds each the way `action_step` does: a window of at most `eval_context_len + 1` frames ending at `t`, the executed actions inside it, and the query at `t`. It supervises the action, reward and termination heads there at `k=0`, and the gradient flows through the blocks into the agent token as well as into the policy and reward heads. These are also the features `latent_imagination` reads, since a rollout step likewise puts the query at the position it reads from.
-
-Because those passes carry gradient they retain activations, but the window cap ties the cost to the acting context rather than the sequence length: `bc_aux_steps` windows of `eval_context_len + 1` frames. At the measured 0.064 GB per timestep per batch element, eight 5-frame windows at batch 16 is about 41 GB next to the 61 GB of the main pass, and it scales linearly in both knobs.
-
 Below are the training artifacts:
 
 <img width="600" height="300" alt="W B Chart 2_28_2026, 6_45_44 PM" src="https://github.com/user-attachments/assets/d67e7c2b-4ab0-4bd5-8370-ade4b840114f" />

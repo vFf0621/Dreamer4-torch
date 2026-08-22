@@ -991,18 +991,9 @@ class Dynamics(nn.Module):
                 (Legacy accepted: [B,T,Nz] => interpreted as level_idx, step_idx=0)
       actions:  [B, T-1, A] or [B, T, A] continuous in [-1, 1]
 
-    Actions are aligned with the latents they were taken at: position t carries a_t.
-    The action at the last timestep has not been taken yet, so a learned action query
-    fills that slot.
-
     Outputs:
       z_pred:      [B, T, Nz, Dz]
-      policy_feat: [B, T, D]  (agent token per timestep, if injected). feat_t is action
-                   conditioned: it sees a_t, which is what a reward or termination head
-                   wants. The exception is the last timestep, whose action slot holds the
-                   query -- that one is blind to the action it is asked to produce, and is
-                   the readout the agent acts on and the only place the act-now head of
-                   the policy is trained.
+      policy_feat: [B, 1, D]  (agent token at last timestep, if injected)
     """
 
     def __init__(
@@ -1064,7 +1055,7 @@ class Dynamics(nn.Module):
         self.action_conditioner = nn.Parameter(0.02 * torch.randn(1, 1, self.Sa, d_model))
         self.reserved = nn.Parameter(0.02 * torch.randn(1, 1, self.Nr, d_model))
 
-        self.action_query = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
+        self.action_pad = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
         self.action_lookup = action_lookup
         act_embed_dim = self.action_bins*self.action_dim
         # --- Action embedding (true lookup, no one-hot materialization) ---
@@ -1112,7 +1103,6 @@ class Dynamics(nn.Module):
             raise ValueError(...)
 
         if Ta == T:
-            # a_{T-1} is dropped: the last timestep holds the action query instead
             return actions[:,:T-1]
         if Ta == T-1:
             return actions
@@ -1131,7 +1121,7 @@ class Dynamics(nn.Module):
         detach_agent: bool = False,
         last_z=None,
         task_id=0,
-    ):
+    ):  
 
         assert (actions.size(1) == z_tokens.size(1) - 1) or ( actions.size(1) == z_tokens.size(1) )
         device = z_tokens.device
@@ -1146,13 +1136,15 @@ class Dynamics(nn.Module):
             raise ValueError(f"signals has T={signals.size(1)} but z_tokens has T={T}.")
 
         acts_bt = self.align_actions(actions, T, B)          # [B, T-1, A]
-        act_two_hot = two_hot(acts_bt, self.action_low, self.action_high, self.action_bins).reshape(B, -1, 1, self.action_bins * self.action_dim)
-        a_emb = self.action_embs(act_two_hot)                                              # [B, T-1, 1, D]
-        if a_emb.size(1) == T - 1:
-            # actions sit at their own timestep, so position t carries a_t. No action
-            # has been taken at the last frame yet, so the learned query fills it.
-            query = self.action_query.expand(B, 1, 1, -1)                                  # [B, 1, 1, D]
-            a_emb = torch.cat([a_emb, query], dim=1)                                       # [B, T, 1, D]
+        act_two_hot = two_hot(acts_bt, self.action_low, self.action_high, self.action_bins).reshape(B, -1, 1, self.action_bins * self.action_dim)                     # [B, T-1, A]
+
+                                                    # [B, T-1, D]
+        a_emb = self.action_embs(act_two_hot[:, :, :])                                                     # [B, T-1, 1, D]
+        if a_emb.size(1) == z_tokens.size(1)-1:
+            # no action led into the first frame: a learned embedding pads t=0 and
+            # the actions shift right, so position t carries a_{t-1}
+            pad = self.action_pad.expand(B, 1, 1, -1)                                      # [B, 1, 1, D]
+            a_emb = torch.cat([pad, a_emb], dim=1)                                         # [B, T, 1, D]
         a_tokens = a_emb.expand(-1, -1, self.Sa, -1) + self.action_conditioner  # [B,T,Sa,D]
         signals = signals.long()
         if signals.dim() == 4 and signals.size(-1) == 2:
@@ -1195,7 +1187,7 @@ class Dynamics(nn.Module):
             z_stream, a_stream, agent_in = blk(
                 z_stream, a_stream, agent_in,
                 z_pad=None,
-                a_pad=None,          # the action query is a readable, learned token
+                a_pad=None,          # the t=0 action pad is a readable, learned embedding
             )
 
         agent_out_bt = agent_in[:, :, 0, :] if agent_in is not None else None
@@ -1216,8 +1208,7 @@ class Dreamer4(nn.Module):
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=True, symlog_for_value=True,
-                kmax_prob=0.1, gqa_ratio=4, mlp_ratio=2.0, attn_mode='per_channel', time_group_size=4,
-                bc_aux_steps=8):
+                kmax_prob=0.1, gqa_ratio=4, mlp_ratio=2.0, attn_mode='per_channel', time_group_size=4):
         super(Dreamer4, self).__init__()
         self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patch, d_model=rep_d_model,
                                 n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=2,
@@ -1228,7 +1219,6 @@ class Dreamer4(nn.Module):
         self.pretrain = False
         self.agent_id = agent_id
         self.eval_ctx = eval_context_len
-        self.bc_aux_steps = bc_aux_steps
         # --- TokenDynamics --      -
         # level_vocab, step_vocab match
         self.sym_rew = symlog_for_reward
@@ -1397,9 +1387,7 @@ class Dreamer4(nn.Module):
                 self.action_buffer = self.action_buffer[:, 1:]
  
             actions_ctx = self.action_buffer
-            assert actions_ctx.size(1)  == z_in.size(1) -1
-            # acting: the executed actions stay at their own timesteps and only the last
-            # timestep holds the query, which is the one the policy is read out from
+            assert actions_ctx.size(1)  == z_in.size(1) -1 
             z_pred, h = self.transformer(z_in, actions_ctx[:,:], signals=sigs, task_id=self.task_id)
 
             a, *_ = self.policy(h[:, -1:])
@@ -1813,70 +1801,6 @@ class Dreamer4(nn.Module):
                 target_param.data.lerp_(online_param.data, tau)
     def decode(self, latents):
         return self.decoder(latents)
-
-    def bc_act_now_aux(self, latents, actions, rewards, termination, num_steps=8):
-        """
-        Extra supervision on the context the agent meets when acting: act-now action,
-        reward and termination. Returns the three losses, k=0 only.
-
-        The single BC pass can only train the k=0 heads at the last timestep, because
-        that is the one slot whose action is the query rather than a_t. This samples
-        `num_steps` other timesteps and rebuilds each one the way action_step does: a
-        window of at most eval_ctx+1 frames ending at t, the executed actions inside
-        it, and the query at t. The readout there is blind the same way, and it is the
-        same kind of feature latent_imagination reads, since a rollout step also puts
-        the query at the position it reads.
-
-        Gradient flows: through the blocks into the agent token, and into the policy
-        and reward heads. Activation memory is num_steps windows of at most eval_ctx+1
-        frames, so it scales with the acting context, not with the sequence length.
-        """
-        B, T = latents.shape[:2]
-        N = self.shortcut_kmax
-        k = min(int(num_steps), T)
-        zero = latents.new_zeros(())
-        if k <= 0:
-            return zero, zero, zero
-
-        if rewards.dim() == 3 and rewards.size(-1) == 1:
-            rewards = rewards[..., 0]
-
-        idx = torch.randperm(T, device=latents.device)[:k].sort().values
-        feats = []
-        for t in idx.tolist():
-            lo = max(0, t - self.eval_ctx)                      # same window action_step keeps
-            z_ctx = self.mix_tau_ctx(latents[:, lo:t + 1])
-            _, feat = self.transformer(
-                z_ctx,
-                actions[:, lo:t],
-                signals=self.make_signals_indices(B, t + 1 - lo, 1, N, N - 1),
-                task_id=self.task_id,
-            )
-            feats.append(feat[:, -1:])
-        feats = torch.cat(feats, dim=1)                         # [B,k,D]
-
-        alive = (torch.cumsum(termination, 1) - termination) <= 0        # up to the first done
-        m = alive[:, idx].unsqueeze(-1).to(feats.dtype)                  # [B,k,1]
-        denom = m.sum() + 1e-6
-
-        a_logits = self.policy(feats)[2].base_dist.logits[:, :, :1]      # [B,k,1,Da,bins]
-        a_loss = soft_ce(a_logits, actions[:, idx].unsqueeze(2), self.policy_num_bins,
-                         self.policy.action_low, self.policy.action_high).mean([-2, -1])
-
-        _, _, r_logits, term_dist = self.reward(feats)
-        # soft_ce squeezes dim -2 of the two-hot target, so keep the k=0 slice flat here
-        # and let the trailing singleton on the target be the one it removes
-        r_loss = soft_ce(r_logits[:, :, 0], rewards[:, idx].unsqueeze(-1), self.reward_bins,
-                         self.rminv, self.rmaxv, self.sym_rew)                   # [B,k,1]
-        t_loss = F.binary_cross_entropy_with_logits(
-            term_dist.logits[:, :, :1], termination[:, idx].unsqueeze(-1).to(feats.dtype),
-            reduction="none",
-        )
-
-        return ((a_loss * m).sum() / denom,
-                (r_loss * m).sum() / denom,
-                (t_loss * m).sum() / denom)
-
     def multistep_aux_losses(self, feat, actions, rewards, termination, t_policy=False):
         """
         Auxiliary Loss:
@@ -1984,14 +1908,6 @@ class Dreamer4(nn.Module):
         
         # FIX: Strict less-than T_a prevents the off-by-one padding leak
         a_mask = (t_idx + k_idx) < T_a                                # [1, L, K_use]
-
-        # a_t sits at position t, so the readout at t has already seen it: supervising
-        # the k=0 head there would train it to copy the action out of its own context.
-        # The last timestep is the one blind slot -- it holds the action query -- and it
-        # is also the readout the agent acts on, so k=0 is supervised there and nowhere
-        # else. k>=1 targets are future actions, which no readout can see, so they stay
-        # dense over the whole sequence.
-        a_mask = a_mask & ((k_idx > 0) | (t_idx == L_use - 1))        # [1, L, K_use]
         a_mask = a_mask & done_mask                                   # [B, L, K_use]
 
         raw_act_loss = soft_ce(
@@ -2151,28 +2067,18 @@ class Dreamer4(nn.Module):
             if train_reward or policy:
                 clean_latents = self.encoder(states).detach()
                 B, T, Nz, _ = clean_latents.shape
-
-                noised = self.mix_tau_ctx(clean_latents)
-
+                
+                noised = self.mix_tau_ctx(clean_latents) 
+                
                 self.unfreeze_agent_token()
                 N = self.shortcut_kmax
-                # One pass. feat_t is action conditioned (a_t sits with z_t), which is what
-                # the reward and termination heads want; the action head is masked so its
-                # act-now output is only trained at the blind last timestep.
-                h_with_grad = self.transformer(noised, actions[:,:-1],
-                                               signals=self.make_signals_indices(B, noised.size(1), 1, N, N-1),
+                h_with_grad = self.transformer(noised, actions[:,:-1], signals=self.make_signals_indices(B, noised.size(1), 1, N, N-1),
                                                task_id=self.task_id)[1]
             
                 action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:], termination.float(), policy)
-
-                # the act-now heads are otherwise trained at one timestep per sequence,
-                # so sample a few more acting windows; gradient reaches the agent token
-                # and the policy and reward heads
-                aux_act, aux_rew, aux_term = self.bc_act_now_aux(
-                    clean_latents, actions, reward, termination.float(), self.bc_aux_steps)
-                act_now_loss = aux_act + aux_rew + aux_term
-
-                ac_loss =  0.1*(action_loss+aux_act+reward_loss+aux_rew+term_loss+aux_term) + 2 *  dyn_loss
+                                                
+             
+                ac_loss =  0.1*(action_loss+reward_loss+term_loss) + 2 *  dyn_loss
                 if not policy:
                     (ac_loss.mean()/self.grad_accum).backward()
                 if i == self.grad_accum-1 and not policy:
@@ -2265,7 +2171,6 @@ class Dreamer4(nn.Module):
             logger["psnr"] = psnr.item()
         if train_reward:
             logger["finetune_bc_loss"] = action_loss.mean().detach().item()
-            logger["act_now_bc_loss"] = act_now_loss.detach().item()
             logger["reward_loss"] = reward_loss.detach().item()
             logger["termination_loss"] = term_loss.mean().detach().item()
             logger["model_gn"] = model_gn
