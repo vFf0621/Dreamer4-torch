@@ -15,6 +15,8 @@ This will NOT be any more data efficient than other implementations; it just con
 
 Action embeddings are interleaved with the latent, not added, as in previous implementations.
 
+Actions are aligned with the latents they were taken at, so position `t` of the action stream carries `a_t` rather than `a_{t-1}`. The action at the last timestep has not been taken yet, so a learned action query fills that slot; it stays readable as an attention key, so it receives gradient and is learned. Since the policy is read out from a timestep that holds the query, behaviour cloning passes `action_query_at="all"` to `Dynamics.forward` and puts the query at every timestep: the readout at `t` then has to predict `a_t` from `z_{<=t}` instead of copying the action sitting next to it. Acting, imagination and the world model keep the default `action_query_at="last"`, where the executed actions stay in the stream and only the timestep being acted on holds the query.
+
 Below are the training artifacts:
 
 <img width="600" height="300" alt="W B Chart 2_28_2026, 6_45_44 PM" src="https://github.com/user-attachments/assets/d67e7c2b-4ab0-4bd5-8370-ade4b840114f" />
