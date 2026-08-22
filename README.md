@@ -15,7 +15,9 @@ This will NOT be any more data efficient than other implementations; it just con
 
 Action embeddings are interleaved with the latent, not added, as in previous implementations.
 
-Actions are aligned with the latents they were taken at, so position `t` of the action stream carries `a_t` rather than `a_{t-1}`. The action at the last timestep has not been taken yet, so a learned action query fills that slot; it stays readable as an attention key, so it receives gradient and is learned. Since the policy is read out from a timestep that holds the query, behaviour cloning passes `action_query_at="all"` to `Dynamics.forward` and puts the query at every timestep: the readout at `t` then has to predict `a_t` from `z_{<=t}` instead of copying the action sitting next to it. Acting, imagination and the world model keep the default `action_query_at="last"`, where the executed actions stay in the stream and only the timestep being acted on holds the query.
+Actions are aligned with the latents they were taken at, so position `t` of the action stream carries `a_t` rather than `a_{t-1}`. The action at the last timestep has not been taken yet, so a learned action query fills that slot; it stays readable as an attention key, so it receives gradient and is learned. The policy is always read out from the timestep holding the query, which is the only readout that cannot see the action it is being asked to predict.
+
+Because that readout exists at one timestep per forward pass, behaviour cloning runs a loop rather than a single pass (`Dreamer4.bc_features`): at step `t` the model is fed the prefix `z_{0:t}` with the executed actions `a_{0:t-1}` at their own timesteps and the query at `t`, and only the last position is kept. Concatenating those gives a feature per timestep, each one produced from exactly the context the agent has when it acts, so behaviour cloning never trains on a context that evaluation will not produce. This costs `T` passes over growing prefixes instead of one pass over the sequence.
 
 Below are the training artifacts:
 

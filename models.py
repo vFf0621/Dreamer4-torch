@@ -993,15 +993,15 @@ class Dynamics(nn.Module):
 
     Actions are aligned with the latents they were taken at: position t carries a_t.
     The action at the last timestep has not been taken yet, so a learned action query
-    fills that slot. `action_query_at="all"` puts the query at every timestep instead,
-    which is what behaviour cloning needs: the policy reads a feature at every t, and
-    a_t must not be visible to the readout at t.
+    fills that slot.
 
     Outputs:
       z_pred:      [B, T, Nz, Dz]
-      policy_feat: [B, T, D]  (agent token per timestep, if injected). Only valid at
-                   timesteps that hold the action query, since elsewhere the readout
-                   sees the action it would be asked to predict.
+      policy_feat: [B, T, D]  (agent token per timestep, if injected). Only the last
+                   timestep is a usable policy feature: it is the one holding the action
+                   query, so it is the only readout that cannot see the action it would
+                   be asked to predict. Callers that need a feature per timestep run one
+                   pass per prefix (see Dreamer4.bc_features).
     """
 
     def __init__(
@@ -1130,7 +1130,6 @@ class Dynamics(nn.Module):
         detach_agent: bool = False,
         last_z=None,
         task_id=0,
-        action_query_at: str = "last",          # "last" (rollout / dynamics) or "all" (BC)
     ):
 
         assert (actions.size(1) == z_tokens.size(1) - 1) or ( actions.size(1) == z_tokens.size(1) )
@@ -1146,21 +1145,13 @@ class Dynamics(nn.Module):
             raise ValueError(f"signals has T={signals.size(1)} but z_tokens has T={T}.")
 
         acts_bt = self.align_actions(actions, T, B)          # [B, T-1, A]
-        if action_query_at not in ("last", "all"):
-            raise ValueError(f"action_query_at must be 'last' or 'all', got {action_query_at!r}")
-
-        if action_query_at == "all":
-            # Behaviour cloning: every timestep holds the query, so the readout at t
-            # sees no action at all and has to predict a_t from z_{<=t} alone.
-            a_emb = self.action_query.expand(B, T, 1, -1)                                  # [B, T, 1, D]
-        else:
-            act_two_hot = two_hot(acts_bt, self.action_low, self.action_high, self.action_bins).reshape(B, -1, 1, self.action_bins * self.action_dim)
-            a_emb = self.action_embs(act_two_hot)                                          # [B, T-1, 1, D]
-            if a_emb.size(1) == T - 1:
-                # actions sit at their own timestep, so position t carries a_t. No action
-                # has been taken at the last frame yet, so the learned query fills it.
-                query = self.action_query.expand(B, 1, 1, -1)                              # [B, 1, 1, D]
-                a_emb = torch.cat([a_emb, query], dim=1)                                   # [B, T, 1, D]
+        act_two_hot = two_hot(acts_bt, self.action_low, self.action_high, self.action_bins).reshape(B, -1, 1, self.action_bins * self.action_dim)
+        a_emb = self.action_embs(act_two_hot)                                              # [B, T-1, 1, D]
+        if a_emb.size(1) == T - 1:
+            # actions sit at their own timestep, so position t carries a_t. No action
+            # has been taken at the last frame yet, so the learned query fills it.
+            query = self.action_query.expand(B, 1, 1, -1)                                  # [B, 1, 1, D]
+            a_emb = torch.cat([a_emb, query], dim=1)                                       # [B, T, 1, D]
         a_tokens = a_emb.expand(-1, -1, self.Sa, -1) + self.action_conditioner  # [B,T,Sa,D]
         signals = signals.long()
         if signals.dim() == 4 and signals.size(-1) == 2:
@@ -1406,7 +1397,7 @@ class Dreamer4(nn.Module):
             assert actions_ctx.size(1)  == z_in.size(1) -1
             # acting: the executed actions stay at their own timesteps and only the last
             # timestep holds the query, which is the one the policy is read out from
-            z_pred, h = self.transformer(z_in, actions_ctx[:,:], signals=sigs, action_query_at="last")
+            z_pred, h = self.transformer(z_in, actions_ctx[:,:], signals=sigs)
 
             a, *_ = self.policy(h[:, -1:])
 
@@ -1816,6 +1807,32 @@ class Dreamer4(nn.Module):
                 target_param.data.lerp_(online_param.data, tau)
     def decode(self, latents):
         return self.decoder(latents)
+
+    def bc_features(self, latents, actions, detach_agent=False):
+        """
+        Policy features for behaviour cloning: [B, T, D], one transformer pass per step.
+
+        Step t is fed exactly the context the agent has when it acts at t: the prefix
+        z_{0:t}, the executed actions a_{0:t-1} at their own timesteps, and the action
+        query at t. Only the readout at the last position is kept, so h[:, t] is
+        produced the same way action_step produces the feature it acts on -- the policy
+        never sees a_t, and it never trains on a context it will not meet at evaluation.
+
+        Costs T passes over growing prefixes instead of one pass over the sequence.
+        """
+        B, T = latents.shape[:2]
+        N = self.shortcut_kmax
+        h_list = []
+        for t in range(T):
+            z_ctx = self.mix_tau_ctx(latents[:, :t+1])
+            _, feat = self.transformer(
+                z_ctx,
+                actions[:, :t],
+                signals=self.make_signals_indices(B, t+1, 1, N, N-1),
+                detach_agent=detach_agent,
+            )
+            h_list.append(feat[:, -1:])
+        return torch.cat(h_list, dim=1)                       # [B, T, D]
     def multistep_aux_losses(self, feat, actions, rewards, termination, t_policy=False):
         """
         Auxiliary Loss:
@@ -2082,15 +2099,12 @@ class Dreamer4(nn.Module):
             if train_reward or policy:
                 clean_latents = self.encoder(states).detach()
                 B, T, Nz, _ = clean_latents.shape
-                
-                noised = self.mix_tau_ctx(clean_latents) 
-                
+
                 self.unfreeze_agent_token()
-                N = self.shortcut_kmax
-                # BC reads a policy feature at every timestep, so the action query goes
-                # in at every timestep: a_t is never visible to the readout that predicts it.
-                h_with_grad = self.transformer(noised, actions[:,:-1], signals=self.make_signals_indices(B, noised.size(1), 1, N, N-1),
-                                               action_query_at="all")[1]
+                # One pass per timestep, each one the context the agent acts in: the
+                # executed actions behind it and the action query at the step being
+                # predicted. Nothing here is a context evaluation will not produce.
+                h_with_grad = self.bc_features(clean_latents, actions)
             
                 action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:], termination.float(), policy)
                                                 
