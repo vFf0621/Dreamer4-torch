@@ -1400,7 +1400,7 @@ class Dreamer4(nn.Module):
             assert actions_ctx.size(1)  == z_in.size(1) -1
             # acting: the executed actions stay at their own timesteps and only the last
             # timestep holds the query, which is the one the policy is read out from
-            z_pred, h = self.transformer(z_in, actions_ctx[:,:], signals=sigs)
+            z_pred, h = self.transformer(z_in, actions_ctx[:,:], signals=sigs, task_id=self.task_id)
 
             a, *_ = self.policy(h[:, -1:])
 
@@ -1591,6 +1591,7 @@ class Dreamer4(nn.Module):
             z_targ,
             actions[:, :-1],
             signals=self.make_signals_indices(B, T, 1, tau_idx, k_pow),
+            task_id=self.task_id,
         )[0]
 
         is_base_f = is_base.unsqueeze(-1).float()
@@ -1609,6 +1610,7 @@ class Dreamer4(nn.Module):
                 z_targ,
                 actions[:, :-1],
                 signals=self.make_signals_indices(B, T, 1, tau_idx, k_half),
+                task_id=self.task_id,
             )[0][:, :]
 
             v1 = (z1_prime - z_targ) / (1.0 - tau).clamp(min=1e-5)
@@ -1620,6 +1622,7 @@ class Dreamer4(nn.Module):
                 z_mid,
                 actions[:, :-1],
                 signals=self.make_signals_indices(B, T, 1, tau_mid_idx, k_half),
+                task_id=self.task_id,
             )[0][:, :]
 
             v2 = (z1_mid - z_mid) / (1.0 - tau_mid).clamp(min=1e-5)
@@ -1847,6 +1850,7 @@ class Dreamer4(nn.Module):
                 z_ctx,
                 actions[:, lo:t],
                 signals=self.make_signals_indices(B, t + 1 - lo, 1, N, N - 1),
+                task_id=self.task_id,
             )
             feats.append(feat[:, -1:])
         feats = torch.cat(feats, dim=1)                         # [B,k,D]
@@ -2156,7 +2160,8 @@ class Dreamer4(nn.Module):
                 # the reward and termination heads want; the action head is masked so its
                 # act-now output is only trained at the blind last timestep.
                 h_with_grad = self.transformer(noised, actions[:,:-1],
-                                               signals=self.make_signals_indices(B, noised.size(1), 1, N, N-1))[1]
+                                               signals=self.make_signals_indices(B, noised.size(1), 1, N, N-1),
+                                               task_id=self.task_id)[1]
             
                 action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:], termination.float(), policy)
 
