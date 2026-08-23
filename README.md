@@ -15,7 +15,7 @@ This will NOT be any more data efficient than other implementations; it just con
 
 Action embeddings are interleaved with the latent, not added, as in previous implementations.
 
-Actions are aligned with the latents they were taken at: position `t` of the action stream carries `a_t`, not `a_{t-1}`. The last timestep has no action yet, so a learned query fills that slot. Note this puts `a_t` inside the same timestep as `z_t`, so the readout at `t` sees it through the latents.
+Actions are aligned with the latents they were taken at: position `t` of the action stream carries `a_t`, not `a_{t-1}`. The last timestep has no action yet; the stream still needs an entry there, so it is left at zero, which leaves that slot as the bare `action_conditioner`. Note this puts `a_t` inside the same timestep as `z_t`, so the readout at `t` sees it through the latents.
 
 The agent token is injected once, at the first timestep, rather than restamped at every step. Later positions start empty on that channel and pick the token up through its causal temporal attention, so the readout carries it forward instead of re-reading a fresh copy each step. Note this makes the readout channel a carry within whatever window is fed: `action_step` trims its buffer to `eval_context_len`, so at inference the token is re-seeded at the start of each window.
 

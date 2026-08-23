@@ -1060,7 +1060,6 @@ class Dynamics(nn.Module):
         self.action_conditioner = nn.Parameter(0.02 * torch.randn(1, 1, self.Sa, d_model))
         self.reserved = nn.Parameter(0.02 * torch.randn(1, 1, self.Nr, d_model))
 
-        self.action_pad = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
         self.action_lookup = action_lookup
         act_embed_dim = self.action_bins*self.action_dim
         # --- Action embedding (true lookup, no one-hot materialization) ---
@@ -1162,10 +1161,11 @@ class Dynamics(nn.Module):
         a_emb = self.action_embs(act_two_hot[:, :, :])                                                     # [B, T-1, 1, D]
         if a_emb.size(1) == z_tokens.size(1)-1:
             # actions stay at their own timestep: position t carries a_t, so z_t is
-            # aligned with the action taken at t. No action has been taken at the last
-            # frame yet, so a learned query fills that slot.
-            query = self.action_pad.expand(B, 1, 1, -1)                                    # [B, 1, 1, D]
-            a_emb = torch.cat([a_emb, query], dim=1)                                       # [B, T, 1, D]
+            # aligned with the action taken at t. The last frame has no action yet and
+            # the stream needs an entry there, so it is left at zero -- adding the
+            # action conditioner below leaves that slot as the bare conditioner, which
+            # is already a learned per-channel embedding marking "no action".
+            a_emb = torch.cat([a_emb, a_emb.new_zeros(B, 1, 1, self.d_model)], dim=1)      # [B, T, 1, D]
         a_tokens = a_emb.expand(-1, -1, self.Sa, -1) + self.action_conditioner  # [B,T,Sa,D]
         signals = signals.long()
         if signals.dim() == 4 and signals.size(-1) == 2:
