@@ -15,8 +15,6 @@ This will NOT be any more data efficient than other implementations; it just con
 
 Action embeddings are interleaved with the latent, not added, as in previous implementations.
 
-The dynamics reads out two tokens per timestep rather than one. Both attend over the same keys with the same weights; they differ only in their own content. `h_t` is the readout token alone, so it sees `z_1..z_t` and `a_1..a_{t-1}` and never the action it is being asked to predict — this is the policy input. `h_t_a` is the same token plus the embedding of `a_t`, so it additionally carries the current action, and feeds the reward and termination heads, which predict `r_t` knowing what was done. The action stream itself stays shifted, position `t` carrying `a_{t-1}`, so the latents are conditioned on the action that produced them; the aligned view of the actions exists only inside `h_t_a`, with a learned query filling the last timestep where no action has been taken yet. Nothing attends to a readout channel in either attention mode, so the action inside `h_t_a` provably cannot reach the latents or `h_t`.
-
 Below are the training artifacts:
 
 <img width="600" height="300" alt="W B Chart 2_28_2026, 6_45_44 PM" src="https://github.com/user-attachments/assets/d67e7c2b-4ab0-4bd5-8370-ade4b840114f" />
