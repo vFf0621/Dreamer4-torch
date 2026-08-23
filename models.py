@@ -261,7 +261,7 @@ class ModalitySpaceBlock(nn.Module):
         z     <- [z ; actions]   (attn_z_za)
         actions <- actions       (attn_a_a)
         actions <- z             (attn_a_z)
-        agent <- [z ; actions]   (attn_agent_za)
+        agent <- z               (attn_agent_z)
 
     Action conditioning reaches z through a single attention: the queries come
     from z while the keys and values are projected from the concatenation, so
@@ -271,6 +271,10 @@ class ModalitySpaceBlock(nn.Module):
 
     The action stream still runs two paths whose outputs share a shape and are
     summed: actions gets attn_a_a + attn_a_z.
+
+    The agent reads the z stream alone -- latents, the signal token and the reserved
+    registers -- and never the action tokens. Actions still shape it, but only through
+    what they did to z, which under the shifted stream is a_{t-1} and earlier.
 
     Nothing attends to the agent, so the agent stays read-only by construction,
     which is what the additive agent mask used to enforce.
@@ -289,7 +293,7 @@ class ModalitySpaceBlock(nn.Module):
         self.attn_z_za = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
         self.attn_a_a = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
         self.attn_a_z = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
-        self.attn_agent_za = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        self.attn_agent_z = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
 
         self.mlp_z = build_network(d_model, hidden, 3, "SwiGLU", d_model, True)
         self.mlp_a = build_network(d_model, hidden, 3, "SwiGLU", d_model, True)
@@ -335,11 +339,11 @@ class ModalitySpaceBlock(nn.Module):
         z = z + self.mlp_z(z)
         a = a + self.mlp_a(a)
 
-        # ---- agent: reads the concatenation of z and actions ----
+        # ---- agent: reads the z stream only, never the action tokens ----
         if agent is not None:
             Na = agent.shape[2]
             agn = self.ln_agent(agent).reshape(B * T, Na, D)
-            ag_out = self.attn_agent_za(agn, x_k=za, key_padding_mask=za_kpm)
+            ag_out = self.attn_agent_z(agn, x_k=zn, key_padding_mask=z_kpm)
             agent = agent + ag_out.reshape(B, T, Na, D)
             agent = agent + self.mlp_agent(agent)
 
@@ -597,9 +601,9 @@ class SharedSpaceBlock(nn.Module):
     """
     Dynamics spatial attention, paper-style: one set of weights and a single
     softmax over the concatenated token sequence, with an additive mask giving
-    the same routing as ModalitySpaceBlock -- every stream sees z, the signal
-    token, the registers and the actions, and nothing attends to the agent,
-    which reads all of them.
+    the same routing as ModalitySpaceBlock -- z and the actions see z, the signal
+    token, the registers and the actions; nothing attends to the agent; and the
+    agent reads the z stream only, never the action tokens.
 
     Note this is not merely ModalitySpaceBlock with tied weights: attending in
     one pass makes z and the actions compete inside a single softmax, whereas
@@ -628,9 +632,10 @@ class SharedSpaceBlock(nn.Module):
         xn = self.ln(x).reshape(B * T, S, D)
 
         bias = None
-        if Na > 0:                                   # block the agent columns
+        if Na > 0:
             bias = torch.zeros((S, S), dtype=xn.dtype, device=x.device)
-            bias[: Nz + Sa, Nz + Sa :] = float("-inf")
+            bias[: Nz + Sa, Nz + Sa :] = float("-inf")   # nothing attends to the agent
+            bias[Nz + Sa :, Nz : Nz + Sa] = float("-inf")  # the agent never reads actions
 
         kpm = None
         if z_pad is not None or a_pad is not None:

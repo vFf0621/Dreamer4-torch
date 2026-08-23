@@ -15,6 +15,8 @@ This will NOT be any more data efficient than other implementations; it just con
 
 Action embeddings are interleaved with the latent, not added, as in previous implementations.
 
+The policy readout attends to the z stream only -- latents, the signal token and the reserved registers -- and never to the action tokens. Actions still shape it, but only through what they did to the latents, which under the shifted stream means `a_1..a_{t-1}` at position `t`. In the per-channel mode this is simply the key set it is given; in the shared mode, where all routing is one additive mask, the agent rows are blocked from the action columns.
+
 Below are the training artifacts:
 
 <img width="600" height="300" alt="W B Chart 2_28_2026, 6_45_44 PM" src="https://github.com/user-attachments/assets/d67e7c2b-4ab0-4bd5-8370-ade4b840114f" />
