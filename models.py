@@ -1100,6 +1100,21 @@ class Dynamics(nn.Module):
 
         self.to(device)
 
+    def seed_agent_channel(self, tok, B, T):
+        """
+        Agent channel input: the token at t=0 and nothing afterwards.
+
+        The token is injected once rather than restamped at every timestep. Later
+        positions start empty and pick it up through the channel's causal temporal
+        attention, so the readout carries the token forward instead of re-reading a
+        fresh copy of it at each step.
+        """
+        tok = tok.reshape(1, 1, 1, self.d_model).expand(B, 1, 1, self.d_model)
+        if T == 1:
+            return tok
+        rest = tok.new_zeros(B, T - 1, 1, self.d_model)
+        return torch.cat([tok, rest], dim=1)                    # [B,T,1,D]
+
     def align_actions(self, actions, T, B):
         if actions.dim() != 3:
             raise ValueError(...)
@@ -1178,14 +1193,14 @@ class Dynamics(nn.Module):
         if policy_tok_in is not None:
             ag = policy_tok_in
             if ag.size(0) == 1 and B > 1: ag = ag.expand(B, -1, -1, -1)
-            if ag.size(1) == 1 and T > 1: ag = ag.expand(B, T, -1, -1)
             if ag.size(2) != 1:
                 raise ValueError("policy_tok_in token dim must be 1 at dim=2")
-            agent = ag
+            agent = self.seed_agent_channel(ag[:, :1], B, T)
             agent_in = agent.detach() if detach_agent else agent
         elif self.use_agent_token:
             assert task_id < self.num_task
-            agent = self.agent_token[:, :, task_id].expand(B, T, 1, self.d_model)
+            tok = self.agent_token[:, :, task_id].reshape(1, 1, 1, self.d_model)
+            agent = self.seed_agent_channel(tok, B, T)
             agent_in = agent.detach() if detach_agent else agent
 
         for blk in self.blocks:
