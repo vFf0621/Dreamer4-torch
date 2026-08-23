@@ -1056,13 +1056,20 @@ class Dynamics(nn.Module):
         self.reserved = nn.Parameter(0.02 * torch.randn(1, 1, self.Nr, d_model))
 
         self.action_pad = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
+        # stands in for a_t at the last timestep, where the action has not been taken yet
+        self.action_query = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
         self.action_lookup = action_lookup
         act_embed_dim = self.action_bins*self.action_dim
         # --- Action embedding (true lookup, no one-hot materialization) ---
         self.action_embs = nn.Sequential(nn.RMSNorm(act_embed_dim), nn.Linear(act_embed_dim, self.d_model), nn.RMSNorm(d_model))
 
-        # Agent token (learned)
+        # Two readout tokens, both attending over the same keys with the same weights.
+        # They differ only in their own content: h_t is the token alone, h_t_a is the
+        # token plus the embedding of a_t. So h_t never carries the current action and
+        # h_t_a does. Nothing attends to an agent channel in either block family, so
+        # the action in h_t_a cannot reach z or h_t.
         self.agent_token = nn.Parameter(0.02 * torch.randn(1, 1, num_tasks, d_model))
+        self.agent_token_a = nn.Parameter(0.02 * torch.randn(1, 1, num_tasks, d_model))
 
         # Blocks: modality-specific attention weights.
         #   space -> z/z, z/actions, actions/actions, actions/z, agent/[z;actions]
@@ -1078,7 +1085,7 @@ class Dynamics(nn.Module):
                     n_latent=self.Nz,
                     n_reserved=self.Nr,
                     n_a_channels=self.Sa,
-                    n_agent_channels=1,
+                    n_agent_channels=2,          # h_t and h_t_a
                     dropout=dropout, device=device, gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio,
                     time_group_size=time_group_size,
                 ) if per_channel else SharedTimeBlock(
@@ -1141,10 +1148,16 @@ class Dynamics(nn.Module):
                                                     # [B, T-1, D]
         a_emb = self.action_embs(act_two_hot[:, :, :])                                                     # [B, T-1, 1, D]
         if a_emb.size(1) == z_tokens.size(1)-1:
-            # no action led into the first frame: a learned embedding pads t=0 and
-            # the actions shift right, so position t carries a_{t-1}
+            # the stream keeps the shifted view: no action led into the first frame, so a
+            # learned embedding pads t=0 and position t carries a_{t-1}. z reads this one,
+            # so the latents are conditioned on the action that produced them and never on
+            # their own. a_cur is the same actions aligned instead, a_t at position t, and
+            # goes only into h_t_a; the last timestep has no action yet, so the query fills it.
             pad = self.action_pad.expand(B, 1, 1, -1)                                      # [B, 1, 1, D]
+            a_cur = torch.cat([a_emb, self.action_query.expand(B, 1, 1, -1)], dim=1)       # [B, T, 1, D]
             a_emb = torch.cat([pad, a_emb], dim=1)                                         # [B, T, 1, D]
+        else:
+            a_cur = a_emb
         a_tokens = a_emb.expand(-1, -1, self.Sa, -1) + self.action_conditioner  # [B,T,Sa,D]
         signals = signals.long()
         if signals.dim() == 4 and signals.size(-1) == 2:
@@ -1176,11 +1189,17 @@ class Dynamics(nn.Module):
             if ag.size(1) == 1 and T > 1: ag = ag.expand(B, T, -1, -1)
             if ag.size(2) != 1:
                 raise ValueError("policy_tok_in token dim must be 1 at dim=2")
-            agent = ag
+            assert task_id < self.num_task
+            ha = self.agent_token_a[:, :, task_id].expand(B, T, 1, self.d_model) + a_cur
+            agent = torch.cat([ag, ha], dim=2)                          # [B,T,2,D]
             agent_in = agent.detach() if detach_agent else agent
         elif self.use_agent_token:
             assert task_id < self.num_task
-            agent = self.agent_token[:, :, task_id].expand(B, T, 1, self.d_model)
+            h_tok = self.agent_token[:, :, task_id].expand(B, T, 1, self.d_model)
+            # same token, plus the current action: this is the only difference between
+            # the two channels, and both then attend over the same keys
+            ha = self.agent_token_a[:, :, task_id].expand(B, T, 1, self.d_model) + a_cur
+            agent = torch.cat([h_tok, ha], dim=2)                       # [B,T,2,D]
             agent_in = agent.detach() if detach_agent else agent
 
         for blk in self.blocks:
@@ -1190,15 +1209,17 @@ class Dynamics(nn.Module):
                 a_pad=None,          # the t=0 action pad is a readable, learned embedding
             )
 
-        agent_out_bt = agent_in[:, :, 0, :] if agent_in is not None else None
-
         hist = z_stream[:, :, :self.Nz]                     # drop signal + reserved
         hist = hist.reshape(B, T*self.Nz, self.d_model)     # [B,T*Nz,D]
         z = self.out(hist)                              # [B,T*Nz,Dz]
         z_pred = z.view(B, T, Nz_in, Dz)            # [B,T,Nz,Dz]                        # [B,T,Nz,D]
 
-        policy_feat = agent_out_bt if agent_out_bt is not None else None
-        return z_pred, policy_feat
+        policy_feat = action_feat = None
+        if agent_in is not None:
+            policy_feat = agent_in[:, :, 0, :]                          # h_t,   no a_t
+            if agent_in.size(2) > 1:
+                action_feat = agent_in[:, :, 1, :]                      # h_t_a, with a_t
+        return z_pred, policy_feat, action_feat
 
 
 
@@ -1388,7 +1409,7 @@ class Dreamer4(nn.Module):
  
             actions_ctx = self.action_buffer
             assert actions_ctx.size(1)  == z_in.size(1) -1 
-            z_pred, h = self.transformer(z_in, actions_ctx[:,:], signals=sigs, task_id=self.task_id)
+            z_pred, h, _ = self.transformer(z_in, actions_ctx[:,:], signals=sigs, task_id=self.task_id)
 
             a, *_ = self.policy(h[:, -1:])
 
@@ -1691,7 +1712,7 @@ class Dreamer4(nn.Module):
                     z_act = z_all[:,:i+1]
                     z_act = self.mix_tau_ctx(z_act)
                     # Policy Mode: Run transformer on accumulated history
-                    z_last, policy_feat = self.transformer(
+                    z_last, policy_feat, _ = self.transformer(
                             z_act, 
                             actions[:,:i], 
                             signals=self.make_signals_indices(B,z_act.size(1), 1, N, N-1), 
@@ -1710,7 +1731,7 @@ class Dreamer4(nn.Module):
                     # Policy Mode: Run transformer on accumulated history
                     assert z_act.size(1) == a_exec.size(1) + 1
                     with torch.no_grad():
-                        _, policy_feat = self.transformer(
+                        _, policy_feat, _ = self.transformer(
                             z_act, 
                             a_exec[:,:], 
                             signals=self.make_signals_indices(B,z_act.size(1), 1, N, N-1), 
@@ -1731,7 +1752,7 @@ class Dreamer4(nn.Module):
                     # Slice actions to match the current timestep
                     curr_actions = actions[:, :i] if actions is not None else a_exec
                     
-                    _, policy_feat = self.transformer(
+                    _, policy_feat, _ = self.transformer(
                         z_inp, 
                         curr_actions, 
                         signals=self.make_signals_indices(B, T_curr, 1, N, N-1), 
@@ -1801,14 +1822,21 @@ class Dreamer4(nn.Module):
                 target_param.data.lerp_(online_param.data, tau)
     def decode(self, latents):
         return self.decoder(latents)
-    def multistep_aux_losses(self, feat, actions, rewards, termination, t_policy=False):
+    def multistep_aux_losses(self, feat, feat_a, actions, rewards, termination, t_policy=False):
         """
         Auxiliary Loss:
         Predict NEXT K steps for both Action and Reward.
         Target at step t:
         - Actions: a_t, ..., a_{t+K-1}
         - Rewards: r_t, ..., r_{t+K-1}
+
+        feat is h_t, which does not carry a_t, so the action head cannot copy its own
+        target. feat_a is h_t_a, which does, so the reward and termination heads predict
+        r_t and the done flag knowing the action that was taken. Pass feat for both to
+        keep the old behaviour.
         """
+        if feat_a is None:
+            feat_a = feat
 
         B, T_feat, D = feat.shape
         K = int(self.aux_horizon)
@@ -1849,6 +1877,7 @@ class Dreamer4(nn.Module):
         L_use = max(0, L_use)
 
         feat = feat[:, :L_use]
+        feat_a = feat_a[:, :L_use]
 
         # ======================================================================
         # ACTION HEAD
@@ -1938,7 +1967,7 @@ class Dreamer4(nn.Module):
         r_mask = (t_idx + k_idx) < T_r                               # [1, L, K_use]
         r_mask = r_mask & done_mask                                  
 
-        rew_pred, _, rew_logits, term_dist = self.reward(feat)
+        rew_pred, _, rew_logits, term_dist = self.reward(feat_a)
         rew_logits = rew_logits[:, :L_use, :K_use]                
         
         raw_rew_loss = soft_ce(
@@ -2072,10 +2101,12 @@ class Dreamer4(nn.Module):
                 
                 self.unfreeze_agent_token()
                 N = self.shortcut_kmax
-                h_with_grad = self.transformer(noised, actions[:,:-1], signals=self.make_signals_indices(B, noised.size(1), 1, N, N-1),
-                                               task_id=self.task_id)[1]
+                _, h_with_grad, ha_with_grad = self.transformer(
+                    noised, actions[:,:-1],
+                    signals=self.make_signals_indices(B, noised.size(1), 1, N, N-1),
+                    task_id=self.task_id)
             
-                action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_with_grad[:,:], actions[:,:], reward[:,:], termination.float(), policy)
+                action_loss, reward_loss, term_loss = self.multistep_aux_losses(h_with_grad[:,:], ha_with_grad[:,:], actions[:,:], reward[:,:], termination.float(), policy)
                                                 
              
                 ac_loss =  0.1*(action_loss+reward_loss+term_loss) + 2 *  dyn_loss
