@@ -1161,10 +1161,11 @@ class Dynamics(nn.Module):
                                                     # [B, T-1, D]
         a_emb = self.action_embs(act_two_hot[:, :, :])                                                     # [B, T-1, 1, D]
         if a_emb.size(1) == z_tokens.size(1)-1:
-            # no action led into the first frame: a learned embedding pads t=0 and
-            # the actions shift right, so position t carries a_{t-1}
-            pad = self.action_pad.expand(B, 1, 1, -1)                                      # [B, 1, 1, D]
-            a_emb = torch.cat([pad, a_emb], dim=1)                                         # [B, T, 1, D]
+            # actions stay at their own timestep: position t carries a_t, so z_t is
+            # aligned with the action taken at t. No action has been taken at the last
+            # frame yet, so a learned query fills that slot.
+            query = self.action_pad.expand(B, 1, 1, -1)                                    # [B, 1, 1, D]
+            a_emb = torch.cat([a_emb, query], dim=1)                                       # [B, T, 1, D]
         a_tokens = a_emb.expand(-1, -1, self.Sa, -1) + self.action_conditioner  # [B,T,Sa,D]
         signals = signals.long()
         if signals.dim() == 4 and signals.size(-1) == 2:
