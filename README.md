@@ -19,7 +19,7 @@ Actions are aligned with the latents they were taken at: position `t` of the act
 
 The agent token is injected once, at the first timestep, rather than restamped at every step. Later positions start empty on that channel and pick the token up through its causal temporal attention, so the readout carries it forward instead of re-reading a fresh copy each step. Note this makes the readout channel a carry within whatever window is fed: `action_step` trims its buffer to `eval_context_len`, so at inference the token is re-seeded at the start of each window.
 
-The policy readout attends to the z stream only -- latents, the signal token and the reserved registers -- and never to the action tokens. Actions still shape it, but only through what they did to the latents, which under the shifted stream means `a_1..a_{t-1}` at position `t`. In the per-channel mode this is simply the key set it is given; in the shared mode, where all routing is one additive mask, the agent rows are blocked from the action columns.
+The policy readout attends to the z stream only -- latents, the signal token and the reserved registers -- and never to the action tokens. Actions still shape it, but only through what they did to the latents -- and since the stream is aligned, `z_t` carries `a_t`, so the readout at `t` does see the current action by that route. In the per-channel mode this is simply the key set it is given; in the shared mode, where all routing is one additive mask, the agent rows are blocked from the action columns.
 
 Below are the training artifacts:
 
