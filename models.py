@@ -258,7 +258,7 @@ class ModalitySpaceBlock(nn.Module):
     Spatial attention where every modality owns its attention weights.
 
     Routing (queries <- keys):
-        z     <- [z ; actions]   (attn_z_za)
+        z     <- [z ; actions ; h_{t-1}]   (attn_z_za)
         actions <- actions       (attn_a_a)
         actions <- z             (attn_a_z)
         agent <- z               (attn_agent_z)
@@ -289,6 +289,7 @@ class ModalitySpaceBlock(nn.Module):
         self.ln_z = nn.RMSNorm(d_model)
         self.ln_a = nn.RMSNorm(d_model)
         self.ln_agent = nn.RMSNorm(d_model)
+        self.ln_hprev = nn.RMSNorm(d_model)
 
         self.attn_z_za = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
         self.attn_a_a = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
@@ -319,7 +320,15 @@ class ModalitySpaceBlock(nn.Module):
         z_kpm = z_pad.reshape(B * T, Nz) if z_pad is not None else None
         a_kpm = a_pad.reshape(B * T, Sa) if a_pad is not None else None
 
-        # ---- keys/values shared by the z and agent paths ----
+        # ---- keys for the z path: latents, actions, and last step's readout ----
+        # h_{t-1} is prepended as extra keys so the next latents are produced from the
+        # previous readout. The lag keeps it causal, and the agent's own keys stay out
+        # of its own timestep, so nothing reads h_t at t.
+        hp = None
+        if agent is not None:
+            Na_ = agent.shape[2]
+            h_prev = torch.cat([agent.new_zeros(B, 1, Na_, D), agent[:, :-1]], dim=1)
+            hp = self.ln_hprev(h_prev).reshape(B * T, Na_, D)
         za = torch.cat([zn, an], dim=1)                           # [B*T, Nz+Sa, D]
         za_kpm = None
         if z_kpm is not None or a_kpm is not None:
@@ -327,8 +336,14 @@ class ModalitySpaceBlock(nn.Module):
             ak = a_kpm if a_kpm is not None else torch.zeros(B * T, Sa, dtype=torch.bool, device=a.device)
             za_kpm = torch.cat([zk, ak], dim=1)
 
-        # ---- z: one attention over [z ; actions] (action conditioning) ----
-        z_out = self.attn_z_za(zn, x_k=za, key_padding_mask=za_kpm)
+        # ---- z: one attention over [z ; actions ; h_{t-1}] ----
+        z_keys, z_kpm_full = za, za_kpm
+        if hp is not None:
+            z_keys = torch.cat([za, hp], dim=1)
+            if za_kpm is not None:
+                z_kpm_full = torch.cat(
+                    [za_kpm, torch.zeros(B * T, hp.size(1), dtype=torch.bool, device=z.device)], dim=1)
+        z_out = self.attn_z_za(zn, x_k=z_keys, key_padding_mask=z_kpm_full)
 
         # ---- actions: self + cross(z), same shape -> summed ----
         a_out = self.attn_a_a(an, key_padding_mask=a_kpm) \
@@ -631,20 +646,26 @@ class SharedSpaceBlock(nn.Module):
 
         xn = self.ln(x).reshape(B * T, S, D)
 
-        bias = None
+        # h_{t-1} joins as key-only columns so the next latents are produced from the
+        # previous readout; the lag keeps it causal.
+        xk, Sk, bias = xn, S, None
         if Na > 0:
-            bias = torch.zeros((S, S), dtype=xn.dtype, device=x.device)
-            bias[: Nz + Sa, Nz + Sa :] = float("-inf")   # nothing attends to the agent
-            bias[Nz + Sa :, Nz : Nz + Sa] = float("-inf")  # the agent never reads actions
+            h_prev = torch.cat([agent.new_zeros(B, 1, Na, D), agent[:, :-1]], dim=1)
+            xk = torch.cat([xn, self.ln(h_prev).reshape(B * T, Na, D)], dim=1)
+            Sk = S + Na
+            bias = torch.zeros((S, Sk), dtype=xn.dtype, device=x.device)
+            bias[: Nz + Sa, Nz + Sa : S] = float("-inf")     # nothing attends to h_t
+            bias[Nz + Sa :, Nz : Nz + Sa] = float("-inf")    # the agent never reads actions
+            bias[Nz:, S:] = float("-inf")                    # only z reads h_{t-1}
 
         kpm = None
         if z_pad is not None or a_pad is not None:
             zk = z_pad if z_pad is not None else torch.zeros(B, T, Nz, dtype=torch.bool, device=x.device)
             ak = a_pad if a_pad is not None else torch.zeros(B, T, Sa, dtype=torch.bool, device=x.device)
-            gk = torch.zeros(B, T, Na, dtype=torch.bool, device=x.device)
-            kpm = torch.cat([zk, ak, gk], dim=2).reshape(B * T, S)
+            gk = torch.zeros(B, T, Sk - Nz - Sa, dtype=torch.bool, device=x.device)
+            kpm = torch.cat([zk, ak, gk], dim=2).reshape(B * T, Sk)
 
-        out = self.attn(xn, attn_mask=bias, key_padding_mask=kpm).reshape(B, T, S, D)
+        out = self.attn(xn, x_k=xk, attn_mask=bias, key_padding_mask=kpm).reshape(B, T, S, D)
         x = x + out
         x = x + self.mlp(x)
         return x[:, :, :Nz], x[:, :, Nz : Nz + Sa], (x[:, :, Nz + Sa :] if Na > 0 else None)
@@ -1031,6 +1052,7 @@ class Dynamics(nn.Module):
         attn_mode: str = "per_channel",     # "per_channel" or "shared" (paper-style masked attention)
         time_group_size: int = 4,           # channels per temporal attention weight set (per_channel mode)
         # behavior toggles
+        h_tokens: int | None = None,        # readout tokens per step; defaults to latent_tokens
         mask_last_action: bool = True,      # usually correct for "predict next"
         clamp_signal_indices: bool = False, # set True if you’d rather clamp than crash
     ):
@@ -1045,6 +1067,7 @@ class Dynamics(nn.Module):
         self.d_model = d_model
         self.Dz = Dz
         self.Nz = latent_tokens
+        self.Nh = int(h_tokens) if h_tokens else latent_tokens
         self.num_task = num_tasks
         self.mask_last_action = mask_last_action
         self.clamp_signal_indices = clamp_signal_indices
@@ -1067,7 +1090,7 @@ class Dynamics(nn.Module):
         self.action_embs = nn.Sequential(nn.RMSNorm(act_embed_dim), nn.Linear(act_embed_dim, self.d_model), nn.RMSNorm(d_model))
 
         # Agent token (learned)
-        self.agent_token = nn.Parameter(0.02 * torch.randn(1, 1, num_tasks, d_model))
+        self.agent_token = nn.Parameter(0.02 * torch.randn(1, 1, num_tasks, self.Nh, d_model))
 
         # Blocks: modality-specific attention weights.
         #   space -> z/z, z/actions, actions/actions, actions/z, agent/[z;actions]
@@ -1083,7 +1106,7 @@ class Dynamics(nn.Module):
                     n_latent=self.Nz,
                     n_reserved=self.Nr,
                     n_a_channels=self.Sa,
-                    n_agent_channels=1,
+                    n_agent_channels=self.Nh,
                     dropout=dropout, device=device, gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio,
                     time_group_size=time_group_size,
                 ) if per_channel else SharedTimeBlock(
@@ -1109,11 +1132,12 @@ class Dynamics(nn.Module):
         attention, so the readout carries the token forward instead of re-reading a
         fresh copy of it at each step.
         """
-        tok = tok.reshape(1, 1, 1, self.d_model).expand(B, 1, 1, self.d_model)
+        Nh = tok.shape[-2]
+        tok = tok.reshape(1, 1, Nh, self.d_model).expand(B, 1, Nh, self.d_model)
         if T == 1:
             return tok
-        rest = tok.new_zeros(B, T - 1, 1, self.d_model)
-        return torch.cat([tok, rest], dim=1)                    # [B,T,1,D]
+        rest = tok.new_zeros(B, T - 1, Nh, self.d_model)
+        return torch.cat([tok, rest], dim=1)                    # [B,T,Nh,D]
 
     def align_actions(self, actions, T, B):
         if actions.dim() != 3:
@@ -1200,7 +1224,7 @@ class Dynamics(nn.Module):
             agent_in = agent.detach() if detach_agent else agent
         elif self.use_agent_token:
             assert task_id < self.num_task
-            tok = self.agent_token[:, :, task_id].reshape(1, 1, 1, self.d_model)
+            tok = self.agent_token[:, :, task_id].reshape(1, 1, self.Nh, self.d_model)
             agent = self.seed_agent_channel(tok, B, T)
             agent_in = agent.detach() if detach_agent else agent
 
@@ -1211,7 +1235,8 @@ class Dynamics(nn.Module):
                 a_pad=None,          # the t=0 action pad is a readable, learned embedding
             )
 
-        agent_out_bt = agent_in[:, :, 0, :] if agent_in is not None else None
+        # the policy consumes one vector per step, so pool the Nh readout tokens
+        agent_out_bt = agent_in.mean(dim=2) if agent_in is not None else None
 
         hist = z_stream[:, :, :self.Nz]                     # drop signal + reserved
         hist = hist.reshape(B, T*self.Nz, self.d_model)     # [B,T*Nz,D]
@@ -1229,7 +1254,8 @@ class Dreamer4(nn.Module):
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=True, symlog_for_value=True,
-                kmax_prob=0.1, gqa_ratio=4, mlp_ratio=2.0, attn_mode='per_channel', time_group_size=4):
+                kmax_prob=0.1, gqa_ratio=4, mlp_ratio=2.0, attn_mode='per_channel', time_group_size=4,
+                h_tokens=None):
         super(Dreamer4, self).__init__()
         self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patch, d_model=rep_d_model,
                                 n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=2,
@@ -1308,7 +1334,8 @@ class Dreamer4(nn.Module):
             mlp_ratio=mlp_ratio,
             attn_mode=attn_mode,
             time_group_size=time_group_size,
-            latent_tokens=latent_tokens * self.expanding_ratio
+            latent_tokens=latent_tokens * self.expanding_ratio,
+            h_tokens=h_tokens,
         )
 
 
