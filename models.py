@@ -673,11 +673,11 @@ class Dynamics(nn.Module):
 
 
 class Dreamer4(nn.Module):
-    # Default sizes: ~790M tokenizer (encoder+decoder at d=1024, depth 22)
+    # Default sizes: ~570M tokenizer (encoder+decoder at d=1024, depth 16)
     # + 1.56B dynamics (d=1024, depth 16, 4-layer per-modality MLPs),
-    # ~2.35B world model total.
+    # ~2.13B world model total.
     def __init__(self,agent_id, ch=3, h=96, w=96, patch = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512,
-                 rep_depth = 22, rep_d_model=1024, dyn_d_model=1024, dyn_depth=16, num_heads=16, dropout=0.1, k_max=8, mtp=8, action_low = -1, action_high = 1,
+                 rep_depth = 16, rep_d_model=1024, dyn_d_model=1024, dyn_depth=16, num_heads=16, dropout=0.1, k_max=8, mtp=8, action_low = -1, action_high = 1,
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=True, symlog_for_value=True,
