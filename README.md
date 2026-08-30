@@ -13,7 +13,7 @@ Action inputs are expected to be normalized to [-1, 1]. Discrete action inputs h
 
 This will NOT be any more data efficient than other implementations; it just consists of fewer lines of code.
 
-Action embeddings are interleaved with the latent temporally, not added, as in previous implementations. Each timestep contributes the block `a, z, (t, d)` — action tokens, then latent tokens, then the shortcut signal token — and the dynamics model's temporal attention layers flatten these blocks into the single stream `a_1, z_1, (t,d)_1, a_2, z_2, (t,d)_2, ...`, attending block-causally over it: every token reads all tokens of its own and earlier timesteps, so actions, latents, and signals mix across time directly rather than each spatial slot only seeing its own history.
+Action embeddings are interleaved with the latent temporally, not added, as in previous implementations. Each timestep contributes the block `a, z, (t, d)` — action tokens, then latent tokens, then the shortcut signal token — and the dynamics model's temporal attention layers flatten these blocks into the single stream `a_1, z_1, (t,d)_1, a_2, z_2, (t,d)_2, ...`, attending block-causally over it: every token reads all tokens of its own and earlier timesteps, so actions, latents, and signals mix across time directly rather than each spatial slot only seeing its own history. Causality applies at block granularity only — within a timestep's `a, z, (t, d)` block, attention is fully bidirectional in both directions of the stream order.
 
 Below are the training artifacts:
 

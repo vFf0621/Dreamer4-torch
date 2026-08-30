@@ -204,7 +204,10 @@ class CausalSTBlock(nn.Module):
         interleaved token stream (N tokens per timestep block).
 
         - Block-causal: a token may attend to every token of its own timestep
-          and of all earlier timesteps, never to future timesteps.
+          and of all earlier timesteps, never to future timesteps. Causality is
+          applied at block granularity only, so attention within the a, z, (t,d)
+          block is fully bidirectional regardless of token order in the stream
+          (e.g. z reads the signal token that follows it).
         - Agent rule: only agent queries may read agent keys (current or past);
           all other tokens, reserved included, are blocked from agent columns.
         """
