@@ -177,55 +177,21 @@ class GQA(nn.Module):
 
 class CausalSTBlock(nn.Module):
     def __init__(self, d_model, n_heads, dropout=0.1, time_attn=True, cap_value=50,
-                 temporal_interleave=False, device="cuda"):
+                 device="cuda"):
         super().__init__()
         self.time_attn_enabled = time_attn
-        self.temporal_interleave = temporal_interleave
         self.d_model = d_model
         self.ln_space = nn.RMSNorm(d_model)
 
         if not self.time_attn_enabled:
             self.space_attn = GQA(d_model, n_heads,  dropout, device=device)
         else:
-            # With temporal interleaving the block-causal mask is built here,
-            # so the underlying attention must not add its own token-level tril.
-            self.time_attn = GQA(d_model, n_heads, dropout,
-                                 causal=not temporal_interleave, device=device)
+            self.time_attn = GQA(d_model, n_heads, dropout, causal=True, device=device)
 
         self.ln_time = nn.RMSNorm(d_model)
         self.mlp = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
         self.device = device
-        self._bc_cache = None
         self.to(self.device)
-
-    def _block_causal_bias(self, T, N, agent_idx, device, dtype):
-        """
-        Additive attention bias [T*N, T*N] for the flattened, temporally
-        interleaved token stream (N tokens per timestep block).
-
-        - Block-causal: a token may attend to every token of its own timestep
-          and of all earlier timesteps, never to future timesteps. Causality is
-          applied at block granularity only, so attention within the a, z, (t,d)
-          block is fully bidirectional regardless of token order in the stream
-          (e.g. z reads the signal token that follows it).
-        - Agent rule: only agent queries may read agent keys (current or past);
-          all other tokens, reserved included, are blocked from agent columns.
-        """
-        key = (T, N, agent_idx)
-        if self._bc_cache is not None and self._bc_cache[0] == key:
-            return self._bc_cache[1].to(device=device, dtype=dtype)
-
-        t_ids = torch.arange(T, device=device).repeat_interleave(N)      # [T*N]
-        allow = t_ids.unsqueeze(1) >= t_ids.unsqueeze(0)                 # [T*N,T*N]
-
-        if agent_idx is not None:
-            is_agent = (torch.arange(T * N, device=device) % N) == agent_idx
-            allow = allow & (~is_agent.unsqueeze(0) | is_agent.unsqueeze(1))
-
-        bias = torch.zeros((T * N, T * N), dtype=dtype, device=device)
-        bias.masked_fill_(~allow, float("-inf"))
-        self._bc_cache = (key, bias)
-        return bias
 
     def forward(
             self,
@@ -255,45 +221,27 @@ class CausalSTBlock(nn.Module):
             raise ValueError(f"agent_idx={agent_idx} out of range for N={N}")
 
         # =========================
-        # TIME ATTENTION
+        # TIME ATTENTION (per-channel independent)
         # =========================
+        # Each of the N channels (a, z, (t,d), reserved slots) attends causally
+        # over its own history only; cross-channel mixing happens in the space
+        # attention layers. This keeps temporal attention at O(N * T^2) instead
+        # of O((T*N)^2) for the flattened stream.
         if self.time_attn_enabled:
-            if self.temporal_interleave:
-                # Temporal interleaving: the per-timestep blocks are flattened
-                # into one stream a_1, z_1, (t,d)_1, ..., a_T, z_T, (t,d)_T and
-                # attention runs over the whole stream under a block-causal
-                # mask. Every token therefore reads the actions, latents and
-                # signal tokens of all earlier timesteps directly, instead of
-                # only its own spatial slot's history.
-                x_time = self.ln_time(x).reshape(B, T * N, D)
+            x_time = self.ln_time(x).permute(0, 2, 1, 3).reshape(B * N, T, D)
 
-                time_kpm = None
-                if token_pad_mask is not None:
-                    time_kpm = token_pad_mask.reshape(B, T * N)
+            time_kpm = None
+            if token_pad_mask is not None:
+                # token_pad_mask: [B,T,N] -> [B,N,T] -> [B*N, T]
+                time_kpm = token_pad_mask.permute(0, 2, 1).reshape(B * N, T)
 
-                bias = self._block_causal_bias(T, N, agent_idx, x.device, x.dtype)
-                xt_out = self.time_attn(
-                    x_time,
-                    attn_mask=bias,
-                    key_padding_mask=time_kpm,
-                )
-                xt_out = xt_out.reshape(B, T, N, D)
-            else:
-                x_time = self.ln_time(x).permute(0, 2, 1, 3).reshape(B * N, T, D)
+            xt_out = self.time_attn(
+                x_time,
+                attn_mask=None,
+                key_padding_mask=time_kpm,
+            )
 
-                time_kpm = None
-                if token_pad_mask is not None:
-                    # token_pad_mask: [B,T,N] -> [B,N,T] -> [B*N, T]
-                    time_kpm = token_pad_mask.permute(0, 2, 1).reshape(B * N, T)
-
-                xt_out = self.time_attn(
-                    x_time,
-                    attn_mask=None,
-                    key_padding_mask=time_kpm,
-                )
-
-                xt_out = xt_out.reshape(B, N, T, D).permute(0, 2, 1, 3)
-
+            xt_out = xt_out.reshape(B, N, T, D).permute(0, 2, 1, 3)
             x = x + xt_out
             x = x + self.mlp(x)
             return x.squeeze(2) if x.shape[2] == 1 else x
@@ -471,9 +419,10 @@ class Dynamics(nn.Module):
     Token-based dynamics with discrete signal embeddings + discrete action embeddings.
 
     Tokens are temporally interleaved: each timestep contributes the block
-    [a (Sa), z (Nz), (t,d) (1), reserved (Nr)], and the temporal attention
-    layers attend block-causally over the flattened stream
-    a_1, z_1, (t,d)_1, a_2, z_2, (t,d)_2, ...
+    [a (Sa), z (Nz), (t,d) (1), reserved (Nr)]. Temporal attention is axial and
+    per-channel independent: every slot of the block attends causally over its
+    own history only, while the space attention layers mix channels
+    bidirectionally within each timestep.
 
     The agent token is a pure readout: after the backbone, one learned query
     per timestep cross-attends block-causally over the processed stream to
@@ -566,7 +515,6 @@ class Dynamics(nn.Module):
                     d_model, n_heads,
                     dropout=dropout,
                     time_attn=use_time,
-                    temporal_interleave=True,
                     device=device,
                 )
             )
@@ -647,9 +595,9 @@ class Dynamics(nn.Module):
 
         z_inp = self.z_proj(z_tokens)
 
-        # Temporal interleaving: each timestep contributes the block [a, z, (t,d)],
-        # and the time-attention layers flatten these blocks into the single
-        # stream a_1, z_1, (t,d)_1, a_2, z_2, (t,d)_2, ...
+        # Temporal interleaving: each timestep contributes the block [a, z, (t,d)].
+        # Time layers attend per channel independently and causally; space
+        # layers mix the channels bidirectionally within each timestep.
         x = torch.cat([a_tokens, z_inp], dim=2)                  # [B,T,Sa+Nz,D]
         x = torch.cat([x, self.sig_proj(lev_feat + step_feat).unsqueeze(-2)], dim=2)
         token_pad_mask = self.make_kpm_for_actions(B, T, S=x.size(2), Nz=Nz_in, pad_action_t=0, device=device)
@@ -701,7 +649,7 @@ class Dynamics(nn.Module):
 
 
 class Dreamer4(nn.Module):
-    def __init__(self,agent_id, ch=3, h=96, w=96, patch = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512, 
+    def __init__(self,agent_id, ch=3, h=96, w=96, patch = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512,
                  rep_depth = 8, rep_d_model=256, dyn_d_model=256, num_heads=8, dropout=0.1, k_max=8, mtp=8, action_low = -1, action_high = 1,
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
@@ -773,8 +721,8 @@ class Dreamer4(nn.Module):
             n_heads=num_heads,
             action_dim =action_dim,
             d_model=dyn_d_model,
-            Sa = Sa, 
-            Nr = Nr, 
+            Sa = Sa,
+            Nr = Nr,
             max_T = max_imag_len,
             num_tasks=num_tasks,
             time_every=4,

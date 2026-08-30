@@ -2,11 +2,12 @@
 Tests for the temporally interleaved dynamics stream a_1, z_1, (t,d)_1, a_2, ...
 
 Invariants:
-  1. Within a timestep block, attention among a, z, (t,d) is fully
-     bidirectional (token order in the stream does not restrict it).
-  2. Across timesteps, attention is causal at block granularity.
-  3. Only agent queries may read agent keys; z predictions never depend on
-     the agent token.
+  1. Time layers are axial: per-channel independent and causal; space layers
+     mix a, z, (t,d) bidirectionally within each timestep, so information
+     still flows both ways inside a block and causally across blocks.
+  2. The agent token is a pure readout: block-causal over the processed
+     stream, never written back into it, with gradient reaching the entire
+     transformer.
 
 Run with `pytest tests/` or `python tests/test_temporal_interleaving.py`.
 """
@@ -28,34 +29,21 @@ def make_dynamics():
     ).eval()
 
 
-def test_block_causal_mask_bidirectional_within_block():
-    blk = CausalSTBlock(32, 4, time_attn=True, temporal_interleave=True, device="cpu")
-    T, N, agent_idx = 3, 7, 5  # per block: a(2) z(2) sig(1) agent(1) reserved(1)
-    bias = blk._block_causal_bias(T, N, agent_idx, "cpu", torch.float32)
-    allow = torch.isfinite(bias)
+def test_time_attention_is_per_channel_independent():
+    """A time layer must attend causally within each channel and never mix
+    channels; cross-channel mixing belongs to the space layers."""
+    torch.manual_seed(0)
+    blk = CausalSTBlock(32, 4, dropout=0.0, time_attn=True, device="cpu").eval()
+    B, T, N = 1, 4, 5
+    x = torch.randn(B, T, N, 32, requires_grad=True)
+    out = blk(x)
 
-    non_agent = [i for i in range(N) if i != agent_idx]
-    for t in range(T):
-        base = t * N
-        # bidirectional among a, z, (t,d), reserved within the block
-        for i in non_agent:
-            for j in non_agent:
-                assert allow[base + i, base + j], (t, i, j)
-        # agent reads everyone; nobody else reads agent
-        for i in range(N):
-            assert allow[base + agent_idx, base + i]
-            if i != agent_idx:
-                assert not allow[base + i, base + agent_idx]
-
-    # causal at block granularity: past fully visible (minus agent), future blocked
-    for tq in range(T):
-        for tk in range(T):
-            sub = allow[tq * N:(tq + 1) * N, tk * N:(tk + 1) * N]
-            if tk > tq:
-                assert not sub.any(), (tq, tk)
-            else:
-                assert sub[non_agent][:, non_agent].all(), (tq, tk)
-                assert not sub[non_agent][:, agent_idx].any(), (tq, tk)
+    g = torch.autograd.grad(out[:, 2, 3].sum(), x)[0]
+    per_channel = g.abs().sum(-1)[0]  # [T, N]
+    assert per_channel[:3, 3].sum() > 0, "channel cannot see its own history"
+    assert per_channel[3:, :].sum() == 0, "time layer leaks the future"
+    other = [n for n in range(N) if n != 3]
+    assert per_channel[:, other].sum() == 0, "time layer mixes channels"
 
 
 def test_z_reads_signal_token_both_ways_in_block():
