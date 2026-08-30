@@ -1,7 +1,7 @@
 # Unofficial Dreamer4
 Compact implementation of Dreamer 4.
 
-Please note that Attention Soft Capping is not implemented as no training instability is found. Instead, Scaled Dot-Product Attention is used
+Attention logit soft capping is implemented as in the paper: attention is computed manually (no SDPA) and the pre-softmax logits are squashed with `cap * tanh(logits / cap)` (cap = 50) before masking, in every attention layer including the agent readout.
 
 This default implementation uses RoPE1D(as stated in the paper), as well as the one directional masking for latent tokens in the encoder and decoder. Also, 
 embedding lookup is implemented for continuous action inputs.

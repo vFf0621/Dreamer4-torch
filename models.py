@@ -72,7 +72,7 @@ class Policy(nn.Module):
         action = action.squeeze(-1)
         return action, logp, dist, dist_act, idx
 class GQA(nn.Module):
-    def __init__(self, embed_dim=16, num_heads=8, dropout=0.1, causal=False,device="cuda"):
+    def __init__(self, embed_dim=16, num_heads=8, dropout=0.1, causal=False, softcap=50.0, device="cuda"):
         super().__init__()
         assert embed_dim % num_heads == 0
 
@@ -81,6 +81,7 @@ class GQA(nn.Module):
         self.num_kv_heads = num_heads//2
         self.head_dim = embed_dim // num_heads
         self.causal = causal
+        self.softcap = float(softcap)
 
         self.q_proj = nn.Linear(embed_dim, num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, self.num_kv_heads * self.head_dim, bias=False)
@@ -161,15 +162,26 @@ class GQA(nn.Module):
             final_bias = causal_bias if final_bias is None else (final_bias + causal_bias)
 
         # =====================================================
-        # SDPA
+        # MANUAL ATTENTION WITH LOGIT SOFT CAPPING
         # =====================================================
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=final_bias,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,   # IMPORTANT: we already applied causal bias
-            enable_gqa=True,
-        )
+        # grow kv heads to match query heads (GQA)
+        if self.num_kv_heads != self.num_heads:
+            rep = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # soft cap the raw logits BEFORE masking so -inf mask entries stay -inf
+        scores = self.softcap * torch.tanh(scores / self.softcap)
+        if final_bias is not None:
+            scores = scores + final_bias
+
+        attn = F.softmax(scores, dim=-1)
+        # a fully masked query row (e.g. the padded action at t=0 in causal
+        # time attention) softmaxes to NaN; zero it like SDPA does
+        attn = torch.nan_to_num(attn, nan=0.0)
+        attn = F.dropout(attn, p=self.dropout, training=self.training)
+        out = torch.matmul(attn, v)
 
         out = out.transpose(1, 2).contiguous().view(B, Tq, D)
         return self.out_proj(out)
@@ -184,9 +196,9 @@ class CausalSTBlock(nn.Module):
         self.ln_space = nn.RMSNorm(d_model)
 
         if not self.time_attn_enabled:
-            self.space_attn = GQA(d_model, n_heads,  dropout, device=device)
+            self.space_attn = GQA(d_model, n_heads,  dropout, softcap=cap_value, device=device)
         else:
-            self.time_attn = GQA(d_model, n_heads, dropout, causal=True, device=device)
+            self.time_attn = GQA(d_model, n_heads, dropout, causal=True, softcap=cap_value, device=device)
 
         self.ln_time = nn.RMSNorm(d_model)
         # modality_sizes splits the token dim into groups (e.g. [Sa, Nz, 1, Nr])
@@ -394,11 +406,12 @@ class ReadoutAttention(nn.Module):
     unaffected by the agent while gradients from the readout heads flow back
     through the entire transformer.
     """
-    def __init__(self, d_model, n_heads, dropout=0.0):
+    def __init__(self, d_model, n_heads, dropout=0.0, softcap=50.0):
         super().__init__()
         assert d_model % n_heads == 0
         self.num_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.softcap = float(softcap)
         self.norm_q = nn.RMSNorm(d_model)
         self.norm_k = nn.RMSNorm(d_model)
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
@@ -424,11 +437,16 @@ class ReadoutAttention(nn.Module):
             kpm.masked_fill_(key_padding_mask[:, None, None, :], float("-inf"))
             bias = kpm if bias is None else bias + kpm
 
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=bias,
-            dropout_p=self.dropout if self.training else 0.0,
-        )
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # soft cap the raw logits BEFORE masking so -inf mask entries stay -inf
+        scores = self.softcap * torch.tanh(scores / self.softcap)
+        if bias is not None:
+            scores = scores + bias
+        attn = F.softmax(scores, dim=-1)
+        attn = torch.nan_to_num(attn, nan=0.0)  # fully masked rows -> 0, as SDPA
+        attn = F.dropout(attn, p=self.dropout, training=self.training)
+        out = torch.matmul(attn, v)
+
         out = out.transpose(1, 2).contiguous().view(B, Tq, D)
         out = q_tok + self.out_proj(out)
         return out + self.mlp(out)

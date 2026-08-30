@@ -18,7 +18,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import CausalSTBlock, Dynamics
+from models import GQA, CausalSTBlock, Dynamics
 
 
 def make_dynamics():
@@ -142,6 +142,29 @@ def test_readout_is_block_causal():
     g = torch.autograd.grad(feat[:, 1].sum(), z)[0]
     assert g[:, :2].abs().sum() > 0
     assert g[:, 2:].abs().sum() == 0, "readout sees future timesteps"
+
+
+def test_attention_soft_capping():
+    """As softcap -> 0, capped logits -> 0, so attention becomes uniform over
+    the allowed keys and the output no longer depends on the query content."""
+    torch.manual_seed(0)
+    g = GQA(32, 4, dropout=0.0, causal=False, device="cpu").eval()
+    kv = torch.randn(2, 6, 32)
+    q1, q2 = torch.randn(2, 3, 32), torch.randn(2, 3, 32)
+
+    g.softcap = 1e-6
+    out_uniform_1 = g(q1, x_k=kv)
+    out_uniform_2 = g(q2, x_k=kv)
+    assert torch.allclose(out_uniform_1, out_uniform_2, atol=1e-4), \
+        "tiny cap should erase query dependence"
+
+    g.softcap = 50.0
+    assert not torch.allclose(g(q1, x_k=kv), g(q2, x_k=kv), atol=1e-4), \
+        "normal cap should keep content-dependent attention"
+
+    # capping must not corrupt masking: fully valid rows stay finite
+    out = g(q1, x_k=kv, key_padding_mask=torch.tensor([[False]*5 + [True]] * 2))
+    assert torch.isfinite(out).all()
 
 
 if __name__ == "__main__":
