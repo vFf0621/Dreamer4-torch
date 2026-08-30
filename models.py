@@ -72,13 +72,16 @@ class Policy(nn.Module):
         action = action.squeeze(-1)
         return action, logp, dist, dist_act, idx
 class GQA(nn.Module):
-    def __init__(self, embed_dim=16, num_heads=8, dropout=0.1, causal=False, softcap=50.0, device="cuda"):
+    def __init__(self, embed_dim=16, num_heads=8, dropout=0.1, causal=False, softcap=50.0,
+                 gqa_ratio=2, device="cuda"):
         super().__init__()
         assert embed_dim % num_heads == 0
+        # gqa_ratio = query heads per kv head: 1 -> MHA, num_heads -> MQA
+        assert num_heads % gqa_ratio == 0, f"num_heads={num_heads} not divisible by gqa_ratio={gqa_ratio}"
 
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.num_kv_heads = num_heads//2
+        self.num_kv_heads = num_heads // gqa_ratio
         self.head_dim = embed_dim // num_heads
         self.causal = causal
         self.softcap = float(softcap)
@@ -192,16 +195,18 @@ class GQA(nn.Module):
 
 class CausalSTBlock(nn.Module):
     def __init__(self, d_model, n_heads, dropout=0.1, time_attn=True, cap_value=50,
-                 mlp_layers=3, modality_sizes=None, device="cuda"):
+                 mlp_layers=3, modality_sizes=None, gqa_ratio=2, device="cuda"):
         super().__init__()
         self.time_attn_enabled = time_attn
         self.d_model = d_model
         self.ln_space = nn.RMSNorm(d_model)
 
         if not self.time_attn_enabled:
-            self.space_attn = GQA(d_model, n_heads,  dropout, softcap=cap_value, device=device)
+            self.space_attn = GQA(d_model, n_heads,  dropout, softcap=cap_value,
+                                  gqa_ratio=gqa_ratio, device=device)
         else:
-            self.time_attn = GQA(d_model, n_heads, dropout, causal=True, softcap=cap_value, device=device)
+            self.time_attn = GQA(d_model, n_heads, dropout, causal=True, softcap=cap_value,
+                                 gqa_ratio=gqa_ratio, device=device)
 
         self.ln_time = nn.RMSNorm(d_model)
         # modality_sizes splits the token dim into groups (e.g. [Sa, Nz, 1, Nr])
@@ -343,6 +348,7 @@ class Encoder(nn.Module):
         out_dim: int = 16,     # Dz
         max_T: int = 256,
         num_reserved = 4,
+        gqa_ratio: int = 2,
         pool: str = "first",      # "mean" or "first"
     ):
         super().__init__()
@@ -365,7 +371,7 @@ class Encoder(nn.Module):
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == 0)
-            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time))
+            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time, gqa_ratio=gqa_ratio))
         self.blocks = nn.ModuleList(blocks)
 
         self.ln_out = nn.RMSNorm(d_model)
@@ -502,6 +508,7 @@ class Dynamics(nn.Module):
         time_every: int = 4,
         dropout: float = 0.1,
         mlp_layers: int = 4,
+        gqa_ratio: int = 2,
         Sa: int = 64,
         max_T: int = 255,
         use_agent_token: bool = True,
@@ -563,6 +570,7 @@ class Dynamics(nn.Module):
                     time_attn=use_time,
                     mlp_layers=mlp_layers,
                     modality_sizes=[self.Sa, self.Nz, 1, self.Nr],
+                    gqa_ratio=gqa_ratio,
                     device=device,
                 )
             )
@@ -701,7 +709,7 @@ class Dreamer4(nn.Module):
     # + 1.56B dynamics (d=1024, depth 16, 4-layer per-modality MLPs),
     # ~2.13B world model total.
     def __init__(self,agent_id, ch=3, h=96, w=96, patch = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512,
-                 rep_depth = 16, rep_d_model=1024, dyn_d_model=1024, dyn_depth=16, num_heads=16, dropout=0.1, k_max=8, mtp=8, action_low = -1, action_high = 1,
+                 rep_depth = 16, rep_d_model=1024, dyn_d_model=1024, dyn_depth=16, num_heads=16, gqa_ratio=2, dropout=0.1, k_max=8, mtp=8, action_low = -1, action_high = 1,
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=True, symlog_for_value=True,
@@ -709,7 +717,8 @@ class Dreamer4(nn.Module):
         super(Dreamer4, self).__init__()
         self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patch, d_model=rep_d_model,
                                 n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=2,
-                                out_dim=z_dim, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
+                                out_dim=z_dim, dropout=dropout, max_T=max_imag_len, num_reserved=Nr,
+                                gqa_ratio=gqa_ratio)
         self.ema = 0.98
         self.device="cuda" if torch.cuda.is_available() else "cpu"
         self.pretrain = False
@@ -721,7 +730,8 @@ class Dreamer4(nn.Module):
 
         self.lambda_=lambda_
         self.decoder = Decoder(img_channels=ch, w = w, h=h, patch=patch, z_dim=z_dim, d_model=rep_d_model, n_heads=num_heads,
-                               depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len, num_reserved=Nr)
+                               depth=rep_depth, latent_tokens=latent_tokens, time_every=2, dropout=dropout, max_T=max_imag_len, num_reserved=Nr,
+                               gqa_ratio=gqa_ratio)
         self.imagination_steps = max_imag_len - 1
         self.rminv = -reward_clamp
         self.rmaxv = reward_clamp
@@ -773,6 +783,7 @@ class Dreamer4(nn.Module):
             action_dim =action_dim,
             d_model=dyn_d_model,
             depth=dyn_depth,
+            gqa_ratio=gqa_ratio,
             Sa = Sa,
             Nr = Nr,
             max_T = max_imag_len,
@@ -1728,6 +1739,7 @@ class Decoder(nn.Module):
         max_T: int = 256,
         output_range: str = "0_1",
         num_reserved = 4,
+        gqa_ratio: int = 2,
     ):
         super().__init__()
         assert (h % patch == 0) and (w % patch == 0)
@@ -1755,7 +1767,7 @@ class Decoder(nn.Module):
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == 0)
-            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time))
+            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time, gqa_ratio=gqa_ratio))
         self.blocks = nn.ModuleList(blocks)
         self.ln_out = nn.RMSNorm(d_model)
         self.to_patch = nn.Linear(d_model, img_channels * patch * patch)
