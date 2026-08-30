@@ -177,7 +177,7 @@ class GQA(nn.Module):
 
 class CausalSTBlock(nn.Module):
     def __init__(self, d_model, n_heads, dropout=0.1, time_attn=True, cap_value=50,
-                 device="cuda"):
+                 mlp_layers=3, modality_sizes=None, device="cuda"):
         super().__init__()
         self.time_attn_enabled = time_attn
         self.d_model = d_model
@@ -189,9 +189,29 @@ class CausalSTBlock(nn.Module):
             self.time_attn = GQA(d_model, n_heads, dropout, causal=True, device=device)
 
         self.ln_time = nn.RMSNorm(d_model)
-        self.mlp = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
+        # modality_sizes splits the token dim into groups (e.g. [Sa, Nz, 1, Nr])
+        # that each get their own independent feed-forward; None shares one MLP.
+        self.modality_sizes = list(modality_sizes) if modality_sizes is not None else None
+        if self.modality_sizes is None:
+            self.mlp = build_network(d_model, d_model * 2, mlp_layers, "SwiGLU", d_model, True)
+        else:
+            self.mlps = nn.ModuleList([
+                build_network(d_model, d_model * 2, mlp_layers, "SwiGLU", d_model, True)
+                for _ in self.modality_sizes
+            ])
         self.device = device
         self.to(self.device)
+
+    def _ff(self, x):
+        # x: [B,T,N,D]; token-wise, so modality splitting never mixes tokens
+        if self.modality_sizes is None:
+            return self.mlp(x)
+        assert x.size(2) == sum(self.modality_sizes), (x.size(2), self.modality_sizes)
+        outs, i = [], 0
+        for size, mlp in zip(self.modality_sizes, self.mlps):
+            outs.append(mlp(x[:, :, i:i + size]))
+            i += size
+        return torch.cat(outs, dim=2)
 
     def forward(
             self,
@@ -243,7 +263,7 @@ class CausalSTBlock(nn.Module):
 
             xt_out = xt_out.reshape(B, N, T, D).permute(0, 2, 1, 3)
             x = x + xt_out
-            x = x + self.mlp(x)
+            x = x + self._ff(x)
             return x.squeeze(2) if x.shape[2] == 1 else x
 
         # =========================
@@ -290,7 +310,7 @@ class CausalSTBlock(nn.Module):
         )[:, :N]  # drop reserved outputs
 
         x = x + xs.reshape(B, T, N, D)
-        x = x + self.mlp(x)
+        x = x + self._ff(x)
         return x.squeeze(2) if x.shape[2] == 1 else x
 class Encoder(nn.Module):
     def __init__(
@@ -457,6 +477,7 @@ class Dynamics(nn.Module):
         depth: int = 16,
         time_every: int = 4,
         dropout: float = 0.1,
+        mlp_layers: int = 4,
         Sa: int = 64,
         max_T: int = 255,
         use_agent_token: bool = True,
@@ -506,7 +527,8 @@ class Dynamics(nn.Module):
         self.agent_token = nn.Parameter(0.02 * torch.randn(1, 1, num_tasks, d_model))
         self.readout_attn = ReadoutAttention(d_model, n_heads, dropout)
 
-        # Blocks
+        # Blocks: deeper feed-forward than the tokenizer, and one independent
+        # MLP per modality (a, z, (t,d), reserved).
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == (0))
@@ -515,6 +537,8 @@ class Dynamics(nn.Module):
                     d_model, n_heads,
                     dropout=dropout,
                     time_attn=use_time,
+                    mlp_layers=mlp_layers,
+                    modality_sizes=[self.Sa, self.Nz, 1, self.Nr],
                     device=device,
                 )
             )
@@ -650,9 +674,10 @@ class Dynamics(nn.Module):
 
 class Dreamer4(nn.Module):
     # Default sizes: ~790M tokenizer (encoder+decoder at d=1024, depth 22)
-    # + 1.27B dynamics (d=2048, depth 16), ~2.06B world model total.
+    # + 1.56B dynamics (d=1024, depth 16, 4-layer per-modality MLPs),
+    # ~2.35B world model total.
     def __init__(self,agent_id, ch=3, h=96, w=96, patch = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512,
-                 rep_depth = 22, rep_d_model=1024, dyn_d_model=2048, dyn_depth=16, num_heads=16, dropout=0.1, k_max=8, mtp=8, action_low = -1, action_high = 1,
+                 rep_depth = 22, rep_d_model=1024, dyn_d_model=1024, dyn_depth=16, num_heads=16, dropout=0.1, k_max=8, mtp=8, action_low = -1, action_high = 1,
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=True, symlog_for_value=True,
