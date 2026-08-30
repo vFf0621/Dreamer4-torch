@@ -463,42 +463,28 @@ class Dynamics(nn.Module):
 
     def recover_z(self, out: torch.Tensor):
         """
-        out: [B,T,Nz+Sa,D] created by interleave_gb_1a
+        out: [B,T,Sa+Nz,D] laid out as [a (Sa tokens), z (Nz tokens)] per timestep
         returns:
-        a_rec: [B,T,Sa,D]
-        b_rec: [B,T,Nz,D]
+        z_rec: [B,T,Nz,D]
         """
         Sa = self.Sa
         B, T, L, D = out.shape
-        assert L % Sa == 0, "Token length must be divisible by Sa"
-        block = L // Sa                 # block = g+1
-        g = block - 1
-        assert g >= 1
+        assert L > Sa, f"Token length {L} must exceed Sa={Sa}"
+        return out[:, :, Sa:, :]
 
-        blocks = out.reshape(B, T, Sa, g+1, D)   # [B,T,Sa,g+1,D]
-        z_rec = blocks[:, :, :, :g, :].reshape(B, T, Sa*g, D)  # [B,T,Nz,D]
-       # a_rec = blocks[:, :, :,  g, :]                          # [B,T,Sa,D]
-        return z_rec
-    
-    def interleave_z_a(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    def interleave_a_z(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         """
-        1 action token per (Nz/Sa) latent tokens
+        Temporal interleaving: each timestep's tokens are ordered [a, z], so with
+        the signal token appended afterwards the stream reads
+        a_1, z_1, (t,d)_1, a_2, z_2, (t,d)_2, ...
         z: [B,T,Nz,D]
         a: [B,T,Sa,D]
-        returns: [B,T,Nz+Sa,D]
+        returns: [B,T,Sa+Nz,D]
         """
         B, T, Nz, D = z.shape
         assert a.shape[0] == B and a.shape[1] == T and a.shape[3] == D
 
-        Sa = a.shape[2]
-        assert Nz % Sa == 0, f"Nz={Nz} must be divisible by Sa={Sa}"
-        g = Nz // Sa
-
-        z_grp = z.reshape(B, T, Sa, g, D)     # [B,T,Sa,g,D]
-        a_grp = a.unsqueeze(3)               # [B,T,Sa,1,D]
-
-        out = torch.cat([z_grp, a_grp], dim=3)  # [B,T,Sa,g+1,D]
-        return out.reshape(B, T, Nz + Sa, D)
+        return torch.cat([a, z], dim=2)
 
 
 
@@ -521,13 +507,9 @@ class Dynamics(nn.Module):
         if pad_action_t is None:
             return kpm
         Sa = self.Sa
-        assert Nz % Sa == 0
-        
-        
-        g = Nz // Sa
-        action_pos = torch.arange(Sa, device=device) * (g + 1) + g  # [Sa]
-        #action_pos lives in the first (Nz+Sa) tokens; do NOT include the signal/agent/reserved tail
-        kpm[:, pad_action_t, action_pos] = True
+        # actions occupy the first Sa positions of each timestep's [a, z, (t,d)] block;
+        # do NOT include the signal/agent/reserved tail
+        kpm[:, pad_action_t, :Sa] = True
         return kpm
 
     def agent_mask(self, S: int, agent_idx: int, device=None, Nr: int = 0, *, dtype=torch.float32):
@@ -608,8 +590,8 @@ class Dynamics(nn.Module):
 
         z_inp = self.z_proj(z_tokens)
 
-        # Interleave z + a, then append signal token
-        x = self.interleave_z_a(z_inp, a_tokens )                 # x: [B,T,?,D]
+        # Temporal interleaving: [a, z] per timestep, then append signal token -> a, z, (t,d)
+        x = self.interleave_a_z(z_inp, a_tokens)                 # x: [B,T,Sa+Nz,D]
         Nmain = x.size(2)
         x = torch.cat([x, self.sig_proj(lev_feat + step_feat).unsqueeze(-2)], dim=2)
         token_pad_mask = self.make_kpm_for_actions(B, T, S=x.size(2), Nz=Nz_in, pad_action_t=0, device=device)

@@ -13,7 +13,7 @@ Action inputs are expected to be normalized to [-1, 1]. Discrete action inputs h
 
 This will NOT be any more data efficient than other implementations; it just consists of fewer lines of code.
 
-Action embeddings are interleaved with the latent, not added, as in previous implementations.
+Action embeddings are interleaved with the latent temporally, not added, as in previous implementations. Each timestep's tokens are ordered `a, z, (t, d)`: the action tokens first, then the latent tokens, then the shortcut signal token, so the sequence reads `a_1, z_1, (t,d)_1, a_2, z_2, (t,d)_2, ...`.
 
 Below are the training artifacts:
 
