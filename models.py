@@ -649,8 +649,10 @@ class Dynamics(nn.Module):
 
 
 class Dreamer4(nn.Module):
+    # Default sizes follow the paper's 2B split: ~400M tokenizer
+    # (encoder+decoder at d=1024, depth 11) + ~1.6B dynamics (d=2048, depth 21).
     def __init__(self,agent_id, ch=3, h=96, w=96, patch = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512,
-                 rep_depth = 8, rep_d_model=256, dyn_d_model=256, num_heads=8, dropout=0.1, k_max=8, mtp=8, action_low = -1, action_high = 1,
+                 rep_depth = 11, rep_d_model=1024, dyn_d_model=2048, dyn_depth=21, num_heads=16, dropout=0.1, k_max=8, mtp=8, action_low = -1, action_high = 1,
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=True, symlog_for_value=True,
@@ -721,6 +723,7 @@ class Dreamer4(nn.Module):
             n_heads=num_heads,
             action_dim =action_dim,
             d_model=dyn_d_model,
+            depth=dyn_depth,
             Sa = Sa,
             Nr = Nr,
             max_T = max_imag_len,
