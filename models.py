@@ -176,21 +176,53 @@ class GQA(nn.Module):
 
 
 class CausalSTBlock(nn.Module):
-    def __init__(self, d_model, n_heads, dropout=0.1, time_attn=True, cap_value=50,  device="cuda"):
+    def __init__(self, d_model, n_heads, dropout=0.1, time_attn=True, cap_value=50,
+                 temporal_interleave=False, device="cuda"):
         super().__init__()
         self.time_attn_enabled = time_attn
+        self.temporal_interleave = temporal_interleave
         self.d_model = d_model
         self.ln_space = nn.RMSNorm(d_model)
 
         if not self.time_attn_enabled:
             self.space_attn = GQA(d_model, n_heads,  dropout, device=device)
         else:
-            self.time_attn = GQA(d_model, n_heads,  dropout, causal=True, device=device)
+            # With temporal interleaving the block-causal mask is built here,
+            # so the underlying attention must not add its own token-level tril.
+            self.time_attn = GQA(d_model, n_heads, dropout,
+                                 causal=not temporal_interleave, device=device)
 
         self.ln_time = nn.RMSNorm(d_model)
         self.mlp = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
         self.device = device
+        self._bc_cache = None
         self.to(self.device)
+
+    def _block_causal_bias(self, T, N, agent_idx, device, dtype):
+        """
+        Additive attention bias [T*N, T*N] for the flattened, temporally
+        interleaved token stream (N tokens per timestep block).
+
+        - Block-causal: a token may attend to every token of its own timestep
+          and of all earlier timesteps, never to future timesteps.
+        - Agent rule: only agent queries may read agent keys (current or past);
+          all other tokens, reserved included, are blocked from agent columns.
+        """
+        key = (T, N, agent_idx)
+        if self._bc_cache is not None and self._bc_cache[0] == key:
+            return self._bc_cache[1].to(device=device, dtype=dtype)
+
+        t_ids = torch.arange(T, device=device).repeat_interleave(N)      # [T*N]
+        allow = t_ids.unsqueeze(1) >= t_ids.unsqueeze(0)                 # [T*N,T*N]
+
+        if agent_idx is not None:
+            is_agent = (torch.arange(T * N, device=device) % N) == agent_idx
+            allow = allow & (~is_agent.unsqueeze(0) | is_agent.unsqueeze(1))
+
+        bias = torch.zeros((T * N, T * N), dtype=dtype, device=device)
+        bias.masked_fill_(~allow, float("-inf"))
+        self._bc_cache = (key, bias)
+        return bias
 
     def forward(
             self,
@@ -223,21 +255,42 @@ class CausalSTBlock(nn.Module):
         # TIME ATTENTION
         # =========================
         if self.time_attn_enabled:
-            x_time = self.ln_time(x).permute(0, 2, 1, 3).reshape(B * N, T, D)
+            if self.temporal_interleave:
+                # Temporal interleaving: the per-timestep blocks are flattened
+                # into one stream a_1, z_1, (t,d)_1, ..., a_T, z_T, (t,d)_T and
+                # attention runs over the whole stream under a block-causal
+                # mask. Every token therefore reads the actions, latents and
+                # signal tokens of all earlier timesteps directly, instead of
+                # only its own spatial slot's history.
+                x_time = self.ln_time(x).reshape(B, T * N, D)
 
-            time_kpm = None
-            if token_pad_mask is not None:
-                # token_pad_mask: [B,T,N] -> [B,N,T] -> [B*N, T]
-                time_kpm = token_pad_mask.permute(0, 2, 1).reshape(B * N, T)
+                time_kpm = None
+                if token_pad_mask is not None:
+                    time_kpm = token_pad_mask.reshape(B, T * N)
 
-            # Prefer is_causal=True inside your GQA/attn module if possible; otherwise pass a causal float mask.
-            xt_out = self.time_attn(
-                x_time,
-                attn_mask=None,              # or causal_mask(T) if your impl needs it
-                key_padding_mask=time_kpm,
-            )
+                bias = self._block_causal_bias(T, N, agent_idx, x.device, x.dtype)
+                xt_out = self.time_attn(
+                    x_time,
+                    attn_mask=bias,
+                    key_padding_mask=time_kpm,
+                )
+                xt_out = xt_out.reshape(B, T, N, D)
+            else:
+                x_time = self.ln_time(x).permute(0, 2, 1, 3).reshape(B * N, T, D)
 
-            xt_out = xt_out.reshape(B, N, T, D).permute(0, 2, 1, 3)
+                time_kpm = None
+                if token_pad_mask is not None:
+                    # token_pad_mask: [B,T,N] -> [B,N,T] -> [B*N, T]
+                    time_kpm = token_pad_mask.permute(0, 2, 1).reshape(B * N, T)
+
+                xt_out = self.time_attn(
+                    x_time,
+                    attn_mask=None,
+                    key_padding_mask=time_kpm,
+                )
+
+                xt_out = xt_out.reshape(B, N, T, D).permute(0, 2, 1, 3)
+
             x = x + xt_out
             x = x + self.mlp(x)
             return x.squeeze(2) if x.shape[2] == 1 else x
@@ -367,6 +420,11 @@ class Dynamics(nn.Module):
     """
     Token-based dynamics with discrete signal embeddings + discrete action embeddings.
 
+    Tokens are temporally interleaved: each timestep contributes the block
+    [a (Sa), z (Nz), (t,d) (1), agent (1), reserved (Nr)], and the temporal
+    attention layers attend block-causally over the flattened stream
+    a_1, z_1, (t,d)_1, a_2, z_2, (t,d)_2, ...
+
     Inputs:
       z_tokens: [B, T, Nz, Dz]
       signals:  [B, T, Nz, 2]   (signals[...,0]=level_idx (tau_idx), signals[...,1]=step_idx (k_idx))  (int/long)
@@ -451,6 +509,7 @@ class Dynamics(nn.Module):
                     d_model, n_heads,
                     dropout=dropout,
                     time_attn=use_time,
+                    temporal_interleave=True,
                     device=device,
                 )
             )
@@ -460,33 +519,6 @@ class Dynamics(nn.Module):
         self.out = build_network(d_model, 2*d_model, 3, "SwiGLU", Dz)
 
         self.to(device)
-
-    def recover_z(self, out: torch.Tensor):
-        """
-        out: [B,T,Sa+Nz,D] laid out as [a (Sa tokens), z (Nz tokens)] per timestep
-        returns:
-        z_rec: [B,T,Nz,D]
-        """
-        Sa = self.Sa
-        B, T, L, D = out.shape
-        assert L > Sa, f"Token length {L} must exceed Sa={Sa}"
-        return out[:, :, Sa:, :]
-
-    def interleave_a_z(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
-        """
-        Temporal interleaving: each timestep's tokens are ordered [a, z], so with
-        the signal token appended afterwards the stream reads
-        a_1, z_1, (t,d)_1, a_2, z_2, (t,d)_2, ...
-        z: [B,T,Nz,D]
-        a: [B,T,Sa,D]
-        returns: [B,T,Sa+Nz,D]
-        """
-        B, T, Nz, D = z.shape
-        assert a.shape[0] == B and a.shape[1] == T and a.shape[3] == D
-
-        return torch.cat([a, z], dim=2)
-
-
 
     def align_actions(self, actions, T, B):
         if actions.dim() != 3:
@@ -590,9 +622,10 @@ class Dynamics(nn.Module):
 
         z_inp = self.z_proj(z_tokens)
 
-        # Temporal interleaving: [a, z] per timestep, then append signal token -> a, z, (t,d)
-        x = self.interleave_a_z(z_inp, a_tokens)                 # x: [B,T,Sa+Nz,D]
-        Nmain = x.size(2)
+        # Temporal interleaving: each timestep contributes the block [a, z, (t,d)],
+        # and the time-attention layers flatten these blocks into the single
+        # stream a_1, z_1, (t,d)_1, a_2, z_2, (t,d)_2, ...
+        x = torch.cat([a_tokens, z_inp], dim=2)                  # [B,T,Sa+Nz,D]
         x = torch.cat([x, self.sig_proj(lev_feat + step_feat).unsqueeze(-2)], dim=2)
         token_pad_mask = self.make_kpm_for_actions(B, T, S=x.size(2), Nz=Nz_in, pad_action_t=0, device=device)
         pad_extra = torch.zeros(B, T, 1 + self.Nr, dtype=torch.bool, device=device)
@@ -626,11 +659,10 @@ class Dynamics(nn.Module):
                 x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, mask=tok_mask, agent_idx=agent_idx)
 
         agent = x_aug[:, :, agent_idx:agent_idx+1, :]
-        x     = x_aug[:, :, :agent_idx, :]
         agent_out_bt = agent[:, :, 0, :]
 
-
-        hist = self.recover_z(x[:,:,:Nmain])     
+        # z tokens sit at positions [Sa, Sa+Nz) of every timestep block
+        hist = x_aug[:, :, self.Sa:self.Sa + self.Nz, :]
 
         hist = hist.reshape(B, T*self.Nz, self.d_model)     # [B,T*Nz,D]
         z = self.out(hist)                              # [B,T*Nz,Dz]
