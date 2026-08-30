@@ -419,14 +419,67 @@ class Encoder(nn.Module):
         ztok = torch.tanh(pre)   # [B,T,Np,Dz]
         return ztok
 
+class ReadoutAttention(nn.Module):
+    """
+    Cross-attention readout: learned query tokens read the processed stream but
+    never write into it, so the backbone's z predictions are structurally
+    unaffected by the agent while gradients from the readout heads flow back
+    through the entire transformer.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.0):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.num_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.norm_q = nn.RMSNorm(d_model)
+        self.norm_k = nn.RMSNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.mlp = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
+        self.dropout = dropout
+
+    def forward(self, q_tok, kv, attn_bias=None, key_padding_mask=None):
+        # q_tok: [B, Tq, D], kv: [B, Tk, D]
+        B, Tq, D = q_tok.shape
+        Tk = kv.shape[1]
+        q = self.q_proj(self.norm_q(q_tok)).view(B, Tq, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(self.norm_k(kv)).view(B, Tk, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(kv).view(B, Tk, self.num_heads, self.head_dim).transpose(1, 2)
+
+        bias = None
+        if attn_bias is not None:
+            bias = attn_bias[None, None].to(dtype=q.dtype, device=q.device)  # [1,1,Tq,Tk]
+        if key_padding_mask is not None:
+            kpm = torch.zeros((B, 1, 1, Tk), dtype=q.dtype, device=q.device)
+            kpm.masked_fill_(key_padding_mask[:, None, None, :], float("-inf"))
+            bias = kpm if bias is None else bias + kpm
+
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=bias,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        out = out.transpose(1, 2).contiguous().view(B, Tq, D)
+        out = q_tok + self.out_proj(out)
+        return out + self.mlp(out)
+
+
 class Dynamics(nn.Module):
     """
     Token-based dynamics with discrete signal embeddings + discrete action embeddings.
 
     Tokens are temporally interleaved: each timestep contributes the block
-    [a (Sa), z (Nz), (t,d) (1), agent (1), reserved (Nr)], and the temporal
-    attention layers attend block-causally over the flattened stream
+    [a (Sa), z (Nz), (t,d) (1), reserved (Nr)], and the temporal attention
+    layers attend block-causally over the flattened stream
     a_1, z_1, (t,d)_1, a_2, z_2, (t,d)_2, ...
+
+    The agent token is a pure readout: after the backbone, one learned query
+    per timestep cross-attends block-causally over the processed stream to
+    produce the policy features. It never enters the stream, so z predictions
+    cannot depend on it, while readout gradients flow through the entire
+    transformer.
 
     Inputs:
       z_tokens: [B, T, Nz, Dz]
@@ -500,8 +553,9 @@ class Dynamics(nn.Module):
         # --- Action embedding (true lookup, no one-hot materialization) ---
         self.action_embs = nn.Sequential(nn.RMSNorm(act_embed_dim), nn.Linear(act_embed_dim, self.d_model), nn.RMSNorm(d_model))
 
-        # Agent token (learned)
+        # Agent token (learned readout query, one per task)
         self.agent_token = nn.Parameter(0.02 * torch.randn(1, 1, num_tasks, d_model))
+        self.readout_attn = ReadoutAttention(d_model, n_heads, dropout)
 
         # Blocks
         blocks = []
@@ -547,47 +601,15 @@ class Dynamics(nn.Module):
         kpm[:, pad_action_t, :Sa] = True
         return kpm
 
-    def agent_mask(self, S: int, agent_idx: int, device=None, Nr: int = 0, *, dtype=torch.float32):
-        if not (0 <= agent_idx < S):
-            raise ValueError(f"agent_idx={agent_idx} out of range for S={S}")
-        if Nr < 0 or Nr > S:
-            raise ValueError(f"Nr={Nr} must satisfy 0 <= Nr <= S={S}")
-
-        allow = torch.ones((S, S), dtype=torch.bool, device=device)
-
-        # Agent rule: others cannot read agent; agent reads everyone
-        allow[:, agent_idx] = False
-        allow[agent_idx, :] = True
-        allow[agent_idx, agent_idx] = True
-
-        # Reserved rule: reserved can read everyone EXCEPT agent
-        if Nr > 0:
-            rs = S - Nr  # start index of reserved tokens
-            allow[rs:, agent_idx] = False  # reserved queries can't read agent
-
-        # Convert allow-mask -> additive bias (0 keep, -inf block)
-        attn_bias = torch.zeros((S, S), dtype=dtype, device=device)
-        attn_bias.masked_fill_(~allow, float("-inf"))
-
-        # Optional sanity checks (safe ones)
-        assert attn_bias.shape == (S, S)
-        assert torch.isfinite(attn_bias[allow]).all()
-
-        return attn_bias
-
-                                # Forwar
-    # -----------------------------
-# -----------------------------
     def forward(
         self,
         z_tokens: torch.Tensor,                 # [B, T, Nz, Dz]
         actions: torch.Tensor | None,           # [B, T-1, A] or [B, T, A]
         signals: torch.Tensor,                  # [B, T, Nz, 2] (level_idx, step_idx)
         policy_tok_in: torch.Tensor | None = None,  # [1,1,1,D] or [B,1,1,D] or [B,T,1,D]
-        detach_agent: bool = False,
         last_z=None,
         task_id=0,
-    ):  
+    ):
 
         assert (actions.size(1) == z_tokens.size(1) - 1) or ( actions.size(1) == z_tokens.size(1) )
         device = z_tokens.device
@@ -631,47 +653,49 @@ class Dynamics(nn.Module):
         x = torch.cat([a_tokens, z_inp], dim=2)                  # [B,T,Sa+Nz,D]
         x = torch.cat([x, self.sig_proj(lev_feat + step_feat).unsqueeze(-2)], dim=2)
         token_pad_mask = self.make_kpm_for_actions(B, T, S=x.size(2), Nz=Nz_in, pad_action_t=0, device=device)
-        pad_extra = torch.zeros(B, T, 1 + self.Nr, dtype=torch.bool, device=device)
-        token_pad_mask_aug = torch.cat([token_pad_mask, pad_extra], dim=2)  # [B,T,Nmain+1+Nr]
-        agent = None
-        if policy_tok_in is not None:
-            ag = policy_tok_in
-            if ag.size(0) == 1 and B > 1: ag = ag.expand(B, -1, -1, -1)
-            if ag.size(1) == 1 and T > 1: ag = ag.expand(B, T, -1, -1)
-            if ag.size(2) != 1:
-                raise ValueError("policy_tok_in token dim must be 1 at dim=2")
-            agent = ag
-            agent_in = agent.detach() if detach_agent else agent
-        elif self.use_agent_token:
-            assert task_id < self.num_task
-            agent = self.agent_token[:, :, task_id].expand(B, T, 1, self.d_model)
-            agent_in = agent.detach() if detach_agent else agent
+        pad_extra = torch.zeros(B, T, self.Nr, dtype=torch.bool, device=device)
+        token_pad_mask_aug = torch.cat([token_pad_mask, pad_extra], dim=2)  # [B,T,S]
 
-        agent_idx = x.size(2)
-        reserved  = self.reserved.expand(B, T, self.Nr, -1)
-
-        x_aug = torch.cat([x, agent_in, reserved], dim=2)
+        reserved = self.reserved.expand(B, T, self.Nr, -1)
+        x_aug = torch.cat([x, reserved], dim=2)
+        S = x_aug.size(2)
 
         for blk in self.blocks:
-            S = x_aug.size(2)
-            tok_mask = self.agent_mask(S, agent_idx, device=device, Nr=self.Nr)  # keep agent mask
+            x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug)
 
-            if blk.time_attn_enabled:
-                x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, agent_idx=agent_idx)
-            else:
-                x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, mask=tok_mask, agent_idx=agent_idx)
+        # ---- agent readout ----
+        # One learned query per timestep cross-attends block-causally over the
+        # processed stream. The agent never enters the stream, so the backbone's
+        # z predictions cannot depend on it, while gradients from the readout
+        # heads flow through the entire transformer.
+        if policy_tok_in is not None:
+            q = policy_tok_in
+            if q.size(0) == 1 and B > 1: q = q.expand(B, -1, -1, -1)
+            if q.size(1) == 1 and T > 1: q = q.expand(B, T, -1, -1)
+            if q.size(2) != 1:
+                raise ValueError("policy_tok_in token dim must be 1 at dim=2")
+            q = q[:, :, 0]                                            # [B,T,D]
+        else:
+            assert task_id < self.num_task
+            q = self.agent_token[:, :, task_id].expand(B, T, self.d_model)
 
-        agent = x_aug[:, :, agent_idx:agent_idx+1, :]
-        agent_out_bt = agent[:, :, 0, :]
+        stream = x_aug.reshape(B, T * S, self.d_model)
+        stream_kpm = token_pad_mask_aug.reshape(B, T * S)
+        t_k = torch.arange(T, device=device).repeat_interleave(S)     # [T*S]
+        readout_bias = torch.zeros((T, T * S), dtype=x_aug.dtype, device=device)
+        readout_bias.masked_fill_(
+            torch.arange(T, device=device).unsqueeze(1) < t_k.unsqueeze(0), float("-inf")
+        )
+        policy_feat = self.readout_attn(q, stream, attn_bias=readout_bias,
+                                        key_padding_mask=stream_kpm)  # [B,T,D]
 
         # z tokens sit at positions [Sa, Sa+Nz) of every timestep block
         hist = x_aug[:, :, self.Sa:self.Sa + self.Nz, :]
 
         hist = hist.reshape(B, T*self.Nz, self.d_model)     # [B,T*Nz,D]
         z = self.out(hist)                              # [B,T*Nz,Dz]
-        z_pred = z.view(B, T, Nz_in, Dz)            # [B,T,Nz,Dz]                        # [B,T,Nz,D]
+        z_pred = z.view(B, T, Nz_in, Dz)            # [B,T,Nz,Dz]
 
-        policy_feat = agent_out_bt if agent_out_bt is not None else None
         return z_pred, policy_feat
 
 
@@ -968,7 +992,7 @@ class Dreamer4(nn.Module):
             packed = torch.cat([z_prev, z], dim=1)
 
             x1_hat = self.transformer(
-                packed, actions[:,:], sigs, detach_agent=False, task_id=self.task_id
+                packed, actions[:,:], sigs, task_id=self.task_id
             )[0][:, -1:]
 
             v = (x1_hat - z) / max(1e-5, 1.0 - tau)
@@ -1160,7 +1184,6 @@ class Dreamer4(nn.Module):
                             actions[:,:i], 
                             signals=self.make_signals_indices(B,z_act.size(1), 1, N, N-1), 
                             task_id=self.task_id,
-                            detach_agent=False
                         )
                     z_list.append(z_last[:,-1:])
                     h_list.append(policy_feat[:,-1:])
@@ -1179,7 +1202,6 @@ class Dreamer4(nn.Module):
                             a_exec[:,:], 
                             signals=self.make_signals_indices(B,z_act.size(1), 1, N, N-1), 
                             task_id=self.task_id,
-                            detach_agent=True
                         )
                 elif random or (not eval_ and forced):
 
@@ -1199,7 +1221,6 @@ class Dreamer4(nn.Module):
                         z_inp, 
                         curr_actions, 
                         signals=self.make_signals_indices(B, T_curr, 1, N, N-1), 
-                        detach_agent=detach,
                         task_id=self.task_id
                     )
 
@@ -1434,15 +1455,6 @@ class Dreamer4(nn.Module):
 
         return act_loss, rew_loss, term_loss
 
-    def unfreeze_agent_token(self):
-    
-        self.transformer.agent_token.requires_grad_(True)
-
-    def freeze_agent_token(self):
-        for p in self.transformer.parameters():
-            p.requires_grad_(True)
-        self.transformer.agent_token.requires_grad_(False)
-
     def train_step(self, logger,buffer, model=False, policy=False, train_reward=False):
         self.transformer.train()
         epoch_loss = 0.0
@@ -1509,11 +1521,9 @@ class Dreamer4(nn.Module):
                         # This ensures s_{t+1} has the same embedding whether it's looked at as "current" or "next"
                 z_t = self.encoder(full_sequence, ).detach()
                         # Split into current and next steps
-                self.freeze_agent_token()
                 kl_loss, psnr = self.shortcut_forcing( z_t, actions)
                 kl = kl_loss.detach().item()
-                dyn_loss = kl_loss 
-                self.unfreeze_agent_token()
+                dyn_loss = kl_loss
                 if train_reward or policy:
                     pass
                 else:                        # Scale the loss before backward
@@ -1530,9 +1540,8 @@ class Dreamer4(nn.Module):
                 clean_latents = self.encoder(states).detach()
                 B, T, Nz, _ = clean_latents.shape
                 
-                noised = self.mix_tau_ctx(clean_latents) 
-                
-                self.unfreeze_agent_token()
+                noised = self.mix_tau_ctx(clean_latents)
+
                 N = self.shortcut_kmax
                 h_with_grad = self.transformer(noised, actions[:,:-1], signals=self.make_signals_indices(B, noised.size(1), 1, N, N-1))[1]
             

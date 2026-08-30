@@ -95,7 +95,9 @@ def test_block_causality_of_z_and_actions():
     assert g_a[:, 2:].abs().sum() == 0, "action leaks across time"
 
 
-def test_agent_isolation():
+def test_agent_is_pure_readout():
+    """The agent token reads the stream but never writes into it: z_pred is
+    structurally independent of it, while the readout query itself trains."""
     dyn = make_dynamics()
     B, T, Nz = 2, 4, 8
     z = torch.randn(B, T, Nz, 8, requires_grad=True)
@@ -107,7 +109,51 @@ def test_agent_isolation():
         z_pred.sum(), dyn.agent_token, retain_graph=True, allow_unused=True
     )[0]
     assert g_agent is None or g_agent.abs().sum() == 0, "z_pred reads agent token"
-    assert torch.autograd.grad(feat[:, -1].sum(), z)[0].abs().sum() > 0
+    assert torch.autograd.grad(feat[:, -1].sum(), z, retain_graph=True)[0].abs().sum() > 0
+    assert torch.autograd.grad(
+        feat.sum(), dyn.agent_token, retain_graph=True
+    )[0].abs().sum() > 0, "readout query gets no gradient"
+
+
+def test_readout_grad_flows_through_entire_transformer():
+    """Gradients from the policy features must reach every backbone layer,
+    not stop at the readout."""
+    dyn = make_dynamics()
+    B, T, Nz = 2, 4, 8
+    z = torch.randn(B, T, Nz, 8)
+    a = torch.rand(B, T - 1, 2) * 2 - 1
+    sigs = torch.zeros(B, T, Nz, 2, dtype=torch.long)
+
+    _, feat = dyn(z, a, sigs, task_id=0)
+    feat.sum().backward()
+
+    # each CausalSTBlock owns both norms but uses only one, depending on its type
+    dead = set()
+    for i, blk in enumerate(dyn.blocks):
+        dead.add(f"blocks.{i}." + ("ln_space" if blk.time_attn_enabled else "ln_time"))
+
+    for name, p in dyn.named_parameters():
+        if name.startswith(("out.",)) or "agent_token" in name:
+            continue  # output head is z-only; agent covered above
+        if "action_pad" in name:
+            continue  # key-padding-masked everywhere by design, never receives grad
+        if any(name.startswith(d) for d in dead):
+            continue  # unused norm of the other attention type
+        assert p.grad is not None and p.grad.abs().sum() > 0, \
+            f"no gradient reaches {name}"
+
+
+def test_readout_is_block_causal():
+    dyn = make_dynamics()
+    B, T, Nz = 2, 5, 8
+    z = torch.randn(B, T, Nz, 8, requires_grad=True)
+    a = torch.rand(B, T - 1, 2) * 2 - 1
+    sigs = torch.zeros(B, T, Nz, 2, dtype=torch.long)
+
+    _, feat = dyn(z, a, sigs, task_id=0)
+    g = torch.autograd.grad(feat[:, 1].sum(), z)[0]
+    assert g[:, :2].abs().sum() > 0
+    assert g[:, 2:].abs().sum() == 0, "readout sees future timesteps"
 
 
 if __name__ == "__main__":
