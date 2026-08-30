@@ -176,10 +176,13 @@ class GQA(nn.Module):
         if final_bias is not None:
             scores = scores + final_bias
 
-        attn = F.softmax(scores, dim=-1)
         # a fully masked query row (e.g. the padded action at t=0 in causal
-        # time attention) softmaxes to NaN; zero it like SDPA does
-        attn = torch.nan_to_num(attn, nan=0.0)
+        # time attention) would softmax to NaN and poison the backward pass;
+        # neutralize such rows before softmax and zero their output, like SDPA
+        dead_row = torch.isinf(scores).all(dim=-1, keepdim=True)
+        scores = scores.masked_fill(dead_row, 0.0)
+        attn = F.softmax(scores, dim=-1)
+        attn = attn.masked_fill(dead_row, 0.0)
         attn = F.dropout(attn, p=self.dropout, training=self.training)
         out = torch.matmul(attn, v)
 
@@ -442,8 +445,11 @@ class ReadoutAttention(nn.Module):
         scores = self.softcap * torch.tanh(scores / self.softcap)
         if bias is not None:
             scores = scores + bias
+        # neutralize fully masked query rows before softmax (see GQA.forward)
+        dead_row = torch.isinf(scores).all(dim=-1, keepdim=True)
+        scores = scores.masked_fill(dead_row, 0.0)
         attn = F.softmax(scores, dim=-1)
-        attn = torch.nan_to_num(attn, nan=0.0)  # fully masked rows -> 0, as SDPA
+        attn = attn.masked_fill(dead_row, 0.0)
         attn = F.dropout(attn, p=self.dropout, training=self.training)
         out = torch.matmul(attn, v)
 

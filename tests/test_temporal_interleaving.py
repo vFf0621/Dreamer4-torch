@@ -150,7 +150,7 @@ def test_attention_soft_capping():
     torch.manual_seed(0)
     g = GQA(32, 4, dropout=0.0, causal=False, device="cpu").eval()
     kv = torch.randn(2, 6, 32)
-    q1, q2 = torch.randn(2, 3, 32), torch.randn(2, 3, 32)
+    q1, q2 = torch.randn(2, 6, 32), torch.randn(2, 6, 32)
 
     g.softcap = 1e-6
     out_uniform_1 = g(q1, x_k=kv)
