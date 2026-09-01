@@ -1052,7 +1052,7 @@ class Dynamics(nn.Module):
         attn_mode: str = "per_channel",     # "per_channel" or "shared" (paper-style masked attention)
         time_group_size: int = 4,           # channels per temporal attention weight set (per_channel mode)
         # behavior toggles
-        h_tokens: int = 80,                 # readout tokens per step
+        h_tokens: int = 160,                # readout tokens per step
         mask_last_action: bool = True,      # usually correct for "predict next"
         clamp_signal_indices: bool = False, # set True if you’d rather clamp than crash
     ):
@@ -1069,8 +1069,8 @@ class Dynamics(nn.Module):
         self.Nz = latent_tokens
         # Readout width. One token per latent would be the natural pairing, but the
         # temporal blocks hold per-channel weights, so a readout as wide as the latents
-        # costs as much as the whole latent stream. 80 keeps that in proportion.
-        self.Nh = int(h_tokens) if h_tokens else 80
+        # costs as much as the whole latent stream. 160 keeps that in proportion.
+        self.Nh = int(h_tokens) if h_tokens else 160
         self.num_task = num_tasks
         self.mask_last_action = mask_last_action
         self.clamp_signal_indices = clamp_signal_indices
@@ -1266,7 +1266,7 @@ class Dreamer4(nn.Module):
                  batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=True, symlog_for_value=True,
                 kmax_prob=0.1, gqa_ratio=4, mlp_ratio=2.0, attn_mode='per_channel', time_group_size=4,
-                h_tokens=80):
+                h_tokens=160):
         super(Dreamer4, self).__init__()
         self.encoder =  Encoder(img_channels=ch, h=h, w=w, patch=patch, d_model=rep_d_model,
                                 n_heads=num_heads, depth=rep_depth, latent_tokens=latent_tokens, time_every=2,
