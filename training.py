@@ -50,7 +50,7 @@ def load_replay(path="buffer.npz", seed=None):
 def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, patch , Nr, latent_tokens, z_dim, action_dim, latent_dim, 
                  rep_depth , rep_d_model, dyn_d_model, num_heads, dropout, k_max, mtp, task_id,  kmax_prob, lambda_, buffer,
                  gqa_ratio, mlp_ratio, attn_mode,
-                 policy_bins , reward_bins , pretrain, reward_clamp,level_vocab , level_embed_dim,mode,num_tasks, Sa,
+                 policy_bins , reward_bins , pretrain, reward_clamp,level_vocab , level_embed_dim,mode,num_tasks, Sa, h_tokens,
                  batch_lens, batch_size, accum, max_imag_len, buffer_limit, train, ckpt, rep_lr=1e-4, rep_decay=1e-3,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3 , save_every=500):
     wandb.init(project="Dreamer4", entity="fguan", name=mode)
@@ -73,6 +73,7 @@ def simulate(env, num_warmups, num_interaction_episodes,num_agents, ch, h, w, pa
                 k_max=k_max, 
                 lambda_= lambda_,
                 Sa = Sa, 
+                h_tokens=h_tokens,
                 Nr = Nr, 
                 kmax_prob=kmax_prob,
                 eval_context_len=eval_context_len,
@@ -224,6 +225,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--kmax_base_prob", type=int, default=0.5)
     # Model sizes
     p.add_argument("--Sa", type=int, default=4)
+    p.add_argument("--h_tokens", type=int, default=80,
+                   help="Readout tokens per timestep. Widens every step and the temporal "
+                        "blocks are per channel, so this drives the parameter count.")
 
     p.add_argument("--pred_dim", type=int, default=512)
     p.add_argument("--rep_depth", type=int, default=6, help="Has to be a multiple of 2")
@@ -334,6 +338,7 @@ def main():
         batch_lens=tuple(args.batch_lens),
         batch_size=args.batch_size,
         Sa=args.Sa,
+        h_tokens=args.h_tokens,
         Nr=args.reserved_tokens,    
         save_every=args.save_every,
         lambda_=  args.lambda_,
