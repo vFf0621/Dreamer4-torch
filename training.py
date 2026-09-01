@@ -225,7 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--kmax_base_prob", type=int, default=0.5)
     # Model sizes
     p.add_argument("--Sa", type=int, default=4)
-    p.add_argument("--h_tokens", type=int, default=160,
+    p.add_argument("--h_tokens", type=int, default=256,
                    help="Readout tokens per timestep. Widens every step and the temporal "
                         "blocks are per channel, so this drives the parameter count.")
 
