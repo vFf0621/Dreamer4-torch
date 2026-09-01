@@ -2,9 +2,11 @@
 Tests for the temporally interleaved dynamics stream a_1, z_1, (t,d)_1, a_2, ...
 
 Invariants:
-  1. Time layers are axial: per-channel independent and causal; space layers
-     mix a, z, (t,d) bidirectionally within each timestep, so information
-     still flows both ways inside a block and causally across blocks.
+  1. Dynamics time layers flatten the blocks into one stream and apply the
+     standard causal mask over it, so ordering is strict at token
+     granularity; the tokenizer keeps per-channel independent time attention.
+     Space layers stay bidirectional within a timestep, which is what lets z
+     read its own (t,d) signal token despite the strict temporal order.
   2. The agent token is a pure readout: block-causal over the processed
      stream, never written back into it, with gradient reaching the entire
      transformer.
@@ -29,9 +31,32 @@ def make_dynamics():
     ).eval()
 
 
-def test_time_attention_is_per_channel_independent():
-    """A time layer must attend causally within each channel and never mix
-    channels; cross-channel mixing belongs to the space layers."""
+def test_interleaved_time_attention_is_standard_causal():
+    """With temporal interleaving, a time layer flattens the blocks into one
+    stream and applies the STANDARD causal mask: a token attends to strictly
+    earlier stream positions plus itself, so ordering is strict even inside a
+    block (z sees a, but not the (t,d) token that follows it)."""
+    torch.manual_seed(0)
+    blk = CausalSTBlock(32, 4, dropout=0.0, time_attn=True,
+                        temporal_interleave=True, device="cpu").eval()
+    B, T, N = 1, 4, 5
+    x = torch.randn(B, T, N, 32, requires_grad=True)
+    out = blk(x)
+
+    # query at block t=2, slot 3 -> flat position 2*N + 3
+    qpos = 2 * N + 3
+    g = torch.autograd.grad(out[:, 2, 3].sum(), x)[0]
+    flat = g.abs().sum(-1).reshape(-1)  # [T*N]
+
+    assert flat[:qpos + 1].sum() > 0, "token cannot see its own prefix"
+    assert flat[qpos + 1:].sum() == 0, "standard causal mask leaks later tokens"
+    # strictly inside the block: earlier slots visible, later slots not
+    assert flat[2 * N:qpos + 1].sum() > 0, "cannot see earlier slots of its block"
+    assert flat[qpos + 1:3 * N].sum() == 0, "sees later slots of its own block"
+
+
+def test_per_channel_time_attention_still_available():
+    """The tokenizer keeps per-channel independent time attention."""
     torch.manual_seed(0)
     blk = CausalSTBlock(32, 4, dropout=0.0, time_attn=True, device="cpu").eval()
     B, T, N = 1, 4, 5

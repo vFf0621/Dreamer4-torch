@@ -195,9 +195,14 @@ class GQA(nn.Module):
 
 class CausalSTBlock(nn.Module):
     def __init__(self, d_model, n_heads, dropout=0.1, time_attn=True, cap_value=50,
-                 mlp_layers=3, modality_sizes=None, gqa_ratio=2, device="cuda"):
+                 mlp_layers=3, modality_sizes=None, gqa_ratio=2,
+                 temporal_interleave=False, device="cuda"):
         super().__init__()
         self.time_attn_enabled = time_attn
+        # temporal_interleave: time attention runs over the flattened token
+        # stream a_1, z_1, (t,d)_1, ... under GQA's standard causal mask,
+        # instead of per-channel independent causal attention.
+        self.temporal_interleave = temporal_interleave
         self.d_model = d_model
         self.ln_space = nn.RMSNorm(d_model)
 
@@ -261,27 +266,44 @@ class CausalSTBlock(nn.Module):
             raise ValueError(f"agent_idx={agent_idx} out of range for N={N}")
 
         # =========================
-        # TIME ATTENTION (per-channel independent)
+        # TIME ATTENTION
         # =========================
-        # Each of the N channels (a, z, (t,d), reserved slots) attends causally
-        # over its own history only; cross-channel mixing happens in the space
-        # attention layers. This keeps temporal attention at O(N * T^2) instead
-        # of O((T*N)^2) for the flattened stream.
         if self.time_attn_enabled:
-            x_time = self.ln_time(x).permute(0, 2, 1, 3).reshape(B * N, T, D)
+            if self.temporal_interleave:
+                # Flatten the per-timestep blocks into the single stream
+                # a_1, z_1, (t,d)_1, a_2, z_2, (t,d)_2, ... and apply the
+                # standard causal mask over it: a token attends to every token
+                # at an earlier position in the stream, plus itself. Within a
+                # block this makes the modality order strict (z sees a, not the
+                # signal token that follows it); the space layers, which stay
+                # bidirectional, are what let z read its own (t,d) token.
+                x_time = self.ln_time(x).reshape(B, T * N, D)
 
-            time_kpm = None
-            if token_pad_mask is not None:
-                # token_pad_mask: [B,T,N] -> [B,N,T] -> [B*N, T]
-                time_kpm = token_pad_mask.permute(0, 2, 1).reshape(B * N, T)
+                time_kpm = None
+                if token_pad_mask is not None:
+                    time_kpm = token_pad_mask.reshape(B, T * N)
 
-            xt_out = self.time_attn(
-                x_time,
-                attn_mask=None,
-                key_padding_mask=time_kpm,
-            )
+                xt_out = self.time_attn(
+                    x_time,
+                    attn_mask=None,      # GQA applies the standard causal tril
+                    key_padding_mask=time_kpm,
+                ).reshape(B, T, N, D)
+            else:
+                # Per-channel independent: each of the N channels attends
+                # causally over its own history only.
+                x_time = self.ln_time(x).permute(0, 2, 1, 3).reshape(B * N, T, D)
 
-            xt_out = xt_out.reshape(B, N, T, D).permute(0, 2, 1, 3)
+                time_kpm = None
+                if token_pad_mask is not None:
+                    # token_pad_mask: [B,T,N] -> [B,N,T] -> [B*N, T]
+                    time_kpm = token_pad_mask.permute(0, 2, 1).reshape(B * N, T)
+
+                xt_out = self.time_attn(
+                    x_time,
+                    attn_mask=None,
+                    key_padding_mask=time_kpm,
+                ).reshape(B, N, T, D).permute(0, 2, 1, 3)
+
             x = x + xt_out
             x = x + self._ff(x)
             return x.squeeze(2) if x.shape[2] == 1 else x
@@ -469,10 +491,11 @@ class Dynamics(nn.Module):
     Token-based dynamics with discrete signal embeddings + discrete action embeddings.
 
     Tokens are temporally interleaved: each timestep contributes the block
-    [a (Sa), z (Nz), (t,d) (1), reserved (Nr)]. Temporal attention is axial and
-    per-channel independent: every slot of the block attends causally over its
-    own history only, while the space attention layers mix channels
-    bidirectionally within each timestep.
+    [a (Sa), z (Nz), (t,d) (1), reserved (Nr)]. Temporal attention runs over the
+    flattened stream a_1, z_1, (t,d)_1, a_2, ... under a standard causal mask,
+    so ordering is strict at token granularity; the space attention layers stay
+    bidirectional within each timestep and are what let z read its own (t,d)
+    signal token.
 
     The agent token is a pure readout: after the backbone, one learned query
     per timestep cross-attends block-causally over the processed stream to
@@ -571,6 +594,7 @@ class Dynamics(nn.Module):
                     mlp_layers=mlp_layers,
                     modality_sizes=[self.Sa, self.Nz, 1, self.Nr],
                     gqa_ratio=gqa_ratio,
+                    temporal_interleave=True,
                     device=device,
                 )
             )
