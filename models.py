@@ -556,7 +556,7 @@ class ModalityTimeBlock(nn.Module):
     """
 
     def __init__(self, d_model, n_heads, n_latent, n_reserved, n_a_channels,
-                 dropout=0.1, device="cuda", gqa_ratio=4,
+                 n_agent_channels=1, dropout=0.1, device="cuda", gqa_ratio=4,
                  mlp_ratio=2.0, time_group_size=1):
         super().__init__()
         self.d_model = d_model
@@ -572,11 +572,13 @@ class ModalityTimeBlock(nn.Module):
         self.time_lat = grouped_attn(n_latent)
         self.time_res = grouped_attn(n_reserved) if n_reserved > 0 else None
         self.time_a = grouped_attn(n_a_channels)
+        self.time_agent = grouped_attn(n_agent_channels)
 
         hidden = mlp_hidden(d_model, mlp_ratio)
         self.mlp_lat = PerChannelMLP(n_latent, d_model, hidden)
         self.mlp_res = PerChannelMLP(n_reserved, d_model, hidden) if n_reserved > 0 else None
         self.mlp_a = PerChannelMLP(n_a_channels, d_model, hidden)
+        self.mlp_agent = PerChannelMLP(n_agent_channels, d_model, hidden)
 
         self.device = device
         self.to(self.device)
@@ -605,8 +607,8 @@ class ModalityTimeBlock(nn.Module):
         z = torch.cat([lat, sig, res], dim=2)       # signal token skips time attention
 
         a = self._attend(self.time_a, self.mlp_a, a, a_pad)
-        # the readout skips time attention, like the signal token: it is built by the
-        # spatial path and reaches later steps through z, which reads h_{t-1}
+        if agent is not None:
+            agent = self._attend(self.time_agent, self.mlp_agent, agent, None)
         return z, a, agent
 
 
@@ -687,23 +689,25 @@ class SharedTimeBlock(nn.Module):
             self.to(device)
 
     def forward(self, z, a, agent=None, z_pad=None, a_pad=None):
-        # the readout is left out of the temporal attention entirely and passes through
         B, T, Nz, D = z.shape
         Sa = a.shape[2]
-        x = torch.cat([z, a], dim=2)
+        parts = [z, a] + ([agent] if agent is not None else [])
+        x = torch.cat(parts, dim=2)
         S = x.size(2)
+        Na = S - Nz - Sa
 
         xt = self.ln(x).permute(0, 2, 1, 3).reshape(B * S, T, D)
         kpm = None
         if z_pad is not None or a_pad is not None:
             zk = z_pad if z_pad is not None else torch.zeros(B, T, Nz, dtype=torch.bool, device=x.device)
             ak = a_pad if a_pad is not None else torch.zeros(B, T, Sa, dtype=torch.bool, device=x.device)
-            kpm = torch.cat([zk, ak], dim=2).permute(0, 2, 1).reshape(B * S, T)
+            gk = torch.zeros(B, T, Na, dtype=torch.bool, device=x.device)
+            kpm = torch.cat([zk, ak, gk], dim=2).permute(0, 2, 1).reshape(B * S, T)
 
         out = self.attn(xt, key_padding_mask=kpm).reshape(B, S, T, D).permute(0, 2, 1, 3)
         x = x + out
         x = x + self.mlp(x)
-        return x[:, :, :Nz], x[:, :, Nz : Nz + Sa], agent
+        return x[:, :, :Nz], x[:, :, Nz : Nz + Sa], (x[:, :, Nz + Sa :] if Na > 0 else None)
 
 
 class RepSharedSpaceBlock(nn.Module):
@@ -1064,9 +1068,8 @@ class Dynamics(nn.Module):
         self.Dz = Dz
         self.Nz = latent_tokens
         # Readout width. One token per latent would be the natural pairing, but the
-        # temporal blocks hold per-channel weights, so at the repo defaults that alone
-        # is ~1.15 B parameters -- as much as the whole latent stream. 80 keeps the
-        # dynamics at ~1.6 B.
+        # temporal blocks hold per-channel weights, so a readout as wide as the latents
+        # costs as much as the whole latent stream. 80 keeps that in proportion.
         self.Nh = int(h_tokens) if h_tokens else 80
         self.num_task = num_tasks
         self.mask_last_action = mask_last_action
@@ -1111,6 +1114,7 @@ class Dynamics(nn.Module):
                     n_latent=self.Nz,
                     n_reserved=self.Nr,
                     n_a_channels=self.Sa,
+                    n_agent_channels=self.Nh,
                     dropout=dropout, device=device, gqa_ratio=gqa_ratio, mlp_ratio=mlp_ratio,
                     time_group_size=time_group_size,
                 ) if per_channel else SharedTimeBlock(
@@ -1336,7 +1340,7 @@ class Dreamer4(nn.Module):
             Nr = Nr, 
             max_T = max_imag_len,
             num_tasks=num_tasks,
-            time_every=4,
+            time_every=8,          # depth 16 -> two temporal layers
             gqa_ratio=gqa_ratio,
             mlp_ratio=mlp_ratio,
             attn_mode=attn_mode,
