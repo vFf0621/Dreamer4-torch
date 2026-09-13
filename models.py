@@ -1136,19 +1136,14 @@ class Dynamics(nn.Module):
 
     def seed_agent_channel(self, tok, B, T):
         """
-        Agent channel input: the token at t=0 and nothing afterwards.
+        Agent channel input: the token at every timestep.
 
-        The token is injected once rather than restamped at every timestep. Later
-        positions start empty and pick it up through the channel's causal temporal
-        attention, so the readout carries the token forward instead of re-reading a
-        fresh copy of it at each step.
+        Every position starts from the same learned token, so each step's readout
+        has its task identity directly rather than having to recover it from the
+        temporal path or the z -> h -> z loop.
         """
         Nh = tok.shape[-2]
-        tok = tok.reshape(1, 1, Nh, self.d_model).expand(B, 1, Nh, self.d_model)
-        if T == 1:
-            return tok
-        rest = tok.new_zeros(B, T - 1, Nh, self.d_model)
-        return torch.cat([tok, rest], dim=1)                    # [B,T,Nh,D]
+        return tok.reshape(1, 1, Nh, self.d_model).expand(B, T, Nh, self.d_model)   # [B,T,Nh,D]
 
     def align_actions(self, actions, T, B):
         if actions.dim() != 3:

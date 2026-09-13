@@ -17,7 +17,7 @@ Action embeddings are interleaved with the latent, not added, as in previous imp
 
 Actions are aligned with the latents they were taken at: position `t` of the action stream carries `a_t`, not `a_{t-1}`. The last timestep has no action yet, so a learned query fills that slot. Note this puts `a_t` inside the same timestep as `z_t`. The readout at `t` reads it; the latents do not, since they never attend to the action tokens.
 
-The agent token is injected once, at the first timestep, rather than restamped at every step. Later positions start empty on that channel and pick the token up through its causal temporal attention, so the readout carries it forward instead of re-reading a fresh copy each step. Note this makes the readout channel a carry within whatever window is fed: `action_step` trims its buffer to `eval_context_len`, so at inference the token is re-seeded at the start of each window.
+The agent token is stamped onto the readout channel at every timestep, so each step's readout starts from its task identity directly rather than recovering it from the temporal path or the `z -> h -> z` loop.
 
 The readout is a state, not just a probe. Each timestep carries `h_tokens` readout tokens (defaulting to `latent_tokens`, one per latent), and the latents at `t` attend to the readout tokens from `t-1` alongside their own stream, so the next latents are produced from the previous `h`. The lag is what keeps it causal: nothing reads `h_t` at `t`. The policy consumes one vector per step, produced by a learned action query that cross-attends over the `h` tokens at the step it acts on, so which readout tokens matter is learned rather than averaged.
 
