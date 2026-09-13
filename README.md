@@ -15,7 +15,7 @@ This will NOT be any more data efficient than other implementations; it just con
 
 Action embeddings are interleaved with the latent, not added, as in previous implementations.
 
-Actions are aligned with the latents they were taken at: position `t` of the action stream carries `a_t`, not `a_{t-1}`. The last timestep has no action yet, so a learned query fills that slot. Note this puts `a_t` inside the same timestep as `z_t`, so the readout at `t` sees it through the latents.
+Actions are aligned with the latents they were taken at: position `t` of the action stream carries `a_t`, not `a_{t-1}`. The last timestep has no action yet, so a learned query fills that slot. Note this puts `a_t` inside the same timestep as `z_t`, so both the latents and the readout at `t` see the current action.
 
 The agent token is injected once, at the first timestep, rather than restamped at every step. Later positions start empty on that channel and pick the token up through its causal temporal attention, so the readout carries it forward instead of re-reading a fresh copy each step. Note this makes the readout channel a carry within whatever window is fed: `action_step` trims its buffer to `eval_context_len`, so at inference the token is re-seeded at the start of each window.
 
@@ -23,7 +23,7 @@ The readout is a state, not just a probe. Each timestep carries `h_tokens` reado
 
 The dynamics uses two temporal layers, at `time_every=8` over a depth of 16, with the other fourteen blocks spatial. Almost all of the parameters live in the temporal blocks, because their feed-forwards and attention are per channel, so halving them from four to two is the largest single lever on model size: at the repo defaults with `h_tokens=256` the dynamics is 1.22 B parameters, against 2.37 B with four. `h_tokens` also scales that cost, since the readout gets per-channel temporal weights of its own.
 
-The policy readout attends to the z stream only -- latents, the signal token and the reserved registers -- and never to the action tokens. Actions still shape it, but only through what they did to the latents -- and since the stream is aligned, `z_t` carries `a_t`, so the readout at `t` does see the current action by that route. In the per-channel mode this is simply the key set it is given; in the shared mode, where all routing is one additive mask, the agent rows are blocked from the action columns.
+The readout attends to both the latents and the action tokens, so `h_t` carries `a_t` alongside `z_t`. That is what makes it a useful state for the latents at `t+1` to generate from: the action arrives with the summary rather than having to be re-read. It costs nothing in leakage under the aligned stream, since `z_t` already carried `a_t` and the readout was seeing it that way regardless; this just makes the path direct.
 
 Below are the training artifacts:
 
