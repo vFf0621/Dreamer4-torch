@@ -258,16 +258,15 @@ class ModalitySpaceBlock(nn.Module):
     Spatial attention where every modality owns its attention weights.
 
     Routing (queries <- keys):
-        z     <- [z ; actions ; h_{t-1}]   (attn_z_za)
+        z     <- [z ; h_{t-1}]             (attn_z_zh)
         actions <- actions       (attn_a_a)
         actions <- z             (attn_a_z)
         agent <- [z ; actions]   (attn_agent_za)
 
-    Action conditioning reaches z through a single attention: the queries come
-    from z while the keys and values are projected from the concatenation, so
-    latents and actions compete inside one softmax and share the key/value
-    projections. That differs from normalising a z-to-z and a z-to-action
-    attention separately and adding them.
+    The latents never attend to the action tokens. Action conditioning reaches
+    z only through the readout: h reads [z ; actions] at t, and z reads h at
+    t+1. So z_t is blind to a_t, the action chosen after frame t was observed,
+    while z_{t+1} is conditioned on a_t, the action that produced it.
 
     The action stream still runs two paths whose outputs share a shape and are
     summed: actions gets attn_a_a + attn_a_z.
@@ -291,7 +290,7 @@ class ModalitySpaceBlock(nn.Module):
         self.ln_agent = nn.RMSNorm(d_model)
         self.ln_hprev = nn.RMSNorm(d_model)
 
-        self.attn_z_za = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
+        self.attn_z_zh = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
         self.attn_a_a = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
         self.attn_a_z = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
         self.attn_agent_za = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
@@ -336,14 +335,18 @@ class ModalitySpaceBlock(nn.Module):
             ak = a_kpm if a_kpm is not None else torch.zeros(B * T, Sa, dtype=torch.bool, device=a.device)
             za_kpm = torch.cat([zk, ak], dim=1)
 
-        # ---- z: one attention over [z ; actions ; h_{t-1}] ----
-        z_keys, z_kpm_full = za, za_kpm
+        # ---- z: one attention over [z ; h_{t-1}] -- never the action tokens ----
+        # Actions are not concatenated with the latents. They reach z only through
+        # the readout, which reads them at t and is read by z at t+1. So z_t never
+        # sees a_t, the action chosen after frame t, while z_{t+1} is conditioned on
+        # it, the action that produced that frame.
+        z_keys, z_kpm_full = zn, z_kpm
         if hp is not None:
-            z_keys = torch.cat([za, hp], dim=1)
-            if za_kpm is not None:
+            z_keys = torch.cat([zn, hp], dim=1)
+            if z_kpm is not None:
                 z_kpm_full = torch.cat(
-                    [za_kpm, torch.zeros(B * T, hp.size(1), dtype=torch.bool, device=z.device)], dim=1)
-        z_out = self.attn_z_za(zn, x_k=z_keys, key_padding_mask=z_kpm_full)
+                    [z_kpm, torch.zeros(B * T, hp.size(1), dtype=torch.bool, device=z.device)], dim=1)
+        z_out = self.attn_z_zh(zn, x_k=z_keys, key_padding_mask=z_kpm_full)
 
         # ---- actions: self + cross(z), same shape -> summed ----
         a_out = self.attn_a_a(an, key_padding_mask=a_kpm) \
@@ -616,9 +619,9 @@ class SharedSpaceBlock(nn.Module):
     """
     Dynamics spatial attention, paper-style: one set of weights and a single
     softmax over the concatenated token sequence, with an additive mask giving
-    the same routing as ModalitySpaceBlock -- every stream sees z, the signal
-    token, the registers and the actions, and nothing attends to the agent,
-    which reads all of them.
+    the same routing as ModalitySpaceBlock -- the latents see z and h_{t-1} but
+    never the action tokens, the actions see z and themselves, the agent reads z
+    and the actions, and nothing attends to the agent at its own step.
 
     Note this is not merely ModalitySpaceBlock with tied weights: attending in
     one pass makes z and the actions compete inside a single softmax, whereas
@@ -655,6 +658,7 @@ class SharedSpaceBlock(nn.Module):
             Sk = S + Na
             bias = torch.zeros((S, Sk), dtype=xn.dtype, device=x.device)
             bias[: Nz + Sa, Nz + Sa : S] = float("-inf")     # nothing attends to h_t
+            bias[:Nz, Nz : Nz + Sa] = float("-inf")          # z never reads the actions
             bias[Nz:, S:] = float("-inf")                    # only z reads h_{t-1}
 
         kpm = None
