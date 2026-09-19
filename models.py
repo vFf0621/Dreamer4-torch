@@ -1098,9 +1098,9 @@ class Dynamics(nn.Module):
         # Agent token (learned)
         self.agent_token = nn.Parameter(0.02 * torch.randn(1, 1, num_tasks, self.Nh, d_model))
         # the policy reads one vector per step: a learned action query attends over the
-        # Nh readout tokens, so which of them matter is learned rather than averaged
+        # predicted latents, so which of them matter is learned rather than averaged
         self.action_query = nn.Parameter(0.02 * torch.randn(1, 1, d_model))
-        self.ln_h = nn.RMSNorm(d_model)
+        self.ln_pool = nn.RMSNorm(d_model)
         self.q_pool = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
 
         # Blocks: modality-specific attention weights.
@@ -1241,18 +1241,21 @@ class Dynamics(nn.Module):
                 a_pad=None,          # the t=0 action pad is a readable, learned embedding
             )
 
-        agent_out_bt = None
-        if agent_in is not None:
-            keys = self.ln_h(agent_in).reshape(B * T, agent_in.size(2), self.d_model)
-            q = self.action_query.expand(B * T, 1, self.d_model)
-            agent_out_bt = self.q_pool(q, x_k=keys).reshape(B, T, self.d_model)
+        lat_out = z_stream[:, :, :self.Nz]                  # drop signal + reserved
 
-        hist = z_stream[:, :, :self.Nz]                     # drop signal + reserved
-        hist = hist.reshape(B, T*self.Nz, self.d_model)     # [B,T*Nz,D]
+        # The policy reads a learned-query summary of the predicted latents rather than
+        # of the readout. The latents never attend to the action tokens and reach
+        # actions only through h(t-1), so lat_out at t is blind to a_t -- the behaviour
+        # cloning target is never visible to the feature that predicts it, at any
+        # position, not just the one being acted on.
+        keys = self.ln_pool(lat_out).reshape(B * T, self.Nz, self.d_model)
+        q = self.action_query.expand(B * T, 1, self.d_model)
+        policy_feat = self.q_pool(q, x_k=keys).reshape(B, T, self.d_model)
+
+        hist = lat_out.reshape(B, T*self.Nz, self.d_model)  # [B,T*Nz,D]
         z = self.out(hist)                              # [B,T*Nz,Dz]
         z_pred = z.view(B, T, Nz_in, Dz)            # [B,T,Nz,Dz]                        # [B,T,Nz,D]
 
-        policy_feat = agent_out_bt if agent_out_bt is not None else None
         return z_pred, policy_feat
 
 
