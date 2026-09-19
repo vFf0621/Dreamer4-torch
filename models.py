@@ -258,10 +258,10 @@ class ModalitySpaceBlock(nn.Module):
     Spatial attention where every modality owns its attention weights.
 
     Routing (queries <- keys):
-        z     <- [z ; h_{t-1}]             (attn_z_zh)
+        z     <- [z ; h]                   (attn_z_zh)
         actions <- actions       (attn_a_a)
         actions <- z             (attn_a_z)
-        agent <- [z ; actions]   (attn_agent_za)
+        agent <- [z ; actions(t-1)]  (attn_agent_za)
 
     The latents never attend to the action tokens. Action conditioning reaches
     z only through the readout: h reads [z ; actions] at t, and z reads h at
@@ -271,9 +271,9 @@ class ModalitySpaceBlock(nn.Module):
     The action stream still runs two paths whose outputs share a shape and are
     summed: actions gets attn_a_a + attn_a_z.
 
-    The agent reads both the latents and the action tokens, so the readout at t
-    carries a_t as well as z_t. That is what makes it useful as the state the next
-    latents are generated from: z at t+1 reads h_t and gets the action with it.
+    The agent reads the latents at t and the action tokens from t-1, so the
+    readout at t carries z_t and a_{t-1} -- the action that led into frame t --
+    and never a_t, the action it is asked to predict.
 
     Nothing attends to the agent, so the agent stays read-only by construction,
     which is what the additive agent mask used to enforce.
@@ -288,7 +288,7 @@ class ModalitySpaceBlock(nn.Module):
         self.ln_z = nn.RMSNorm(d_model)
         self.ln_a = nn.RMSNorm(d_model)
         self.ln_agent = nn.RMSNorm(d_model)
-        self.ln_hprev = nn.RMSNorm(d_model)
+        self.ln_hk = nn.RMSNorm(d_model)
 
         self.attn_z_zh = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
         self.attn_a_a = GQA(d_model, n_heads, dropout, device=device, gqa_ratio=gqa_ratio)
@@ -325,9 +325,7 @@ class ModalitySpaceBlock(nn.Module):
         # of its own timestep, so nothing reads h_t at t.
         hp = None
         if agent is not None:
-            Na_ = agent.shape[2]
-            h_prev = torch.cat([agent.new_zeros(B, 1, Na_, D), agent[:, :-1]], dim=1)
-            hp = self.ln_hprev(h_prev).reshape(B * T, Na_, D)
+            hp = self.ln_hk(agent).reshape(B * T, agent.shape[2], D)
         za = torch.cat([zn, an], dim=1)                           # [B*T, Nz+Sa, D]
         za_kpm = None
         if z_kpm is not None or a_kpm is not None:
@@ -335,11 +333,12 @@ class ModalitySpaceBlock(nn.Module):
             ak = a_kpm if a_kpm is not None else torch.zeros(B * T, Sa, dtype=torch.bool, device=a.device)
             za_kpm = torch.cat([zk, ak], dim=1)
 
-        # ---- z: one attention over [z ; h_{t-1}] -- never the action tokens ----
-        # Actions are not concatenated with the latents. They reach z only through
-        # the readout, which reads them at t and is read by z at t+1. So z_t never
-        # sees a_t, the action chosen after frame t, while z_{t+1} is conditioned on
-        # it, the action that produced that frame.
+        # ---- z: one attention over [z ; h] -- never the action tokens ----
+        # Actions are not concatenated with the latents. They reach z only through the
+        # readout, which carries a_{t-1}. The readout is read at the SAME step: one lag
+        # already sits between the action and the readout, and a second would condition
+        # z_t on a_{t-2}. As it stands z_t sees a_{t-1}, the action that produced frame
+        # t, and never a_t.
         z_keys, z_kpm_full = zn, z_kpm
         if hp is not None:
             z_keys = torch.cat([zn, hp], dim=1)
@@ -357,11 +356,22 @@ class ModalitySpaceBlock(nn.Module):
         z = z + self.mlp_z(z)
         a = a + self.mlp_a(a)
 
-        # ---- agent: reads latents and actions, so h(t) carries a(t) forward ----
+        # ---- agent: reads the latents and the PREVIOUS step's action ----
+        # h(t) sees a(t-1), the action that led into frame t, never a(t), the action it
+        # is asked to predict. Position 0 has no previous action and reads zeros there.
         if agent is not None:
             Na = agent.shape[2]
             agn = self.ln_agent(agent).reshape(B * T, Na, D)
-            ag_out = self.attn_agent_za(agn, x_k=za, key_padding_mask=za_kpm)
+            a_prev = torch.cat([a.new_zeros(B, 1, Sa, D), a[:, :-1]], dim=1)
+            apn = self.ln_a(a_prev).reshape(B * T, Sa, D)
+            zap = torch.cat([zn, apn], dim=1)                                    # [B*T, Nz+Sa, D]
+            zap_kpm = None
+            if z_kpm is not None or a_pad is not None:
+                zk = z_kpm if z_kpm is not None else torch.zeros(B * T, Nz, dtype=torch.bool, device=z.device)
+                apk = (torch.cat([a_pad.new_zeros(B, 1, Sa), a_pad[:, :-1]], dim=1).reshape(B * T, Sa)
+                       if a_pad is not None else torch.zeros(B * T, Sa, dtype=torch.bool, device=a.device))
+                zap_kpm = torch.cat([zk, apk], dim=1)
+            ag_out = self.attn_agent_za(agn, x_k=zap, key_padding_mask=zap_kpm)
             agent = agent + ag_out.reshape(B, T, Na, D)
             agent = agent + self.mlp_agent(agent)
 
@@ -619,9 +629,9 @@ class SharedSpaceBlock(nn.Module):
     """
     Dynamics spatial attention, paper-style: one set of weights and a single
     softmax over the concatenated token sequence, with an additive mask giving
-    the same routing as ModalitySpaceBlock -- the latents see z and h_{t-1} but
-    never the action tokens, the actions see z and themselves, the agent reads z
-    and the actions, and nothing attends to the agent at its own step.
+    the same routing as ModalitySpaceBlock -- the latents see z and h but never
+    the action tokens, the actions see z and themselves, and the agent reads z
+    and the previous step's actions.
 
     Note this is not merely ModalitySpaceBlock with tied weights: attending in
     one pass makes z and the actions compete inside a single softmax, whereas
@@ -653,13 +663,16 @@ class SharedSpaceBlock(nn.Module):
         # previous readout; the lag keeps it causal.
         xk, Sk, bias = xn, S, None
         if Na > 0:
-            h_prev = torch.cat([agent.new_zeros(B, 1, Na, D), agent[:, :-1]], dim=1)
-            xk = torch.cat([xn, self.ln(h_prev).reshape(B * T, Na, D)], dim=1)
-            Sk = S + Na
+            a_prev = torch.cat([a.new_zeros(B, 1, Sa, D), a[:, :-1]], dim=1)
+            xk = torch.cat([xn, self.ln(a_prev).reshape(B * T, Sa, D)], dim=1)
+            Sk = S + Sa
             bias = torch.zeros((S, Sk), dtype=xn.dtype, device=x.device)
-            bias[: Nz + Sa, Nz + Sa : S] = float("-inf")     # nothing attends to h_t
-            bias[:Nz, Nz : Nz + Sa] = float("-inf")          # z never reads the actions
-            bias[Nz:, S:] = float("-inf")                    # only z reads h_{t-1}
+            bias[:Nz, Nz : Nz + Sa] = float("-inf")             # z never reads a_t
+            bias[:Nz, S:] = float("-inf")                       # nor a_{t-1} directly
+            bias[Nz : Nz + Sa, Nz + Sa : S] = float("-inf")     # actions do not read h
+            bias[Nz : Nz + Sa, S:] = float("-inf")              # nor a_{t-1}
+            bias[Nz + Sa :, Nz : Nz + Sa] = float("-inf")       # the agent never reads a_t
+            bias[Nz + Sa :, Nz + Sa : S] = float("-inf")        # nor the agent channels
 
         kpm = None
         if z_pad is not None or a_pad is not None:
