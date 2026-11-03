@@ -20,7 +20,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import GQA, CausalSTBlock, Dynamics
+from models import GQA, CausalSTBlock, Decoder, Dynamics, Encoder
 
 
 def make_dynamics():
@@ -38,7 +38,7 @@ def test_interleaved_time_attention_is_standard_causal():
     block (z sees a, but not the (t,d) token that follows it)."""
     torch.manual_seed(0)
     blk = CausalSTBlock(32, 4, dropout=0.0, time_attn=True,
-                        temporal_interleave=True, device="cpu").eval()
+                        time_mode="stream_causal", device="cpu").eval()
     B, T, N = 1, 4, 5
     x = torch.randn(B, T, N, 32, requires_grad=True)
     out = blk(x)
@@ -56,7 +56,7 @@ def test_interleaved_time_attention_is_standard_causal():
 
 
 def test_per_channel_time_attention_still_available():
-    """The tokenizer keeps per-channel independent time attention."""
+    """per_channel remains selectable (no caller uses it by default now)."""
     torch.manual_seed(0)
     blk = CausalSTBlock(32, 4, dropout=0.0, time_attn=True, device="cpu").eval()
     B, T, N = 1, 4, 5
@@ -190,6 +190,63 @@ def test_attention_soft_capping():
     # capping must not corrupt masking: fully valid rows stay finite
     out = g(q1, x_k=kv, key_padding_mask=torch.tensor([[False]*5 + [True]] * 2))
     assert torch.isfinite(out).all()
+
+
+def test_tokenizer_time_attention_is_block_causal():
+    """Tokenizer time layers flatten the frames and apply a BLOCK-causal mask:
+    each frame is internally bidirectional, the future is blocked."""
+    blk = CausalSTBlock(32, 4, dropout=0.0, time_attn=True,
+                        time_mode="block_causal", device="cpu")
+    T, N = 3, 4
+    allow = torch.isfinite(blk._block_causal_bias(T, N, "cpu", torch.float32))
+    for tq in range(T):
+        for tk in range(T):
+            sub = allow[tq * N:(tq + 1) * N, tk * N:(tk + 1) * N]
+            if tk > tq:
+                assert not sub.any(), f"future frame {tk} visible from {tq}"
+            else:
+                assert sub.all(), f"frame {tk} not fully visible from {tq}"
+
+
+def test_block_causal_tiles_the_modality_restriction():
+    """Flattening must not let a token bypass the encoder's one-directional
+    modality mask by reading the same group in an earlier frame."""
+    blk = CausalSTBlock(32, 4, dropout=0.0, time_attn=True,
+                        time_mode="block_causal", device="cpu")
+    T, N, L = 3, 4, 2                      # 2 latents + 2 patches per frame
+    mod = torch.zeros((N, N), dtype=torch.bool)
+    mod[:L, :] = True                      # latents read everything
+    mod[L:, L:] = True                     # patches read only patches
+    allow = torch.isfinite(
+        blk._block_causal_bias(T, N, "cpu", torch.float32, modality=mod))
+
+    patch_q = 1 * N + L                    # a patch token in frame 1
+    for tk in (0, 1):
+        assert not allow[patch_q, tk * N:tk * N + L].any(), \
+            f"patch reads latents of frame {tk}"
+        assert allow[patch_q, tk * N + L:(tk + 1) * N].all(), \
+            f"patch cannot read patches of frame {tk}"
+    assert allow[1 * N, :2 * N].all(), "latent query lost its past"
+
+
+def test_encoder_and_decoder_are_block_causal_in_time():
+    torch.manual_seed(0)
+    enc = Encoder(h=32, w=32, patch=16, d_model=64, n_heads=4, depth=4,
+                  latent_tokens=4, time_every=2, out_dim=8, num_reserved=2)
+    dec = Decoder(h=32, w=32, patch=16, z_dim=8, d_model=64, n_heads=4, depth=4,
+                  latent_tokens=4, time_every=2, num_reserved=2)
+    assert {b.time_mode for b in enc.blocks} == {"block_causal"}
+    assert {b.time_mode for b in dec.blocks} == {"block_causal"}
+
+    frames = torch.rand(2, 4, 3, 32, 32, requires_grad=True)
+    z = enc(frames)
+    assert torch.isfinite(z).all()
+    assert torch.isfinite(dec(z)).all()
+
+    g = torch.autograd.grad(z[:, 1].sum(), frames)[0]
+    per_t = g.abs().sum((0, 2, 3, 4))
+    assert per_t[:2].sum() > 0, "encoder cannot see current/past frames"
+    assert per_t[2:].sum() == 0, "encoder leaks future frames"
 
 
 if __name__ == "__main__":

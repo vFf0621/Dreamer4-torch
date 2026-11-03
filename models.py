@@ -194,15 +194,30 @@ class GQA(nn.Module):
 
 
 class CausalSTBlock(nn.Module):
+    # time_mode selects how the temporal attention layers see the tokens:
+    #   "per_channel"   - each token slot attends causally over its own history
+    #                     only; no cross-channel mixing (axial attention).
+    #   "stream_causal" - flatten the per-timestep blocks into one stream and
+    #                     apply the standard causal mask, so ordering is strict
+    #                     at token granularity (used by the dynamics model).
+    #   "block_causal"  - flatten the blocks and apply a block-causal mask: a
+    #                     token sees every token of its own timestep plus all
+    #                     earlier timesteps, never the future (used by the
+    #                     tokenizer, where frames are bidirectional internally).
+    TIME_MODES = ("per_channel", "stream_causal", "block_causal")
+
     def __init__(self, d_model, n_heads, dropout=0.1, time_attn=True, cap_value=50,
                  mlp_layers=3, modality_sizes=None, gqa_ratio=2,
-                 temporal_interleave=False, device="cuda"):
+                 time_mode="per_channel", device=None):
         super().__init__()
+        assert time_mode in self.TIME_MODES, f"unknown time_mode {time_mode!r}"
+        # Encoder/Decoder construct blocks without naming a device; resolve it
+        # the way Dreamer4 does instead of hardcoding cuda, so the modules can
+        # also be built on a CPU-only machine.
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         self.time_attn_enabled = time_attn
-        # temporal_interleave: time attention runs over the flattened token
-        # stream a_1, z_1, (t,d)_1, ... under GQA's standard causal mask,
-        # instead of per-channel independent causal attention.
-        self.temporal_interleave = temporal_interleave
+        self.time_mode = time_mode
         self.d_model = d_model
         self.ln_space = nn.RMSNorm(d_model)
 
@@ -210,8 +225,13 @@ class CausalSTBlock(nn.Module):
             self.space_attn = GQA(d_model, n_heads,  dropout, softcap=cap_value,
                                   gqa_ratio=gqa_ratio, device=device)
         else:
-            self.time_attn = GQA(d_model, n_heads, dropout, causal=True, softcap=cap_value,
+            # block_causal supplies its own additive bias, so GQA must not add
+            # a token-level tril on top of it.
+            self.time_attn = GQA(d_model, n_heads, dropout,
+                                 causal=(time_mode != "block_causal"),
+                                 softcap=cap_value,
                                  gqa_ratio=gqa_ratio, device=device)
+        self._bc_cache = None
 
         self.ln_time = nn.RMSNorm(d_model)
         # modality_sizes splits the token dim into groups (e.g. [Sa, Nz, 1, Nr])
@@ -237,6 +257,42 @@ class CausalSTBlock(nn.Module):
             outs.append(mlp(x[:, :, i:i + size]))
             i += size
         return torch.cat(outs, dim=2)
+
+    def _block_causal_bias(self, T, N, device, dtype, modality=None):
+        """
+        Additive bias [T*N, T*N] for the flattened stream with N tokens per
+        timestep: a token attends to every token of its own timestep and of all
+        earlier timesteps, never to a later timestep. Causality is at block
+        granularity, so each timestep stays internally bidirectional.
+
+        `modality` is an optional [N,N] allow mask (bool, True = allow, or an
+        additive float bias) restricting which token groups may read which. It
+        is tiled over every (query block, key block) pair, so a one-directional
+        modality restriction holds across time as well as within a frame --
+        without it, flattening would let a token read through the restriction
+        simply by attending the same group in an earlier timestep.
+        """
+        sig = None
+        if modality is not None:
+            if modality.dtype == torch.bool:
+                mod_allow = modality
+            else:
+                mod_allow = torch.isfinite(modality)
+            mod_allow = mod_allow.to(device)
+            sig = int(mod_allow.sum().item())
+        key = (T, N, sig)
+        if self._bc_cache is not None and self._bc_cache[0] == key:
+            return self._bc_cache[1].to(device=device, dtype=dtype)
+
+        t_ids = torch.arange(T, device=device).repeat_interleave(N)   # [T*N]
+        allow = t_ids.unsqueeze(1) >= t_ids.unsqueeze(0)              # [T*N,T*N]
+        if modality is not None:
+            assert mod_allow.shape[-2:] == (N, N), (mod_allow.shape, N)
+            allow = allow & mod_allow.repeat(T, T)
+        bias = torch.zeros((T * N, T * N), dtype=dtype, device=device)
+        bias.masked_fill_(~allow, float("-inf"))
+        self._bc_cache = (key, bias)
+        return bias
 
     def forward(
             self,
@@ -269,23 +325,26 @@ class CausalSTBlock(nn.Module):
         # TIME ATTENTION
         # =========================
         if self.time_attn_enabled:
-            if self.temporal_interleave:
-                # Flatten the per-timestep blocks into the single stream
-                # a_1, z_1, (t,d)_1, a_2, z_2, (t,d)_2, ... and apply the
-                # standard causal mask over it: a token attends to every token
-                # at an earlier position in the stream, plus itself. Within a
-                # block this makes the modality order strict (z sees a, not the
-                # signal token that follows it); the space layers, which stay
-                # bidirectional, are what let z read its own (t,d) token.
+            if self.time_mode != "per_channel":
+                # Flatten the per-timestep blocks into one stream and attend
+                # over it. "stream_causal" uses GQA's standard causal tril, so
+                # ordering is strict at token granularity. "block_causal"
+                # supplies a block-granular mask instead, leaving each
+                # timestep internally bidirectional while blocking the future.
                 x_time = self.ln_time(x).reshape(B, T * N, D)
 
                 time_kpm = None
                 if token_pad_mask is not None:
                     time_kpm = token_pad_mask.reshape(B, T * N)
 
+                bias = None
+                if self.time_mode == "block_causal":
+                    mod = mask if (mask is not None and mask.shape[-2:] == (N, N)) else None
+                    bias = self._block_causal_bias(T, N, x.device, x.dtype, modality=mod)
+
                 xt_out = self.time_attn(
                     x_time,
-                    attn_mask=None,      # GQA applies the standard causal tril
+                    attn_mask=bias,
                     key_padding_mask=time_kpm,
                 ).reshape(B, T, N, D)
             else:
@@ -371,6 +430,7 @@ class Encoder(nn.Module):
         max_T: int = 256,
         num_reserved = 4,
         gqa_ratio: int = 2,
+        time_mode: str = "block_causal",
         pool: str = "first",      # "mean" or "first"
     ):
         super().__init__()
@@ -393,7 +453,8 @@ class Encoder(nn.Module):
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == 0)
-            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time, gqa_ratio=gqa_ratio))
+            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time,
+                                        gqa_ratio=gqa_ratio, time_mode=time_mode))
         self.blocks = nn.ModuleList(blocks)
 
         self.ln_out = nn.RMSNorm(d_model)
@@ -420,10 +481,9 @@ class Encoder(nn.Module):
 
         x = self.drop(x)
         for blk in self.blocks:
-            if blk.time_attn_enabled:
-                x = blk(x, mask=None,)          # no space mask here
-            else:
-                x = blk(x, mask=space_mask)    # modality mask only here
+            # block_causal time layers need the modality mask too, so the
+            # one-directional restriction holds across frames as well
+            x = blk(x, mask=space_mask)
         x = self.ln_out(x[:,:,:self.latent_tokens])  
 
         pre = (self.readout(x))
@@ -532,6 +592,7 @@ class Dynamics(nn.Module):
         dropout: float = 0.1,
         mlp_layers: int = 4,
         gqa_ratio: int = 2,
+        time_mode: str = "stream_causal",
         Sa: int = 64,
         max_T: int = 255,
         use_agent_token: bool = True,
@@ -594,7 +655,7 @@ class Dynamics(nn.Module):
                     mlp_layers=mlp_layers,
                     modality_sizes=[self.Sa, self.Nz, 1, self.Nr],
                     gqa_ratio=gqa_ratio,
-                    temporal_interleave=True,
+                    time_mode=time_mode,
                     device=device,
                 )
             )
@@ -1764,6 +1825,7 @@ class Decoder(nn.Module):
         output_range: str = "0_1",
         num_reserved = 4,
         gqa_ratio: int = 2,
+        time_mode: str = "block_causal",
     ):
         super().__init__()
         assert (h % patch == 0) and (w % patch == 0)
@@ -1791,7 +1853,8 @@ class Decoder(nn.Module):
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == 0)
-            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time, gqa_ratio=gqa_ratio))
+            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time,
+                                        gqa_ratio=gqa_ratio, time_mode=time_mode))
         self.blocks = nn.ModuleList(blocks)
         self.ln_out = nn.RMSNorm(d_model)
         self.to_patch = nn.Linear(d_model, img_channels * patch * patch)
@@ -1828,10 +1891,9 @@ class Decoder(nn.Module):
 
         # ---- transformer ----
         for blk in self.blocks:
-            if blk.time_attn_enabled:
-                x = blk(x)          # no space mask here
-            else:
-                x = blk(x,  mask=space_mask)    # modality mask only here
+            # block_causal time layers need the modality mask too, so the
+            # one-directional restriction holds across frames as well
+            x = blk(x, mask=space_mask)
         x = self.ln_out(x)
 
         # ---- decode ONLY patch tokens ----
