@@ -647,8 +647,8 @@ class Dynamics(nn.Module):
         self.agent_token = nn.Parameter(0.02 * torch.randn(1, 1, num_tasks, d_model))
         self.readout_attn = ReadoutAttention(d_model, n_heads, dropout)
 
-        # Blocks: deeper feed-forward than the tokenizer, and one independent
-        # MLP per modality (a, z, (t,d), reserved).
+        # Blocks: deeper feed-forward than the tokenizer, with one shared
+        # weight set across all modalities (a, z, (t,d), reserved).
         blocks = []
         for i in range(depth):
             use_time = ((i+1) % time_every == (0))
@@ -658,7 +658,6 @@ class Dynamics(nn.Module):
                     dropout=dropout,
                     time_attn=use_time,
                     mlp_layers=mlp_layers,
-                    modality_sizes=[self.Sa, self.Nz, 1, self.Nr],
                     gqa_ratio=gqa_ratio,
                     time_mode=time_mode,
                     device=device,
