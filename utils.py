@@ -486,42 +486,40 @@ def gumbel_softmax(
     #    detach hard so gradients flow through 'y' (the soft version)
     return y_hard - y.detach() + y
 def modality_mask(
-    L: int,                    
-    modality_sizes: list[int], 
+    L: int,
+    modality_sizes: list[int],
     device=None,
     encoder=True
 ) -> torch.Tensor:
-    
+    """
+    Spatial mask over one timestep's [latents (L), *modality_sizes] tokens.
+    Rows are queries, columns are keys.
+
+    Within a timestep every modality attends to every other modality
+    bidirectionally; the only restriction is on the latent tokens, which are
+    one-directional:
+
+      encoder: latents read everything, and nothing else may read a latent,
+               so the latents are the only place frame content is aggregated.
+      decoder: the mirror -- latents read only latents (the source stays
+               pure) and every other token may read them.
+
+    Tiled across the block-causal time staircase, this holds across frames as
+    well as within one.
+    """
     Np = sum(modality_sizes)
     S  = L + Np
     allow = torch.zeros((S, S), dtype=torch.bool, device=device)
-    
-    if encoder:
-        # --- ENCODER LOGIC ---
-        # 1. Agent (Latents) reads everything
-        allow[:L, :] = True 
-        
-        # 2. Modalities read ONLY themselves (Isolated spatial context)
-        #    They DO NOT read the Agent, and DO NOT read other modalities.
-        offset = L
-        for size in modality_sizes:
-            allow[offset : offset + size, offset : offset + size] = True
-            offset += size
 
+    if encoder:
+        # Latents read everything; everything else is mutually bidirectional
+        # but may never read a latent.
+        allow[:L, :] = True
+        allow[L:, L:] = True
     else:
-        # --- DECODER LOGIC ---
-        # 1. Agent (Latents) reads ONLY itself (Keep source pure)
+        # Mirror: latents read only latents, everyone else reads everything.
         allow[:L, :L] = True
-        
-        # 2. Modalities read themselves AND the Agent 
-        #    (CRITICAL for gradient path, but still NO cross-modality attention)
-        offset = L
-        for size in modality_sizes:
-            # Modality reads itself
-            allow[offset : offset + size, offset : offset + size] = True
-            # Modality reads the Agent (Latents)
-            allow[offset : offset + size, :L] = True
-            offset += size
+        allow[L:, :] = True
     return allow
 import seaborn as sns
 import matplotlib.pyplot as plt

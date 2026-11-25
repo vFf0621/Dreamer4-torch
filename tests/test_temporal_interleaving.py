@@ -21,6 +21,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import GQA, CausalSTBlock, Decoder, Dynamics, Encoder
+from utils import modality_mask
 
 
 def make_dynamics():
@@ -247,6 +248,34 @@ def test_encoder_and_decoder_are_block_causal_in_time():
     per_t = g.abs().sum((0, 2, 3, 4))
     assert per_t[:2].sum() > 0, "encoder cannot see current/past frames"
     assert per_t[2:].sum() == 0, "encoder leaks future frames"
+
+
+def test_modality_mask_is_bidirectional_except_latents():
+    """Within a timestep every modality attends every other modality both
+    ways; the only restriction is the latent tokens, which are
+    one-directional (encoder: nothing may read them; decoder: the mirror)."""
+    L, Np, Nr = 4, 6, 2
+    enc = modality_mask(L=L, modality_sizes=[Np, Nr])
+    assert enc[:L, :].all(), "latents must read everything"
+    assert enc[L:, L:].all(), "non-latent modalities must be bidirectional"
+    assert not enc[L:, :L].any(), "nothing but a latent may read a latent"
+
+    dec = modality_mask(L=L, modality_sizes=[Np, Nr], encoder=False)
+    assert dec[:L, :L].all() and not dec[:L, L:].any(), "decoder latents must stay pure"
+    assert dec[L:, :].all(), "decoder non-latents must read everything"
+
+    # the restriction must survive being tiled across the time staircase
+    T, N = 3, L + Np + Nr
+    blk = CausalSTBlock(32, 4, dropout=0.0, time_attn=True,
+                        time_mode="block_causal", device="cpu")
+    allow = torch.isfinite(
+        blk._block_causal_bias(T, N, "cpu", torch.float32, modality=enc))
+    for tq in range(T):
+        for tk in range(tq + 1):           # within and past frames
+            sub = allow[tq * N:(tq + 1) * N, tk * N:(tk + 1) * N]
+            assert sub[:L, :].all(), (tq, tk, "latent row lost context")
+            assert sub[L:, L:].all(), (tq, tk, "modalities not bidirectional")
+            assert not sub[L:, :L].any(), (tq, tk, "latent leaked across frames")
 
 
 if __name__ == "__main__":
