@@ -3,7 +3,7 @@ Compact implementation of Dreamer 4.
 
 Attention logit soft capping is implemented as in the paper: attention is computed manually (no SDPA) and the pre-softmax logits are squashed with `cap * tanh(logits / cap)` (cap = 50) before masking, in every attention layer including the agent readout.
 
-This default implementation uses RoPE1D(as stated in the paper), as well as the one directional masking for latent tokens in the encoder and decoder. Also, 
+This default implementation uses RoPE1D(as stated in the paper), as well as the one directional masking for latent tokens in the encoder and decoder. That masking is block causal over the latent x patch block: latent token `i` reads only the first `ceil((i+1)*Np/L)` patches, so the latents form an ordered, coarse-to-fine code rather than each latent seeing every patch. The decoder uses the transpose, so each patch is reconstructed by exactly the latents that were allowed to encode it (`modality_mask(..., staircase=False)` restores the old solid block). Also, 
 embedding lookup is implemented for continuous action inputs.
 
 Input images are expected to be of shape (CH, H, W) and normalized to [0, 1].

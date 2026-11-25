@@ -21,6 +21,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import GQA, CausalSTBlock, Decoder, Dynamics, Encoder
+from utils import modality_mask
 
 
 def make_dynamics():
@@ -247,6 +248,37 @@ def test_encoder_and_decoder_are_block_causal_in_time():
     per_t = g.abs().sum((0, 2, 3, 4))
     assert per_t[:2].sum() > 0, "encoder cannot see current/past frames"
     assert per_t[2:].sum() == 0, "encoder leaks future frames"
+
+
+def test_modality_mask_latent_patch_staircase():
+    """The latent x patch block is block causal: latent i reaches only the
+    first ceil((i+1)*size/L) tokens of each modality group. Latent x latent
+    stays full, and the decoder uses the transpose so every patch is
+    reconstructed by the latents that were allowed to encode it."""
+    L, Np, Nr = 32, 36, 4
+    enc = modality_mask(L=L, modality_sizes=[Np, Nr])
+    dec = modality_mask(L=L, modality_sizes=[Np, Nr], encoder=False)
+    lp = enc[:L, L:L + Np]
+
+    import math
+    for i in range(L):
+        reach = math.ceil((i + 1) * Np / L)
+        assert lp[i, :reach].all(), f"latent {i} missing its own prefix"
+        assert not lp[i, reach:].any(), f"latent {i} reaches past its share"
+
+    assert enc[:L, :L].all(), "latent x latent should stay full"
+    assert not enc[L:L + Np, :L].any(), "patches must not read latents"
+    assert enc[L:L + Np, L:L + Np].all(), "patches lost their own block"
+
+    # nothing is orphaned in either direction
+    assert (lp.sum(1) > 0).all() and (lp.sum(0) > 0).all()
+    assert torch.equal(dec[L:L + Np, :L], lp.t()), "decoder is not the transpose"
+    assert (dec[L:L + Np, :L].sum(1) > 0).all(), "a patch reads no latent"
+    assert dec[:L, :L].all(), "decoder latent x latent should stay full"
+
+    # opt-out restores the old solid block
+    solid = modality_mask(L=L, modality_sizes=[Np, Nr], staircase=False)
+    assert solid[:L, :].all(), "staircase=False should read everything"
 
 
 if __name__ == "__main__":

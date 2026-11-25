@@ -486,21 +486,48 @@ def gumbel_softmax(
     #    detach hard so gradients flow through 'y' (the soft version)
     return y_hard - y.detach() + y
 def modality_mask(
-    L: int,                    
-    modality_sizes: list[int], 
+    L: int,
+    modality_sizes: list[int],
     device=None,
-    encoder=True
+    encoder=True,
+    staircase=True,
 ) -> torch.Tensor:
-    
+    """
+    Spatial attention mask over [latents (L), *modality_sizes] tokens.
+    Rows are queries, columns are keys.
+
+    With `staircase` (default), the latent x modality block is block causal:
+    latent i only reaches the first ceil((i+1) * size / L) tokens of each
+    modality group, so the latents form an ordered, coarse-to-fine code
+    instead of every latent seeing every patch. Latent x latent stays full.
+    The decoder uses the transpose of that block, so the patches are
+    reconstructed by exactly the latents that were allowed to encode them.
+    The staircase applies to every group in `modality_sizes`, registers
+    included; pass staircase=False for the old solid block.
+    """
     Np = sum(modality_sizes)
     S  = L + Np
     allow = torch.zeros((S, S), dtype=torch.bool, device=device)
-    
+
+    # latent -> modality block, shared by both directions
+    lat_reads = torch.zeros((L, Np), dtype=torch.bool, device=device)
+    steps = torch.arange(1, L + 1, device=device, dtype=torch.float32)
+    offset = 0
+    for size in modality_sizes:
+        if staircase:
+            reach = torch.ceil(steps * size / L).long()                 # [L]
+            cols = torch.arange(size, device=device)                    # [size]
+            lat_reads[:, offset:offset + size] = cols.unsqueeze(0) < reach.unsqueeze(1)
+        else:
+            lat_reads[:, offset:offset + size] = True
+        offset += size
+
     if encoder:
         # --- ENCODER LOGIC ---
-        # 1. Agent (Latents) reads everything
-        allow[:L, :] = True 
-        
+        # 1. Latents read each other, and their own share of each modality
+        allow[:L, :L] = True
+        allow[:L, L:] = lat_reads
+
         # 2. Modalities read ONLY themselves (Isolated spatial context)
         #    They DO NOT read the Agent, and DO NOT read other modalities.
         offset = L
@@ -512,16 +539,14 @@ def modality_mask(
         # --- DECODER LOGIC ---
         # 1. Agent (Latents) reads ONLY itself (Keep source pure)
         allow[:L, :L] = True
-        
-        # 2. Modalities read themselves AND the Agent 
+
+        # 2. Modalities read themselves, AND the latents that encoded them
         #    (CRITICAL for gradient path, but still NO cross-modality attention)
         offset = L
         for size in modality_sizes:
-            # Modality reads itself
             allow[offset : offset + size, offset : offset + size] = True
-            # Modality reads the Agent (Latents)
-            allow[offset : offset + size, :L] = True
             offset += size
+        allow[L:, :L] = lat_reads.t()
     return allow
 import seaborn as sns
 import matplotlib.pyplot as plt
