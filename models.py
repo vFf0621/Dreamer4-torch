@@ -183,7 +183,11 @@ class CausalSTBlock(nn.Module):
     #                    apply a block-causal mask: a token sees every token of
     #                    its own timestep plus all earlier timesteps, never the
     #                    future (used by the encoder and decoder).
-    TIME_MODES = ("per_channel", "block_causal")
+    #   "stream_causal" - flatten the per-timestep blocks into one stream and
+    #                    apply a standard token-level causal mask, so ordering
+    #                    is strict within a timestep too (used by the dynamics:
+    #                    a_1, (t,d)_1, z_1, h_1, a_2, ...).
+    TIME_MODES = ("per_channel", "block_causal", "stream_causal")
 
     def __init__(self, d_model, n_heads, dropout=0.1, time_attn=True, cap_value=50,
                  time_mode="per_channel", device="cuda"):
@@ -197,10 +201,10 @@ class CausalSTBlock(nn.Module):
         if not self.time_attn_enabled:
             self.space_attn = GQA(d_model, n_heads,  dropout, device=device)
         else:
-            # block_causal supplies its own additive bias, so GQA must not add
-            # a token-level tril on top of it.
+            # The flattened modes supply their own additive bias (with the
+            # causal structure folded in), so GQA must not add its own tril.
             self.time_attn = GQA(d_model, n_heads, dropout,
-                                 causal=(time_mode != "block_causal"), device=device)
+                                 causal=(time_mode == "per_channel"), device=device)
         self._bc_cache = None
 
         self.ln_time = nn.RMSNorm(d_model)
@@ -208,12 +212,16 @@ class CausalSTBlock(nn.Module):
         self.device = device
         self.to(self.device)
 
-    def _block_causal_bias(self, T, N, device, dtype, modality=None):
+    def _stream_bias(self, T, N, device, dtype, modality=None, strict=False):
         """
         Additive bias [T*N, T*N] for the flattened stream with N tokens per
-        timestep: a token attends to every token of its own timestep and of
-        all earlier timesteps, never a later one. Each timestep stays
-        internally bidirectional.
+        timestep.
+
+        strict=False (block causal): a token attends to every token of its own
+        timestep and of all earlier timesteps, never a later one. Each
+        timestep stays internally bidirectional.
+        strict=True (stream causal): standard token-level causal mask over the
+        stream, so a token sees only the tokens before it (and itself).
 
         `modality` is an optional [N,N] allow mask (bool, True = allow, or an
         additive float bias). It is tiled over every (query block, key block)
@@ -226,12 +234,16 @@ class CausalSTBlock(nn.Module):
             mod_allow = modality if modality.dtype == torch.bool else torch.isfinite(modality)
             mod_allow = mod_allow.to(device)
             sig = int(mod_allow.sum().item())
-        key = (T, N, sig, str(device), dtype)
+        key = (T, N, sig, strict, str(device), dtype)
         if self._bc_cache is not None and self._bc_cache[0] == key:
             return self._bc_cache[1]
 
-        t_ids = torch.arange(T, device=device).repeat_interleave(N)   # [T*N]
-        allow = t_ids.unsqueeze(1) >= t_ids.unsqueeze(0)              # [T*N,T*N]
+        if strict:
+            pos = torch.arange(T * N, device=device)
+            allow = pos.unsqueeze(1) >= pos.unsqueeze(0)              # [T*N,T*N]
+        else:
+            t_ids = torch.arange(T, device=device).repeat_interleave(N)   # [T*N]
+            allow = t_ids.unsqueeze(1) >= t_ids.unsqueeze(0)              # [T*N,T*N]
         if modality is not None:
             assert mod_allow.shape[-2:] == (N, N), (mod_allow.shape, N)
             allow = allow & mod_allow.repeat(T, T)
@@ -270,16 +282,19 @@ class CausalSTBlock(nn.Module):
         # =========================
         # TIME ATTENTION
         # =========================
-        if self.time_attn_enabled and self.time_mode == "block_causal":
+        if self.time_attn_enabled and self.time_mode != "per_channel":
             # Flatten the per-timestep blocks into one stream and attend over
-            # it with a block-granular causal mask (bidirectional within a
-            # timestep, never the future).
+            # it. block_causal: block-granular causal mask (bidirectional
+            # within a timestep). stream_causal: token-level causal mask, so
+            # the order of tokens inside a timestep matters. In both, an
+            # [N,N] modality mask is tiled over every pair of timesteps.
             x_time = self.ln_time(x).reshape(B, T * N, D)
             time_kpm = None
             if token_pad_mask is not None:
                 time_kpm = token_pad_mask.reshape(B, T * N)
             mod = mask if (mask is not None and mask.shape[-2:] == (N, N)) else None
-            bias = self._block_causal_bias(T, N, x.device, x.dtype, modality=mod)
+            bias = self._stream_bias(T, N, x.device, x.dtype, modality=mod,
+                                     strict=(self.time_mode == "stream_causal"))
             xt_out = self.time_attn(
                 x_time,
                 attn_mask=bias,
@@ -437,8 +452,13 @@ class Dynamics(nn.Module):
     """
     Token-based dynamics with discrete signal embeddings + discrete action embeddings.
 
-    Per-timestep token layout: [a_t (Sa), (t,d)_t (1), z_t (Nz), h_t (1), reserved (Nr)],
-    where h_t is the agent token.
+    Tokens are ordered temporally: each timestep contributes
+    [a_t (Sa), (t,d)_t (1), z_t (Nz), h_t (1), reserved (Nr)], where h_t is the
+    agent token, and the time layers attend over the flattened stream
+    a_1, (t,d)_1, z_1, h_1, a_2, ... with a token-level causal mask. So z_t
+    reads a_t and (t,d)_t, and h_t reads everything up to z_t. Non-agent
+    tokens never read h. Space layers stay bidirectional within a timestep
+    (except for the agent rule).
 
     Inputs:
       z_tokens: [B, T, Nz, Dz]
@@ -524,6 +544,7 @@ class Dynamics(nn.Module):
                     d_model, n_heads,
                     dropout=dropout,
                     time_attn=use_time,
+                    time_mode="stream_causal",
                     device=device,
                 )
             )
@@ -665,10 +686,10 @@ class Dynamics(nn.Module):
             S = x_aug.size(2)
             tok_mask = self.agent_mask(S, agent_idx, device=device, Nr=self.Nr)  # keep agent mask
 
-            if blk.time_attn_enabled:
-                x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, agent_idx=agent_idx)
-            else:
-                x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, mask=tok_mask, agent_idx=agent_idx)
+            # Space layers apply the agent mask within a timestep; the
+            # stream-causal time layers tile it over every pair of timesteps,
+            # so no non-agent token ever reads h, current or past.
+            x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, mask=tok_mask, agent_idx=agent_idx)
 
         agent = x_aug[:, :, agent_idx:agent_idx+1, :]
         x     = x_aug[:, :, :agent_idx, :]
