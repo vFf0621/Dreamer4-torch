@@ -73,7 +73,7 @@ class Policy(nn.Module):
         return action, logp, dist, dist_act, idx
 class GQA(nn.Module):
     def __init__(self, embed_dim=16, num_heads=8, dropout=0.1, causal=False, softcap=50.0,
-                 gqa_ratio=2, mask_self=False, device="cuda"):
+                 gqa_ratio=2, device="cuda"):
         super().__init__()
         assert embed_dim % num_heads == 0
         # gqa_ratio = query heads per kv head: 1 -> MHA, num_heads -> MQA
@@ -85,12 +85,6 @@ class GQA(nn.Module):
         self.head_dim = embed_dim // num_heads
         self.causal = causal
         self.softcap = float(softcap)
-        # mask_self blocks the attention diagonal: a token never reads itself,
-        # so attention carries only other tokens' content and the token's own
-        # content reaches the next layer through the residual stream. It is
-        # applied to the query/key diagonal, which is "self" in every layout
-        # this block uses (space, per-channel time, flattened time).
-        self.mask_self = mask_self
 
         self.q_proj = nn.Linear(embed_dim, num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, self.num_kv_heads * self.head_dim, bias=False)
@@ -160,14 +154,6 @@ class GQA(nn.Module):
 
             final_bias = kpm_bias if final_bias is None else (final_bias + kpm_bias)
 
-        # ---- self mask (block the diagonal) ----
-        if self.mask_self and Tq == Tk:
-            eye = torch.eye(Tq, dtype=torch.bool, device=q.device)
-            self_bias = torch.zeros((Tq, Tk), dtype=q.dtype, device=q.device)
-            self_bias.masked_fill_(eye, float("-inf"))
-            self_bias = self_bias[None, None, :, :]
-            final_bias = self_bias if final_bias is None else (final_bias + self_bias)
-
         # ---- causal mask (ONLY if time attention) ----
         if self.causal:
             # block attending to future keys: j > i
@@ -222,7 +208,7 @@ class CausalSTBlock(nn.Module):
 
     def __init__(self, d_model, n_heads, dropout=0.1, time_attn=True, cap_value=50,
                  mlp_layers=3, modality_sizes=None, gqa_ratio=2,
-                 time_mode="per_channel", mask_self=False, device=None):
+                 time_mode="per_channel", device=None):
         super().__init__()
         assert time_mode in self.TIME_MODES, f"unknown time_mode {time_mode!r}"
         # Encoder/Decoder construct blocks without naming a device; resolve it
@@ -237,14 +223,14 @@ class CausalSTBlock(nn.Module):
 
         if not self.time_attn_enabled:
             self.space_attn = GQA(d_model, n_heads,  dropout, softcap=cap_value,
-                                  gqa_ratio=gqa_ratio, mask_self=mask_self, device=device)
+                                  gqa_ratio=gqa_ratio, device=device)
         else:
             # block_causal supplies its own additive bias, so GQA must not add
             # a token-level tril on top of it.
             self.time_attn = GQA(d_model, n_heads, dropout,
                                  causal=(time_mode != "block_causal"),
                                  softcap=cap_value,
-                                 gqa_ratio=gqa_ratio, mask_self=mask_self, device=device)
+                                 gqa_ratio=gqa_ratio, device=device)
         self._bc_cache = None
 
         self.ln_time = nn.RMSNorm(d_model)
@@ -445,7 +431,6 @@ class Encoder(nn.Module):
         num_reserved = 4,
         gqa_ratio: int = 2,
         time_mode: str = "block_causal",
-        mask_self: bool = True,
         pool: str = "first",      # "mean" or "first"
     ):
         super().__init__()
@@ -469,8 +454,7 @@ class Encoder(nn.Module):
         for i in range(depth):
             use_time = ((i+1) % time_every == 0)
             blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time,
-                                        gqa_ratio=gqa_ratio, time_mode=time_mode,
-                                        mask_self=mask_self))
+                                        gqa_ratio=gqa_ratio, time_mode=time_mode))
         self.blocks = nn.ModuleList(blocks)
 
         self.ln_out = nn.RMSNorm(d_model)
@@ -1842,7 +1826,6 @@ class Decoder(nn.Module):
         num_reserved = 4,
         gqa_ratio: int = 2,
         time_mode: str = "block_causal",
-        mask_self: bool = True,
     ):
         super().__init__()
         assert (h % patch == 0) and (w % patch == 0)
@@ -1871,8 +1854,7 @@ class Decoder(nn.Module):
         for i in range(depth):
             use_time = ((i+1) % time_every == 0)
             blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time,
-                                        gqa_ratio=gqa_ratio, time_mode=time_mode,
-                                        mask_self=mask_self))
+                                        gqa_ratio=gqa_ratio, time_mode=time_mode))
         self.blocks = nn.ModuleList(blocks)
         self.ln_out = nn.RMSNorm(d_model)
         self.to_patch = nn.Linear(d_model, img_channels * patch * patch)

@@ -278,44 +278,6 @@ def test_modality_mask_is_bidirectional_except_latents():
             assert not sub[L:, :L].any(), (tq, tk, "latent leaked across frames")
 
 
-def test_mask_self_blocks_the_attention_diagonal():
-    """mask_self removes a token from its own key/value set. Zeroing the query
-    projection makes attention uniform over the ALLOWED keys, so each output
-    row exposes exactly what it may read: identical rows when self is allowed,
-    distinct rows when each one excludes itself."""
-    def rows(mask_self):
-        torch.manual_seed(0)
-        g = GQA(32, 4, dropout=0.0, mask_self=mask_self, device="cpu").eval()
-        with torch.no_grad():
-            g.q_proj.weight.zero_()
-            return g(torch.randn(1, 5, 32))[0]
-
-    free, selfless = rows(False), rows(True)
-    assert torch.allclose(free, free[0].expand_as(free), atol=1e-5), \
-        "without mask_self every row should pool the same keys"
-    assert not torch.allclose(selfless, selfless[0].expand_as(selfless), atol=1e-5), \
-        "with mask_self each row must exclude a different key"
-    assert torch.isfinite(selfless).all()
-
-
-def test_tokenizer_masks_self_and_stays_finite():
-    torch.manual_seed(0)
-    enc = Encoder(h=32, w=32, patch=16, d_model=64, n_heads=4, depth=4,
-                  latent_tokens=4, time_every=2, out_dim=8, num_reserved=2)
-    dec = Decoder(h=32, w=32, patch=16, z_dim=8, d_model=64, n_heads=4, depth=4,
-                  latent_tokens=4, time_every=2, num_reserved=2)
-    for m in (enc, dec):
-        for b in m.blocks:
-            attn = b.time_attn if b.time_attn_enabled else b.space_attn
-            assert attn.mask_self, "tokenizer should mask the diagonal"
-
-    frames = torch.rand(2, 3, 3, 32, 32, requires_grad=True)
-    z = enc(frames)
-    assert torch.isfinite(z).all() and torch.isfinite(dec(z)).all()
-    g = torch.autograd.grad(z[:, 1].sum(), frames)[0]
-    assert torch.isfinite(g).all(), "self-masking produced non-finite grads"
-
-
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in tests:
