@@ -598,7 +598,7 @@ class Dynamics(nn.Module):
         mlp_layers: int = 4,
         gqa_ratio: int = 2,
         time_mode: str = "block_causal",
-        Sa: int = 64,
+        Sa: int | None = None,      # action tokens per step; defaults to latent_tokens
         max_T: int = 255,
         use_agent_token: bool = True,
         latent_tokens: int = 32,
@@ -615,7 +615,7 @@ class Dynamics(nn.Module):
         self.max_T = max_T
         self.use_agent_token = use_agent_token
         self.device = device
-        self.Sa = Sa
+        self.Sa = latent_tokens if Sa is None else Sa
         self.Nr = Nr
         self.action_dim = action_dim
         self.action_bins = action_bins
@@ -803,7 +803,7 @@ class Dreamer4(nn.Module):
     def __init__(self,agent_id, ch=3, h=96, w=96, patch = 16, latent_tokens=32, z_dim=16, action_dim=2, latent_dim=512,
                  rep_depth = 12, rep_d_model=1024, dyn_d_model=1024, dyn_depth=16, num_heads=16, gqa_ratio=2, dropout=0.1, k_max=8, mtp=8, action_low = -1, action_high = 1,
                  policy_bins = 100, reward_bins = 100, pretrain=False, reward_clamp=6,level_vocab = 16, level_embed_dim = 16,
-                 batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = 64,eval_context_len=15,
+                 batch_lens = (45, 65), batch_size=16, accum=1, max_imag_len=128, ckpt=None, rep_lr=1e-4, rep_decay=1e-3,Sa = None,eval_context_len=15,
                  dyn_lr=1e-4, dyn_decay=1e-3, policy_lr=1e-4, policy_decay=1e-3, num_tasks=30, task_id = 0, Nr = 4,lambda_=0.8, symlog_for_reward=True, symlog_for_value=True,
                 kmax_prob=0.1):
         super(Dreamer4, self).__init__()
