@@ -556,11 +556,11 @@ class Dynamics(nn.Module):
     Token-based dynamics with discrete signal embeddings + discrete action embeddings.
 
     Tokens are temporally interleaved: each timestep contributes the block
-    [a (Sa), z (Nz), (t,d) (1), reserved (Nr)]. Temporal attention runs over the
-    flattened stream a_1, z_1, (t,d)_1, a_2, ... under a standard causal mask,
-    so ordering is strict at token granularity; the space attention layers stay
-    bidirectional within each timestep and are what let z read its own (t,d)
-    signal token.
+    [a (Sa), z (Nz), (t,d) (1), reserved (Nr)]. Every layer is one block-causal
+    attention over the flattened stream a_1, z_1, (t,d)_1, a_2, ... -- there is
+    no factorized space / time alternation. A timestep is internally
+    bidirectional, so z reads its own (t,d) signal token, and it reads all
+    earlier timesteps but never a later one.
 
     The agent token is a pure readout: after the backbone, one learned query
     per timestep cross-attends block-causally over the processed stream to
@@ -597,7 +597,7 @@ class Dynamics(nn.Module):
         dropout: float = 0.1,
         mlp_layers: int = 4,
         gqa_ratio: int = 2,
-        time_mode: str = "stream_causal",
+        time_mode: str = "block_causal",
         Sa: int = 64,
         max_T: int = 255,
         use_agent_token: bool = True,
@@ -649,14 +649,17 @@ class Dynamics(nn.Module):
 
         # Blocks: deeper feed-forward than the tokenizer, with one shared
         # weight set across all modalities (a, z, (t,d), reserved).
+        # Every layer is one block-causal attention over the flattened
+        # a, z, (t,d) stream: no factorized space / time alternation. Each
+        # timestep is internally bidirectional, so z reads its own (t,d)
+        # signal token, and reads all earlier timesteps but never a later one.
         blocks = []
         for i in range(depth):
-            use_time = ((i+1) % time_every == (0))
             blocks.append(
                 CausalSTBlock(
                     d_model, n_heads,
                     dropout=dropout,
-                    time_attn=use_time,
+                    time_attn=True,
                     mlp_layers=mlp_layers,
                     gqa_ratio=gqa_ratio,
                     time_mode=time_mode,
