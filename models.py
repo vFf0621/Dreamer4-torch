@@ -454,7 +454,9 @@ class Dynamics(nn.Module):
 
     Tokens are ordered temporally: each timestep contributes
     [a_t (Sa), (t,d)_t (1), z_t (Nz), h_t (1)], where h_t is the
-    agent token, and the time layers attend over the flattened stream
+    agent token. a_1 has no preceding action, so it is a learned embedding
+    (first_action_emb) that the rest of timestep 1 reads. The time layers
+    attend over the flattened stream
     a_1, (t,d)_1, z_1, h_1, a_2, ... with a token-level causal mask. So z_t
     reads a_t and (t,d)_t, and h_t reads everything up to z_t. Non-agent
     tokens never read h. Space layers stay bidirectional within a timestep
@@ -523,7 +525,9 @@ class Dynamics(nn.Module):
         self.step_emb  = nn.Embedding(self.level_vocab, level_dim)
         self.action_conditioner = nn.Parameter(0.02 * torch.randn(1, 1, self.Sa, d_model))
 
-        self.action_pad = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
+        # Learned "no previous action" embedding for the first timestep. It is
+        # a real token that (t,d)_1, z_1 and h_1 read, not a masked pad.
+        self.first_action_emb = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
         self.action_lookup = action_lookup
         act_embed_dim = self.action_bins*self.action_dim
         # --- Action embedding (true lookup, no one-hot materialization) ---
@@ -565,15 +569,6 @@ class Dynamics(nn.Module):
             return actions
         else:
             raise ValueError("Incorrect action shape")
-
-    def make_kpm_for_actions(self, B, T, S, Nz, *, pad_action_t: int | None, device):
-        kpm = torch.zeros((B, T, S), dtype=torch.bool, device=device)
-        if pad_action_t is None:
-            return kpm
-        # actions occupy the first Sa positions of each timestep's
-        # [a, (t,d), z, h] block
-        kpm[:, pad_action_t, :self.Sa] = True
-        return kpm
 
     def agent_mask(self, S: int, agent_idx: int, device=None, *, dtype=torch.float32):
         if not (0 <= agent_idx < S):
@@ -628,8 +623,8 @@ class Dynamics(nn.Module):
                                                     # [B, T-1, D]
         a_emb = self.action_embs(act_two_hot[:, :, :])                                                     # [B, T-1, 1, D]
         if a_emb.size(1) == z_tokens.size(1)-1:
-            pad = self.action_pad.expand(B, 1, 1, -1)                                     # [B, 1, 1, D]
-            a_emb = torch.cat([pad, a_emb ], dim=1)                                        # [B, T, 1, D]
+            first = self.first_action_emb.expand(B, 1, 1, -1)                             # [B, 1, 1, D]
+            a_emb = torch.cat([first, a_emb], dim=1)                                       # [B, T, 1, D]
         a_tokens = a_emb.expand(-1, -1, self.Sa, -1) + self.action_conditioner  # [B,T,Sa,D]
         signals = signals.long()
         if signals.dim() == 4 and signals.size(-1) == 2:
@@ -650,9 +645,6 @@ class Dynamics(nn.Module):
         # Per-timestep layout: a_t, (t,d)_t, z_t, then h_t (agent) below
         x = torch.cat([a_tokens, sig_tok, z_inp], dim=2)                     # [B,T,Sa+1+Nz,D]
         z_start = self.Sa + 1
-        token_pad_mask = self.make_kpm_for_actions(B, T, S=x.size(2), Nz=Nz_in, pad_action_t=0, device=device)
-        pad_extra = torch.zeros(B, T, 1, dtype=torch.bool, device=device)
-        token_pad_mask_aug = torch.cat([token_pad_mask, pad_extra], dim=2)  # [B,T,Sa+1+Nz+1]
         agent = None
         if policy_tok_in is not None:
             ag = policy_tok_in
@@ -677,7 +669,7 @@ class Dynamics(nn.Module):
             # Space layers apply the agent mask within a timestep; the
             # stream-causal time layers tile it over every pair of timesteps,
             # so no non-agent token ever reads h, current or past.
-            x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, mask=tok_mask, agent_idx=agent_idx)
+            x_aug = blk(x_aug, mask=tok_mask, agent_idx=agent_idx)
 
         agent = x_aug[:, :, agent_idx:agent_idx+1, :]
         x     = x_aug[:, :, :agent_idx, :]
