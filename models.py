@@ -453,7 +453,7 @@ class Dynamics(nn.Module):
     Token-based dynamics with discrete signal embeddings + discrete action embeddings.
 
     Tokens are ordered temporally: each timestep contributes
-    [a_t (Sa), (t,d)_t (1), z_t (Nz), h_t (1), reserved (Nr)], where h_t is the
+    [a_t (Sa), (t,d)_t (1), z_t (Nz), h_t (1)], where h_t is the
     agent token, and the time layers attend over the flattened stream
     a_1, (t,d)_1, z_1, h_1, a_2, ... with a token-level causal mask. So z_t
     reads a_t and (t,d)_t, and h_t reads everything up to z_t. Non-agent
@@ -495,7 +495,6 @@ class Dynamics(nn.Module):
         action_low: int = -1,
         action_high: int= 1,
         action_lookup: bool = True,
-        Nr: int = 4,
         # behavior toggles
         mask_last_action: bool = True,      # usually correct for "predict next"
         clamp_signal_indices: bool = False, # set True if you’d rather clamp than crash
@@ -505,7 +504,6 @@ class Dynamics(nn.Module):
         self.use_agent_token = use_agent_token
         self.device = device
         self.Sa = Sa
-        self.Nr = Nr
         self.action_dim = action_dim
         self.action_bins = action_bins
         self.d_model = d_model
@@ -524,7 +522,6 @@ class Dynamics(nn.Module):
         self.level_emb = nn.Embedding(self.level_vocab, level_dim)
         self.step_emb  = nn.Embedding(self.level_vocab, level_dim)
         self.action_conditioner = nn.Parameter(0.02 * torch.randn(1, 1, self.Sa, d_model))
-        self.reserved = nn.Parameter(0.02 * torch.randn(1, 1, self.Nr, d_model))
 
         self.action_pad = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
         self.action_lookup = action_lookup
@@ -574,15 +571,13 @@ class Dynamics(nn.Module):
         if pad_action_t is None:
             return kpm
         # actions occupy the first Sa positions of each timestep's
-        # [a, (t,d), z, h, reserved] block
+        # [a, (t,d), z, h] block
         kpm[:, pad_action_t, :self.Sa] = True
         return kpm
 
-    def agent_mask(self, S: int, agent_idx: int, device=None, Nr: int = 0, *, dtype=torch.float32):
+    def agent_mask(self, S: int, agent_idx: int, device=None, *, dtype=torch.float32):
         if not (0 <= agent_idx < S):
             raise ValueError(f"agent_idx={agent_idx} out of range for S={S}")
-        if Nr < 0 or Nr > S:
-            raise ValueError(f"Nr={Nr} must satisfy 0 <= Nr <= S={S}")
 
         allow = torch.ones((S, S), dtype=torch.bool, device=device)
 
@@ -590,11 +585,6 @@ class Dynamics(nn.Module):
         allow[:, agent_idx] = False
         allow[agent_idx, :] = True
         allow[agent_idx, agent_idx] = True
-
-        # Reserved rule: reserved can read everyone EXCEPT agent
-        if Nr > 0:
-            rs = S - Nr  # start index of reserved tokens
-            allow[rs:, agent_idx] = False  # reserved queries can't read agent
 
         # Convert allow-mask -> additive bias (0 keep, -inf block)
         attn_bias = torch.zeros((S, S), dtype=dtype, device=device)
@@ -657,12 +647,12 @@ class Dynamics(nn.Module):
         z_inp = self.z_proj(z_tokens)
         sig_tok = self.sig_proj(lev_feat + step_feat).unsqueeze(-2)          # [B,T,1,D]
 
-        # Per-timestep layout: a_t, (t,d)_t, z_t, then h_t (agent) and reserved below
+        # Per-timestep layout: a_t, (t,d)_t, z_t, then h_t (agent) below
         x = torch.cat([a_tokens, sig_tok, z_inp], dim=2)                     # [B,T,Sa+1+Nz,D]
         z_start = self.Sa + 1
         token_pad_mask = self.make_kpm_for_actions(B, T, S=x.size(2), Nz=Nz_in, pad_action_t=0, device=device)
-        pad_extra = torch.zeros(B, T, 1 + self.Nr, dtype=torch.bool, device=device)
-        token_pad_mask_aug = torch.cat([token_pad_mask, pad_extra], dim=2)  # [B,T,Sa+1+Nz+1+Nr]
+        pad_extra = torch.zeros(B, T, 1, dtype=torch.bool, device=device)
+        token_pad_mask_aug = torch.cat([token_pad_mask, pad_extra], dim=2)  # [B,T,Sa+1+Nz+1]
         agent = None
         if policy_tok_in is not None:
             ag = policy_tok_in
@@ -678,13 +668,11 @@ class Dynamics(nn.Module):
             agent_in = agent.detach() if detach_agent else agent
 
         agent_idx = x.size(2)
-        reserved  = self.reserved.expand(B, T, self.Nr, -1)
-
-        x_aug = torch.cat([x, agent_in, reserved], dim=2)
+        x_aug = torch.cat([x, agent_in], dim=2)                               # [B,T,Sa+1+Nz+1,D]
 
         for blk in self.blocks:
             S = x_aug.size(2)
-            tok_mask = self.agent_mask(S, agent_idx, device=device, Nr=self.Nr)  # keep agent mask
+            tok_mask = self.agent_mask(S, agent_idx, device=device)  # keep agent mask
 
             # Space layers apply the agent mask within a timestep; the
             # stream-causal time layers tile it over every pair of timesteps,
