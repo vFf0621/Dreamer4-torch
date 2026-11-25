@@ -176,21 +176,69 @@ class GQA(nn.Module):
 
 
 class CausalSTBlock(nn.Module):
-    def __init__(self, d_model, n_heads, dropout=0.1, time_attn=True, cap_value=50,  device="cuda"):
+    # time_mode selects how the temporal attention layers see the tokens:
+    #   "per_channel"  - each token slot attends causally over its own history
+    #                    only; no cross-channel mixing (axial attention).
+    #   "block_causal" - flatten the per-timestep blocks into one stream and
+    #                    apply a block-causal mask: a token sees every token of
+    #                    its own timestep plus all earlier timesteps, never the
+    #                    future (used by the encoder and decoder).
+    TIME_MODES = ("per_channel", "block_causal")
+
+    def __init__(self, d_model, n_heads, dropout=0.1, time_attn=True, cap_value=50,
+                 time_mode="per_channel", device="cuda"):
         super().__init__()
+        assert time_mode in self.TIME_MODES, f"unknown time_mode {time_mode!r}"
         self.time_attn_enabled = time_attn
+        self.time_mode = time_mode
         self.d_model = d_model
         self.ln_space = nn.RMSNorm(d_model)
 
         if not self.time_attn_enabled:
             self.space_attn = GQA(d_model, n_heads,  dropout, device=device)
         else:
-            self.time_attn = GQA(d_model, n_heads,  dropout, causal=True, device=device)
+            # block_causal supplies its own additive bias, so GQA must not add
+            # a token-level tril on top of it.
+            self.time_attn = GQA(d_model, n_heads, dropout,
+                                 causal=(time_mode != "block_causal"), device=device)
+        self._bc_cache = None
 
         self.ln_time = nn.RMSNorm(d_model)
         self.mlp = build_network(d_model, d_model * 2, 3, "SwiGLU", d_model, True)
         self.device = device
         self.to(self.device)
+
+    def _block_causal_bias(self, T, N, device, dtype, modality=None):
+        """
+        Additive bias [T*N, T*N] for the flattened stream with N tokens per
+        timestep: a token attends to every token of its own timestep and of
+        all earlier timesteps, never a later one. Each timestep stays
+        internally bidirectional.
+
+        `modality` is an optional [N,N] allow mask (bool, True = allow, or an
+        additive float bias). It is tiled over every (query block, key block)
+        pair, so the modality restriction holds across time as well as within
+        a frame -- otherwise a token could read through the restriction by
+        attending the same group in an earlier timestep.
+        """
+        sig = None
+        if modality is not None:
+            mod_allow = modality if modality.dtype == torch.bool else torch.isfinite(modality)
+            mod_allow = mod_allow.to(device)
+            sig = int(mod_allow.sum().item())
+        key = (T, N, sig, str(device), dtype)
+        if self._bc_cache is not None and self._bc_cache[0] == key:
+            return self._bc_cache[1]
+
+        t_ids = torch.arange(T, device=device).repeat_interleave(N)   # [T*N]
+        allow = t_ids.unsqueeze(1) >= t_ids.unsqueeze(0)              # [T*N,T*N]
+        if modality is not None:
+            assert mod_allow.shape[-2:] == (N, N), (mod_allow.shape, N)
+            allow = allow & mod_allow.repeat(T, T)
+        bias = torch.zeros((T * N, T * N), dtype=dtype, device=device)
+        bias.masked_fill_(~allow, float("-inf"))
+        self._bc_cache = (key, bias)
+        return bias
 
     def forward(
             self,
@@ -222,6 +270,25 @@ class CausalSTBlock(nn.Module):
         # =========================
         # TIME ATTENTION
         # =========================
+        if self.time_attn_enabled and self.time_mode == "block_causal":
+            # Flatten the per-timestep blocks into one stream and attend over
+            # it with a block-granular causal mask (bidirectional within a
+            # timestep, never the future).
+            x_time = self.ln_time(x).reshape(B, T * N, D)
+            time_kpm = None
+            if token_pad_mask is not None:
+                time_kpm = token_pad_mask.reshape(B, T * N)
+            mod = mask if (mask is not None and mask.shape[-2:] == (N, N)) else None
+            bias = self._block_causal_bias(T, N, x.device, x.dtype, modality=mod)
+            xt_out = self.time_attn(
+                x_time,
+                attn_mask=bias,
+                key_padding_mask=time_kpm,
+            ).reshape(B, T, N, D)
+            x = x + xt_out
+            x = x + self.mlp(x)
+            return x.squeeze(2) if x.shape[2] == 1 else x
+
         if self.time_attn_enabled:
             x_time = self.ln_time(x).permute(0, 2, 1, 3).reshape(B * N, T, D)
 
@@ -323,10 +390,14 @@ class Encoder(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.reserved = nn.Parameter(torch.randn(1, 1, num_reserved, d_model) * 0.02)
         self.num_reserved=num_reserved
+        # Every layer is one block-causal attention over the flattened frame
+        # tokens: no alternating space-only / time-only layers. Each block is
+        # bidirectional within its frame (subject to the modality mask) and
+        # reads all earlier frames. time_every is kept for API compatibility.
         blocks = []
         for i in range(depth):
-            use_time = ((i+1) % time_every == 0)
-            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time))
+            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=True,
+                                        time_mode="block_causal"))
         self.blocks = nn.ModuleList(blocks)
 
         self.ln_out = nn.RMSNorm(d_model)
@@ -353,10 +424,9 @@ class Encoder(nn.Module):
 
         x = self.drop(x)
         for blk in self.blocks:
-            if blk.time_attn_enabled:
-                x = blk(x, mask=None,)          # no space mask here
-            else:
-                x = blk(x, mask=space_mask)    # modality mask only here
+            # block-causal layers tile the modality mask over every frame pair,
+            # so the one-directional restriction holds across time as well
+            x = blk(x, mask=space_mask)
         x = self.ln_out(x[:,:,:self.latent_tokens])  
 
         pre = (self.readout(x))
@@ -366,6 +436,9 @@ class Encoder(nn.Module):
 class Dynamics(nn.Module):
     """
     Token-based dynamics with discrete signal embeddings + discrete action embeddings.
+
+    Per-timestep token layout: [a_t (Sa), (t,d)_t (1), z_t (Nz), h_t (1), reserved (Nr)],
+    where h_t is the agent token.
 
     Inputs:
       z_tokens: [B, T, Nz, Dz]
@@ -461,47 +534,6 @@ class Dynamics(nn.Module):
 
         self.to(device)
 
-    def recover_z(self, out: torch.Tensor):
-        """
-        out: [B,T,Nz+Sa,D] created by interleave_gb_1a
-        returns:
-        a_rec: [B,T,Sa,D]
-        b_rec: [B,T,Nz,D]
-        """
-        Sa = self.Sa
-        B, T, L, D = out.shape
-        assert L % Sa == 0, "Token length must be divisible by Sa"
-        block = L // Sa                 # block = g+1
-        g = block - 1
-        assert g >= 1
-
-        blocks = out.reshape(B, T, Sa, g+1, D)   # [B,T,Sa,g+1,D]
-        z_rec = blocks[:, :, :, :g, :].reshape(B, T, Sa*g, D)  # [B,T,Nz,D]
-       # a_rec = blocks[:, :, :,  g, :]                          # [B,T,Sa,D]
-        return z_rec
-    
-    def interleave_z_a(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
-        """
-        1 action token per (Nz/Sa) latent tokens
-        z: [B,T,Nz,D]
-        a: [B,T,Sa,D]
-        returns: [B,T,Nz+Sa,D]
-        """
-        B, T, Nz, D = z.shape
-        assert a.shape[0] == B and a.shape[1] == T and a.shape[3] == D
-
-        Sa = a.shape[2]
-        assert Nz % Sa == 0, f"Nz={Nz} must be divisible by Sa={Sa}"
-        g = Nz // Sa
-
-        z_grp = z.reshape(B, T, Sa, g, D)     # [B,T,Sa,g,D]
-        a_grp = a.unsqueeze(3)               # [B,T,Sa,1,D]
-
-        out = torch.cat([z_grp, a_grp], dim=3)  # [B,T,Sa,g+1,D]
-        return out.reshape(B, T, Nz + Sa, D)
-
-
-
     def align_actions(self, actions, T, B):
         if actions.dim() != 3:
             raise ValueError(...)
@@ -520,14 +552,9 @@ class Dynamics(nn.Module):
         kpm = torch.zeros((B, T, S), dtype=torch.bool, device=device)
         if pad_action_t is None:
             return kpm
-        Sa = self.Sa
-        assert Nz % Sa == 0
-        
-        
-        g = Nz // Sa
-        action_pos = torch.arange(Sa, device=device) * (g + 1) + g  # [Sa]
-        #action_pos lives in the first (Nz+Sa) tokens; do NOT include the signal/agent/reserved tail
-        kpm[:, pad_action_t, action_pos] = True
+        # actions occupy the first Sa positions of each timestep's
+        # [a, (t,d), z, h, reserved] block
+        kpm[:, pad_action_t, :self.Sa] = True
         return kpm
 
     def agent_mask(self, S: int, agent_idx: int, device=None, Nr: int = 0, *, dtype=torch.float32):
@@ -607,14 +634,14 @@ class Dynamics(nn.Module):
         step_feat = self.step_emb(step_t)
 
         z_inp = self.z_proj(z_tokens)
+        sig_tok = self.sig_proj(lev_feat + step_feat).unsqueeze(-2)          # [B,T,1,D]
 
-        # Interleave z + a, then append signal token
-        x = self.interleave_z_a(z_inp, a_tokens )                 # x: [B,T,?,D]
-        Nmain = x.size(2)
-        x = torch.cat([x, self.sig_proj(lev_feat + step_feat).unsqueeze(-2)], dim=2)
+        # Per-timestep layout: a_t, (t,d)_t, z_t, then h_t (agent) and reserved below
+        x = torch.cat([a_tokens, sig_tok, z_inp], dim=2)                     # [B,T,Sa+1+Nz,D]
+        z_start = self.Sa + 1
         token_pad_mask = self.make_kpm_for_actions(B, T, S=x.size(2), Nz=Nz_in, pad_action_t=0, device=device)
         pad_extra = torch.zeros(B, T, 1 + self.Nr, dtype=torch.bool, device=device)
-        token_pad_mask_aug = torch.cat([token_pad_mask, pad_extra], dim=2)  # [B,T,Nmain+1+Nr]
+        token_pad_mask_aug = torch.cat([token_pad_mask, pad_extra], dim=2)  # [B,T,Sa+1+Nz+1+Nr]
         agent = None
         if policy_tok_in is not None:
             ag = policy_tok_in
@@ -648,7 +675,7 @@ class Dynamics(nn.Module):
         agent_out_bt = agent[:, :, 0, :]
 
 
-        hist = self.recover_z(x[:,:,:Nmain])     
+        hist = x[:, :, z_start:z_start + self.Nz]                             # [B,T,Nz,D]
 
         hist = hist.reshape(B, T*self.Nz, self.d_model)     # [B,T*Nz,D]
         z = self.out(hist)                              # [B,T*Nz,Dz]
@@ -1726,10 +1753,14 @@ class Decoder(nn.Module):
         self.z_to_latents = nn.Linear(z_dim, latent_tokens * d_model)
         self.z_tok_proj   = nn.Linear(z_dim, d_model)
         self.drop = nn.Dropout(dropout)
+        # Every layer is one block-causal attention over the flattened frame
+        # tokens: no alternating space-only / time-only layers. Each block is
+        # bidirectional within its frame (subject to the modality mask) and
+        # reads all earlier frames. time_every is kept for API compatibility.
         blocks = []
         for i in range(depth):
-            use_time = ((i+1) % time_every == 0)
-            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time))
+            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=True,
+                                        time_mode="block_causal"))
         self.blocks = nn.ModuleList(blocks)
         self.ln_out = nn.RMSNorm(d_model)
         self.to_patch = nn.Linear(d_model, img_channels * patch * patch)
@@ -1766,10 +1797,8 @@ class Decoder(nn.Module):
 
         # ---- transformer ----
         for blk in self.blocks:
-            if blk.time_attn_enabled:
-                x = blk(x)          # no space mask here
-            else:
-                x = blk(x,  mask=space_mask)    # modality mask only here
+            # block-causal layers tile the modality mask over every frame pair
+            x = blk(x, mask=space_mask)
         x = self.ln_out(x)
 
         # ---- decode ONLY patch tokens ----
