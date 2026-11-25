@@ -715,7 +715,6 @@ class Dynamics(nn.Module):
             z_tokens = torch.cat([z_tokens, last_z], dim=1)
 
         B, T, Nz_in, Dz = z_tokens.shape
-        z_tokens = z_tokens.reshape(B,T,self.Nz, self.Dz)
         if signals.size(1) != T:
             raise ValueError(f"signals has T={signals.size(1)} but z_tokens has T={T}.")
 
@@ -786,9 +785,9 @@ class Dynamics(nn.Module):
                                         key_padding_mask=stream_kpm)  # [B,T,D]
 
         # z tokens sit at positions [Sa, Sa+Nz) of every timestep block
-        hist = x_aug[:, :, self.Sa:self.Sa + self.Nz, :]
+        hist = x_aug[:, :, self.Sa:self.Sa + Nz_in, :]
 
-        hist = hist.reshape(B, T*self.Nz, self.d_model)     # [B,T*Nz,D]
+        hist = hist.reshape(B, T*Nz_in, self.d_model)       # [B,T*Nz,D]
         z = self.out(hist)                              # [B,T*Nz,Dz]
         z_pred = z.view(B, T, Nz_in, Dz)            # [B,T,Nz,Dz]
 
