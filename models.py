@@ -183,11 +183,10 @@ class CausalSTBlock(nn.Module):
     #                    apply a block-causal mask: a token sees every token of
     #                    its own timestep plus all earlier timesteps, never the
     #                    future (used by the encoder and decoder).
-    #   "stream_causal" - flatten the per-timestep blocks into one stream and
-    #                    apply a standard token-level causal mask, so ordering
-    #                    is strict within a timestep too (used by the dynamics:
-    #                    a_1, (t,d)_1, z_1, h_1, a_2, ...).
-    TIME_MODES = ("per_channel", "block_causal", "stream_causal")
+    #   "stream"       - the caller passes an already flattened token stream
+    #                    and its attention mask to forward_stream (used by the
+    #                    dynamics, whose timesteps differ in length).
+    TIME_MODES = ("per_channel", "block_causal", "stream")
 
     def __init__(self, d_model, n_heads, dropout=0.1, time_attn=True, cap_value=50,
                  time_mode="per_channel", device="cuda"):
@@ -212,16 +211,12 @@ class CausalSTBlock(nn.Module):
         self.device = device
         self.to(self.device)
 
-    def _stream_bias(self, T, N, device, dtype, modality=None, strict=False):
+    def _block_causal_bias(self, T, N, device, dtype, modality=None):
         """
         Additive bias [T*N, T*N] for the flattened stream with N tokens per
-        timestep.
-
-        strict=False (block causal): a token attends to every token of its own
-        timestep and of all earlier timesteps, never a later one. Each
-        timestep stays internally bidirectional.
-        strict=True (stream causal): standard token-level causal mask over the
-        stream, so a token sees only the tokens before it (and itself).
+        timestep: a token attends to every token of its own timestep and of
+        all earlier timesteps, never a later one. Each timestep stays
+        internally bidirectional.
 
         `modality` is an optional [N,N] allow mask (bool, True = allow, or an
         additive float bias). It is tiled over every (query block, key block)
@@ -234,16 +229,12 @@ class CausalSTBlock(nn.Module):
             mod_allow = modality if modality.dtype == torch.bool else torch.isfinite(modality)
             mod_allow = mod_allow.to(device)
             sig = int(mod_allow.sum().item())
-        key = (T, N, sig, strict, str(device), dtype)
+        key = (T, N, sig, str(device), dtype)
         if self._bc_cache is not None and self._bc_cache[0] == key:
             return self._bc_cache[1]
 
-        if strict:
-            pos = torch.arange(T * N, device=device)
-            allow = pos.unsqueeze(1) >= pos.unsqueeze(0)              # [T*N,T*N]
-        else:
-            t_ids = torch.arange(T, device=device).repeat_interleave(N)   # [T*N]
-            allow = t_ids.unsqueeze(1) >= t_ids.unsqueeze(0)              # [T*N,T*N]
+        t_ids = torch.arange(T, device=device).repeat_interleave(N)   # [T*N]
+        allow = t_ids.unsqueeze(1) >= t_ids.unsqueeze(0)              # [T*N,T*N]
         if modality is not None:
             assert mod_allow.shape[-2:] == (N, N), (mod_allow.shape, N)
             allow = allow & mod_allow.repeat(T, T)
@@ -251,6 +242,15 @@ class CausalSTBlock(nn.Module):
         bias.masked_fill_(~allow, float("-inf"))
         self._bc_cache = (key, bias)
         return bias
+
+    def forward_stream(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Time attention over an already flattened token stream x: [B, L, D],
+        with the caller's full [L, L] mask (bool allow or additive bias).
+        """
+        assert self.time_attn_enabled and self.time_mode == "stream"
+        x = x + self.time_attn(self.ln_time(x), attn_mask=attn_mask)
+        return x + self.mlp(x)
 
     def forward(
             self,
@@ -282,19 +282,20 @@ class CausalSTBlock(nn.Module):
         # =========================
         # TIME ATTENTION
         # =========================
-        if self.time_attn_enabled and self.time_mode != "per_channel":
+        if self.time_attn_enabled and self.time_mode == "stream":
+            raise ValueError("time_mode='stream' blocks are driven via forward_stream")
+
+        if self.time_attn_enabled and self.time_mode == "block_causal":
             # Flatten the per-timestep blocks into one stream and attend over
-            # it. block_causal: block-granular causal mask (bidirectional
-            # within a timestep). stream_causal: token-level causal mask, so
-            # the order of tokens inside a timestep matters. In both, an
-            # [N,N] modality mask is tiled over every pair of timesteps.
+            # it with a block-granular causal mask (bidirectional within a
+            # timestep, never the future). The [N,N] modality mask is tiled
+            # over every pair of timesteps.
             x_time = self.ln_time(x).reshape(B, T * N, D)
             time_kpm = None
             if token_pad_mask is not None:
                 time_kpm = token_pad_mask.reshape(B, T * N)
             mod = mask if (mask is not None and mask.shape[-2:] == (N, N)) else None
-            bias = self._stream_bias(T, N, x.device, x.dtype, modality=mod,
-                                     strict=(self.time_mode == "stream_causal"))
+            bias = self._block_causal_bias(T, N, x.device, x.dtype, modality=mod)
             xt_out = self.time_attn(
                 x_time,
                 attn_mask=bias,
@@ -453,12 +454,16 @@ class Dynamics(nn.Module):
     Token-based dynamics with discrete signal embeddings + discrete action embeddings.
 
     Tokens are ordered temporally: each timestep contributes
-    [a_t (Sa), (t,d)_t (1), z_t (Nz), h_t (1)], where h_t is the
-    agent token, and the time layers attend over the flattened stream
-    a_1, (t,d)_1, z_1, h_1, a_2, ... with a token-level causal mask. So z_t
-    reads a_t and (t,d)_t, and h_t reads everything up to z_t. Non-agent
-    tokens never read h. Space layers stay bidirectional within a timestep
-    (except for the agent rule).
+    [a_t (Sa), (t,d)_t (1), z_t (Nz), h_t (1)], where a_t embeds the action
+    that led into z_t and h_t is the agent token. The first timestep has no
+    preceding action, so it has no action tokens at all (no padding):
+
+        (t,d)_1, z_1, h_1, a_2, (t,d)_2, z_2, h_2, ..., a_T, (t,d)_T, z_T, h_T
+
+    Time layers attend over this stream with a token-level causal mask, so
+    z_t reads a_t and (t,d)_t, and h_t reads everything up to z_t. Space
+    layers are bidirectional within a timestep. In both, non-agent tokens
+    never read h (current or past).
 
     Inputs:
       z_tokens: [B, T, Nz, Dz]
@@ -523,7 +528,6 @@ class Dynamics(nn.Module):
         self.step_emb  = nn.Embedding(self.level_vocab, level_dim)
         self.action_conditioner = nn.Parameter(0.02 * torch.randn(1, 1, self.Sa, d_model))
 
-        self.action_pad = nn.Parameter(0.02*torch.randn(1, 1, 1, d_model, device=self.device))
         self.action_lookup = action_lookup
         act_embed_dim = self.action_bins*self.action_dim
         # --- Action embedding (true lookup, no one-hot materialization) ---
@@ -541,7 +545,7 @@ class Dynamics(nn.Module):
                     d_model, n_heads,
                     dropout=dropout,
                     time_attn=use_time,
-                    time_mode="stream_causal",
+                    time_mode="stream",
                     device=device,
                 )
             )
@@ -566,15 +570,6 @@ class Dynamics(nn.Module):
         else:
             raise ValueError("Incorrect action shape")
 
-    def make_kpm_for_actions(self, B, T, S, Nz, *, pad_action_t: int | None, device):
-        kpm = torch.zeros((B, T, S), dtype=torch.bool, device=device)
-        if pad_action_t is None:
-            return kpm
-        # actions occupy the first Sa positions of each timestep's
-        # [a, (t,d), z, h] block
-        kpm[:, pad_action_t, :self.Sa] = True
-        return kpm
-
     def agent_mask(self, S: int, agent_idx: int, device=None, *, dtype=torch.float32):
         if not (0 <= agent_idx < S):
             raise ValueError(f"agent_idx={agent_idx} out of range for S={S}")
@@ -596,9 +591,27 @@ class Dynamics(nn.Module):
 
         return attn_bias
 
-                                # Forwar
-    # -----------------------------
-# -----------------------------
+    def stream_mask(self, T: int, device=None) -> torch.Tensor:
+        """
+        Bool allow mask [L, L] over the flattened stream
+        (t,d)_1, z_1, h_1, a_2, (t,d)_2, z_2, h_2, ...  with L = T*N - Sa.
+        Token-level causal, and only agent queries may read agent keys.
+        """
+        key = (T, str(device))
+        cache = getattr(self, "_stream_mask_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        Sa, Nz = self.Sa, self.Nz
+        first = torch.tensor([0] * (1 + Nz) + [1], dtype=torch.bool, device=device)
+        rest = torch.tensor([0] * (Sa + 1 + Nz) + [1], dtype=torch.bool, device=device)
+        is_agent = torch.cat([first, rest.repeat(T - 1)])              # [L]
+        L = is_agent.numel()
+        pos = torch.arange(L, device=device)
+        allow = pos.unsqueeze(1) >= pos.unsqueeze(0)                   # causal
+        allow = allow & (~is_agent.unsqueeze(0) | is_agent.unsqueeze(1))
+        self._stream_mask_cache = (key, allow)
+        return allow
+
     def forward(
         self,
         z_tokens: torch.Tensor,                 # [B, T, Nz, Dz]
@@ -626,11 +639,9 @@ class Dynamics(nn.Module):
         act_two_hot = two_hot(acts_bt, self.action_low, self.action_high, self.action_bins).reshape(B, -1, 1, self.action_bins * self.action_dim)                     # [B, T-1, A]
 
                                                     # [B, T-1, D]
-        a_emb = self.action_embs(act_two_hot[:, :, :])                                                     # [B, T-1, 1, D]
-        if a_emb.size(1) == z_tokens.size(1)-1:
-            pad = self.action_pad.expand(B, 1, 1, -1)                                     # [B, 1, 1, D]
-            a_emb = torch.cat([pad, a_emb ], dim=1)                                        # [B, T, 1, D]
-        a_tokens = a_emb.expand(-1, -1, self.Sa, -1) + self.action_conditioner  # [B,T,Sa,D]
+        a_emb = self.action_embs(act_two_hot)                                   # [B, T-1, 1, D]
+        # a_tokens[:, i] is the action leading into timestep i+1
+        a_tokens = a_emb.expand(-1, -1, self.Sa, -1) + self.action_conditioner  # [B,T-1,Sa,D]
         signals = signals.long()
         if signals.dim() == 4 and signals.size(-1) == 2:
             level_idx, step_idx = signals[..., 0], signals[..., 1]
@@ -647,12 +658,6 @@ class Dynamics(nn.Module):
         z_inp = self.z_proj(z_tokens)
         sig_tok = self.sig_proj(lev_feat + step_feat).unsqueeze(-2)          # [B,T,1,D]
 
-        # Per-timestep layout: a_t, (t,d)_t, z_t, then h_t (agent) below
-        x = torch.cat([a_tokens, sig_tok, z_inp], dim=2)                     # [B,T,Sa+1+Nz,D]
-        z_start = self.Sa + 1
-        token_pad_mask = self.make_kpm_for_actions(B, T, S=x.size(2), Nz=Nz_in, pad_action_t=0, device=device)
-        pad_extra = torch.zeros(B, T, 1, dtype=torch.bool, device=device)
-        token_pad_mask_aug = torch.cat([token_pad_mask, pad_extra], dim=2)  # [B,T,Sa+1+Nz+1]
         agent = None
         if policy_tok_in is not None:
             ag = policy_tok_in
@@ -661,34 +666,39 @@ class Dynamics(nn.Module):
             if ag.size(2) != 1:
                 raise ValueError("policy_tok_in token dim must be 1 at dim=2")
             agent = ag
-            agent_in = agent.detach() if detach_agent else agent
-        elif self.use_agent_token:
+        else:
             assert task_id < self.num_task
             agent = self.agent_token[:, :, task_id].expand(B, T, 1, self.d_model)
-            agent_in = agent.detach() if detach_agent else agent
+        agent_in = agent.detach() if detach_agent else agent
 
-        agent_idx = x.size(2)
-        x_aug = torch.cat([x, agent_in], dim=2)                               # [B,T,Sa+1+Nz+1,D]
+        # Timestep 1 has no preceding action: [(t,d)_1, z_1, h_1]
+        # Timesteps 2..T:                      [a_t, (t,d)_t, z_t, h_t]
+        D, Sa, Nz = self.d_model, self.Sa, self.Nz
+        x0 = torch.cat([sig_tok[:, :1], z_inp[:, :1], agent_in[:, :1]], dim=2)     # [B,1,N0,D]
+        xr = torch.cat([a_tokens, sig_tok[:, 1:], z_inp[:, 1:], agent_in[:, 1:]], dim=2)  # [B,T-1,N,D]
+        N0, N = x0.size(2), Sa + 1 + Nz + 1
+        z0, zr = 1, Sa + 1                  # where z starts in each block
+        h0, hr = N0 - 1, N - 1              # agent position in each block
+        mask0 = self.agent_mask(N0, h0, device=device)
+        maskr = self.agent_mask(N, hr, device=device)
+        smask = self.stream_mask(T, device=device)
 
         for blk in self.blocks:
-            S = x_aug.size(2)
-            tok_mask = self.agent_mask(S, agent_idx, device=device)  # keep agent mask
+            if blk.time_attn_enabled:
+                flat = torch.cat([x0.reshape(B, N0, D), xr.reshape(B, (T - 1) * N, D)], dim=1)
+                flat = blk.forward_stream(flat, smask)
+                x0 = flat[:, :N0].reshape(B, 1, N0, D)
+                xr = flat[:, N0:].reshape(B, T - 1, N, D)
+            else:
+                x0 = blk(x0, mask=mask0)
+                if T > 1:
+                    xr = blk(xr, mask=maskr)
 
-            # Space layers apply the agent mask within a timestep; the
-            # stream-causal time layers tile it over every pair of timesteps,
-            # so no non-agent token ever reads h, current or past.
-            x_aug = blk(x_aug, token_pad_mask=token_pad_mask_aug, mask=tok_mask, agent_idx=agent_idx)
+        hist = torch.cat([x0[:, :, z0:z0 + Nz], xr[:, :, zr:zr + Nz]], dim=1)   # [B,T,Nz,D]
+        agent_out_bt = torch.cat([x0[:, :, h0], xr[:, :, hr]], dim=1)            # [B,T,D]
 
-        agent = x_aug[:, :, agent_idx:agent_idx+1, :]
-        x     = x_aug[:, :, :agent_idx, :]
-        agent_out_bt = agent[:, :, 0, :]
-
-
-        hist = x[:, :, z_start:z_start + self.Nz]                             # [B,T,Nz,D]
-
-        hist = hist.reshape(B, T*self.Nz, self.d_model)     # [B,T*Nz,D]
-        z = self.out(hist)                              # [B,T*Nz,Dz]
-        z_pred = z.view(B, T, Nz_in, Dz)            # [B,T,Nz,Dz]                        # [B,T,Nz,D]
+        z = self.out(hist.reshape(B, T * Nz, D))        # [B,T*Nz,Dz]
+        z_pred = z.view(B, T, Nz_in, Dz)                # [B,T,Nz,Dz]
 
         policy_feat = agent_out_bt if agent_out_bt is not None else None
         return z_pred, policy_feat
