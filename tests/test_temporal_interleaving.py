@@ -203,13 +203,11 @@ def test_tokenizer_time_attention_is_block_causal():
     for tq in range(T):
         for tk in range(T):
             sub = allow[tq * N:(tq + 1) * N, tk * N:(tk + 1) * N]
-            if tk >= tq:
-                # future AND the diagonal block are masked: the space layers
-                # already mix the current frame, so the time layers skip it
-                assert not sub.any(), f"frame {tk} visible from {tq}"
+            if tk > tq:
+                assert not sub.any(), f"future frame {tk} visible from {tq}"
             else:
                 assert sub.all(), f"frame {tk} not fully visible from {tq}"
-    assert not allow[:N].any(), "frame 0 should have no keys in a time layer"
+    assert allow[:N, :N].all(), "frame 0 must at least read itself"
 
 
 def test_block_causal_tiles_the_modality_restriction():
@@ -225,13 +223,12 @@ def test_block_causal_tiles_the_modality_restriction():
         blk._block_causal_bias(T, N, "cpu", torch.float32, modality=mod))
 
     patch_q = 1 * N + L                    # a patch token in frame 1
-    for tk in (0,):                        # strictly earlier frames only
+    for tk in (0, 1):                      # its own frame and earlier ones
         assert not allow[patch_q, tk * N:tk * N + L].any(), \
             f"patch reads latents of frame {tk}"
         assert allow[patch_q, tk * N + L:(tk + 1) * N].all(), \
             f"patch cannot read patches of frame {tk}"
-    assert not allow[patch_q, 1 * N:2 * N].any(), "diagonal block should be masked"
-    assert allow[1 * N, :N].all(), "latent query lost its past"
+    assert allow[1 * N, :2 * N].all(), "latent query lost its past"
 
 
 def test_encoder_and_decoder_are_block_causal_in_time():
@@ -242,6 +239,10 @@ def test_encoder_and_decoder_are_block_causal_in_time():
                   latent_tokens=4, time_every=2, num_reserved=2)
     assert {b.time_mode for b in enc.blocks} == {"block_causal"}
     assert {b.time_mode for b in dec.blocks} == {"block_causal"}
+    # one unified causal block per layer: no alternating space-only layers
+    assert all(b.time_attn_enabled for b in enc.blocks), "encoder still alternates"
+    assert all(b.time_attn_enabled for b in dec.blocks), "decoder still alternates"
+    assert not any(hasattr(b, "space_attn") for b in enc.blocks)
 
     frames = torch.rand(2, 4, 3, 32, 32, requires_grad=True)
     z = enc(frames)
@@ -253,10 +254,9 @@ def test_encoder_and_decoder_are_block_causal_in_time():
     assert per_t[:2].sum() > 0, "encoder cannot see current/past frames"
     assert per_t[2:].sum() == 0, "encoder leaks future frames"
 
-    # the time layers skip the current frame, so frame 0 has no temporal keys
-    # at all -- its content must still arrive through the space layers
+    # the diagonal block is what lets a frame read itself
     g0 = torch.autograd.grad(z[:, 0].sum(), frames)[0].abs().sum((0, 2, 3, 4))
-    assert g0[0] > 0, "frame 0 lost its own content"
+    assert g0[0] > 0, "frame 0 cannot read its own patches"
     assert g0[1:].sum() == 0, "frame 0 sees later frames"
 
 
@@ -281,7 +281,7 @@ def test_modality_mask_is_bidirectional_except_latents():
     allow = torch.isfinite(
         blk._block_causal_bias(T, N, "cpu", torch.float32, modality=enc))
     for tq in range(T):
-        for tk in range(tq):               # strictly earlier frames
+        for tk in range(tq + 1):           # its own frame and earlier ones
             sub = allow[tq * N:(tq + 1) * N, tk * N:(tk + 1) * N]
             assert sub[:L, :].all(), (tq, tk, "latent row lost context")
             assert sub[L:, L:].all(), (tq, tk, "modalities not bidirectional")

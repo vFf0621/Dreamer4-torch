@@ -261,12 +261,12 @@ class CausalSTBlock(nn.Module):
     def _block_causal_bias(self, T, N, device, dtype, modality=None):
         """
         Additive bias [T*N, T*N] for the flattened stream with N tokens per
-        timestep: a token attends to every token of all STRICTLY EARLIER
-        timesteps. The diagonal blocks are masked out, so the time layers
-        never re-read the frame they belong to -- the space layers already mix
-        each frame internally, and including it here would duplicate that.
-        A frame-0 query therefore has no keys at all and its time-attention
-        output is zeroed; frame 0 is carried by the space layers alone.
+        timestep: a token attends to every token of its own timestep and of
+        all earlier timesteps, never a later one. Causality is at block
+        granularity, so each timestep stays internally bidirectional. The
+        encoder and decoder stack these blocks exclusively -- there are no
+        separate space-only layers -- so the diagonal block is what gives a
+        frame access to its own content.
 
         `modality` is an optional [N,N] allow mask (bool, True = allow, or an
         additive float bias) restricting which token groups may read which. It
@@ -288,7 +288,7 @@ class CausalSTBlock(nn.Module):
             return self._bc_cache[1].to(device=device, dtype=dtype)
 
         t_ids = torch.arange(T, device=device).repeat_interleave(N)   # [T*N]
-        allow = t_ids.unsqueeze(1) > t_ids.unsqueeze(0)               # [T*N,T*N] strict
+        allow = t_ids.unsqueeze(1) >= t_ids.unsqueeze(0)              # [T*N,T*N]
         if modality is not None:
             assert mod_allow.shape[-2:] == (N, N), (mod_allow.shape, N)
             allow = allow & mod_allow.repeat(T, T)
@@ -453,10 +453,12 @@ class Encoder(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.reserved = nn.Parameter(torch.randn(1, 1, num_reserved, d_model) * 0.02)
         self.num_reserved=num_reserved
+        # Every layer is one block-causal attention over the flattened frame
+        # tokens: no alternating space-only / time-only layers. Each block is
+        # bidirectional within its frame and reads all earlier frames.
         blocks = []
         for i in range(depth):
-            use_time = ((i+1) % time_every == 0)
-            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time,
+            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=True,
                                         gqa_ratio=gqa_ratio, time_mode=time_mode))
         self.blocks = nn.ModuleList(blocks)
 
@@ -1853,10 +1855,12 @@ class Decoder(nn.Module):
         self.z_to_latents = nn.Linear(z_dim, latent_tokens * d_model)
         self.z_tok_proj   = nn.Linear(z_dim, d_model)
         self.drop = nn.Dropout(dropout)
+        # Every layer is one block-causal attention over the flattened frame
+        # tokens: no alternating space-only / time-only layers. Each block is
+        # bidirectional within its frame and reads all earlier frames.
         blocks = []
         for i in range(depth):
-            use_time = ((i+1) % time_every == 0)
-            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=use_time,
+            blocks.append(CausalSTBlock(d_model, n_heads, dropout=dropout, time_attn=True,
                                         gqa_ratio=gqa_ratio, time_mode=time_mode))
         self.blocks = nn.ModuleList(blocks)
         self.ln_out = nn.RMSNorm(d_model)
