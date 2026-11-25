@@ -261,9 +261,12 @@ class CausalSTBlock(nn.Module):
     def _block_causal_bias(self, T, N, device, dtype, modality=None):
         """
         Additive bias [T*N, T*N] for the flattened stream with N tokens per
-        timestep: a token attends to every token of its own timestep and of all
-        earlier timesteps, never to a later timestep. Causality is at block
-        granularity, so each timestep stays internally bidirectional.
+        timestep: a token attends to every token of all STRICTLY EARLIER
+        timesteps. The diagonal blocks are masked out, so the time layers
+        never re-read the frame they belong to -- the space layers already mix
+        each frame internally, and including it here would duplicate that.
+        A frame-0 query therefore has no keys at all and its time-attention
+        output is zeroed; frame 0 is carried by the space layers alone.
 
         `modality` is an optional [N,N] allow mask (bool, True = allow, or an
         additive float bias) restricting which token groups may read which. It
@@ -285,7 +288,7 @@ class CausalSTBlock(nn.Module):
             return self._bc_cache[1].to(device=device, dtype=dtype)
 
         t_ids = torch.arange(T, device=device).repeat_interleave(N)   # [T*N]
-        allow = t_ids.unsqueeze(1) >= t_ids.unsqueeze(0)              # [T*N,T*N]
+        allow = t_ids.unsqueeze(1) > t_ids.unsqueeze(0)               # [T*N,T*N] strict
         if modality is not None:
             assert mod_allow.shape[-2:] == (N, N), (mod_allow.shape, N)
             allow = allow & mod_allow.repeat(T, T)
